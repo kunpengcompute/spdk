@@ -88,7 +88,7 @@ vbdev_ocf_volume_io_set_data(struct ocf_io *io, ctx_data_t *data,
 	io_ctx->offset = offset;
 	io_ctx->data = data;
 
-	if (io_ctx->data && offset >= io_ctx->data->size) {
+	if (io_ctx->data->iovs && offset >= io_ctx->data->size) {
 		return -ENOBUFS;
 	}
 
@@ -174,7 +174,7 @@ vbdev_ocf_volume_submit_io_cb(struct spdk_bdev_io *bdev_io, bool success, void *
 	assert(io_ctx != NULL);
 
 	if (!success) {
-		io_ctx->error |= 1;
+		io_ctx->error = io_ctx->error ? : -OCF_ERR_IO;
 	}
 
 	if (io_ctx->iovs_allocated && bdev_io != NULL) {
@@ -359,10 +359,11 @@ vbdev_ocf_volume_submit_io(struct ocf_io *io)
 
 end:
 	if (status) {
-		/* TODO [ENOMEM]: implement ENOMEM handling when submitting IO to base device */
-
-		/* Since callback is not called, we need to do it manually to free io structures */
-		SPDK_ERRLOG("submission failed with status=%d\n", status);
+		if (status == -ENOMEM) {
+			io_ctx->error = -OCF_ERR_NO_MEM;
+		} else {
+			SPDK_ERRLOG("submission failed with status=%d\n", status);
+		}
 		vbdev_ocf_volume_submit_io_cb(NULL, false, io);
 	}
 }

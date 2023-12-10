@@ -301,6 +301,7 @@ bdev_rbd_cluster_handle(void *arg)
 	if (rc < 0) {
 		SPDK_ERRLOG("Failed to create rados cluster for user_id=%s and rbd_pool=%s\n",
 			    rbd->user_id ? rbd->user_id : "admin (the default)", rbd->pool_name);
+		rbd->cluster = NULL;
 		ret = NULL;
 	}
 
@@ -358,6 +359,7 @@ bdev_rbd_init(struct bdev_rbd *rbd)
 
 	if (spdk_call_unaffinitized(bdev_rbd_init_context, rbd) == NULL) {
 		SPDK_ERRLOG("Cannot init rbd context for rbd=%p\n", rbd);
+		return -1;
 	}
 
 	return ret;
