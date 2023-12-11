@@ -35,7 +35,7 @@ include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 include $(SPDK_ROOT_DIR)/mk/spdk.lib_deps.mk
 include $(SPDK_ROOT_DIR)/mk/spdk.modules.mk
 
-CFLAGS += -DNVMF_I_CHECK
+CFLAGS += -DNVMF_IO_CHECK
 
 ifeq ($(SPDK_MAP_FILE),)
 $(error SPDK_MAP_FILE is not set for lib $(LIBNAME))

@@ -1612,7 +1612,7 @@ consume_admin_cmd(struct nvmf_vfio_user_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
 }
 
 static int
-handle_cmd_rsp(struct nvmf_vfio_user_req *vu_req, void *cb_arg, strcut spdk_nvmf_request *req)
+handle_cmd_rsp(struct nvmf_vfio_user_req *vu_req, void *cb_arg, struct spdk_nvmf_request *req)
 {
 	struct nvmf_vfio_user_sq *vu_sq = cb_arg;
 	struct nvmf_vfio_user_ctrlr *vu_ctrlr = vu_sq->ctrlr;
@@ -1856,7 +1856,7 @@ memory_region_remove_cb(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
 }
 
 static int
-nvmf_vfio_user_prop_req_rsp(struct nvmf_vfio_user_req *req, void *cb_arg, struct spdk_nvmf_request *req)
+nvmf_vfio_user_prop_req_rsp(struct nvmf_vfio_user_req *req, void *cb_arg, struct spdk_nvmf_request *nvmf_req)
 {
 	struct nvmf_vfio_user_sq *vu_sq = cb_arg;
 	struct nvmf_vfio_user_ctrlr *vu_ctrlr;
@@ -3501,7 +3501,7 @@ _post_completion_msg(void *ctx)
 }
 
 static int
-handle_queue_connect_rsp(struct nvmf_vfio_user_req *req, void *cb_arg, strcut spdk_nvmf_request *req)
+handle_queue_connect_rsp(struct nvmf_vfio_user_req *req, void *cb_arg, struct spdk_nvmf_request *nvmf_req)
 {
 	struct nvmf_vfio_user_poll_group *vu_group;
 	struct nvmf_vfio_user_sq *vu_sq = cb_arg;
