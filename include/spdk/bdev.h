@@ -179,9 +179,19 @@ struct spdk_bdev_io_stat {
 	uint64_t bytes_unmapped;
 	uint64_t num_unmap_ops;
 	uint64_t read_latency_ticks;
+	uint64_t read_latency_ticks_min;
+	uint64_t read_latency_ticks_max;
+	uint64_t read_latency_ticks_avg;
 	uint64_t write_latency_ticks;
+	uint64_t write_latency_ticks_min;
+	uint64_t write_latency_ticks_max;
+	uint64_t write_latency_ticks_avg;
 	uint64_t unmap_latency_ticks;
 	uint64_t ticks_rate;
+	uint64_t debug_submit_io;
+	uint64_t debug_retry_io;
+	uint64_t debug_failed_io;
+	uint64_t debug_abort_io;
 };
 
 struct spdk_bdev_opts {
@@ -1706,6 +1716,21 @@ int spdk_bdev_queue_io_wait(struct spdk_bdev *bdev, struct spdk_io_channel *ch,
 void spdk_bdev_get_io_stat(struct spdk_bdev *bdev, struct spdk_io_channel *ch,
 			   struct spdk_bdev_io_stat *stat);
 
+/**
+ * Reset I/O statistics for this channel
+ *
+ * \param bdev_io_stat The per-channel statistics.
+ * 
+ */
+void bdev_io_stat_reset(struct spdk_bdev_io_stat *stat);
+
+/**
+ * Reset I/O statistics per channel for the block device.
+ *
+ * \param bdev Block device.
+ * 
+ */
+void spdk_bdev_reset_device_stat(struct spdk_bdev *bdev);
 
 /**
  * Return I/O statistics for this bdev. All the required information will be passed
