@@ -82,6 +82,7 @@ int __itt_init_ittlib(const char *, __itt_group_id);
  * when splitting into children requests at a time.
  */
 #define SPDK_BDEV_MAX_CHILDREN_UNMAP_WRITE_ZEROES_REQS (8)
+#define BDEV_RETRY_IO_PERIOD 500
 
 static const char *qos_rpc_type[] = {"rw_ios_per_sec",
 				     "rw_mbytes_per_sec", "r_mbytes_per_sec", "w_mbytes_per_sec"
@@ -302,6 +303,7 @@ struct spdk_bdev_channel {
 	bdev_io_tailq_t		queued_resets;
 
 	lba_range_tailq_t	locked_ranges;
+	struct spdk_poller	*retry_io_poller;
 };
 
 struct media_event_entry {
@@ -1940,6 +1942,9 @@ bdev_io_do_submit(struct spdk_bdev_channel *bdev_ch, struct spdk_bdev_io *bdev_i
 	struct spdk_io_channel *ch = bdev_ch->channel;
 	struct spdk_bdev_shared_resource *shared_resource = bdev_ch->shared_resource;
 
+#ifdef DEBUG
+	bdev_io->internal.ch->stat.debug_submit_io++;
+#endif
 	if (spdk_unlikely(bdev_io->type == SPDK_BDEV_IO_TYPE_ABORT)) {
 		struct spdk_bdev_mgmt_channel *mgmt_channel = shared_resource->mgmt_ch;
 		struct spdk_bdev_io *bio_to_abort = bdev_io->u.abort.bio_to_abort;
@@ -1947,6 +1952,9 @@ bdev_io_do_submit(struct spdk_bdev_channel *bdev_ch, struct spdk_bdev_io *bdev_i
 		if (bdev_abort_queued_io(&shared_resource->nomem_io, bio_to_abort) ||
 		    bdev_abort_buf_io(&mgmt_channel->need_buf_small, bio_to_abort) ||
 		    bdev_abort_buf_io(&mgmt_channel->need_buf_large, bio_to_abort)) {
+#ifdef DEBUG
+			bdev_io->internal.ch->stat.debug_abort_io++;
+#endif
 			_bdev_io_complete_in_submit(bdev_ch, bdev_io,
 						    SPDK_BDEV_IO_STATUS_SUCCESS);
 			return;
@@ -1960,6 +1968,7 @@ bdev_io_do_submit(struct spdk_bdev_channel *bdev_ch, struct spdk_bdev_io *bdev_i
 		bdev->fn_table->submit_request(ch, bdev_io);
 		bdev_io->internal.in_submit_request = false;
 	} else {
+		SPDK_DEBUGLOG(bdev, "SUB_TO_QUEUE %s\n", bdev_io->bdev->name);
 		TAILQ_INSERT_TAIL(&shared_resource->nomem_io, bdev_io, internal.link);
 	}
 }
@@ -2987,6 +2996,62 @@ spdk_bdev_set_timeout(struct spdk_bdev_desc *desc, uint64_t timeout_in_sec,
 	return 0;
 }
 
+static void
+bdev_ch_retry_io(struct spdk_bdev_channel *bdev_ch)
+{
+	struct spdk_bdev *bdev = bdev_ch->bdev;
+	struct spdk_bdev_shared_resource *shared_resource = bdev_ch->shared_resource;
+	struct spdk_bdev_io *bdev_io;
+
+	if (shared_resource->io_outstanding > shared_resource->nomem_threshold) {
+		/*
+		 * Allow some more I/O to complete before retrying the nomem_io queue.
+		 *  Some drivers (such as nvme) cannot immediately take a new I/O in
+		 *  the context of a completion, because the resources for the I/O are
+		 *  not released until control returns to the bdev poller.  Also, we
+		 *  may require several small I/O to complete before a larger I/O
+		 *  (that requires splitting) can be submitted.
+		 */
+		return;
+	}
+
+	while (!TAILQ_EMPTY(&shared_resource->nomem_io)) {
+		bdev_io = TAILQ_FIRST(&shared_resource->nomem_io);
+#ifdef DEBUG
+		bdev_io->internal.ch->stat.debug_retry_io++;
+#endif
+		TAILQ_REMOVE(&shared_resource->nomem_io, bdev_io, internal.link);
+		bdev_io->internal.ch->io_outstanding++;
+		shared_resource->io_outstanding++;
+		bdev_io->internal.status = SPDK_BDEV_IO_STATUS_PENDING;
+		bdev_io->internal.error.nvme.cdw0 = 0;
+		bdev_io->num_retries++;
+		bdev->fn_table->submit_request(spdk_bdev_io_get_io_channel(bdev_io), bdev_io);
+		if (bdev_io->internal.status == SPDK_BDEV_IO_STATUS_NOMEM) {
+			break;
+		}
+	}
+}
+
+static int
+bdev_channel_retry_io_poller(void *ctx)
+{
+	struct spdk_bdev_channel *ch = ctx;
+
+	bdev_ch_retry_io(ch);
+
+	return SPDK_POLLER_BUSY;
+}
+
+void
+bdev_io_stat_reset(struct spdk_bdev_io_stat *bdev_io_stat)
+{
+	memset(bdev_io_stat, 0, sizeof(bdev_io_stat));
+
+	bdev_io_stat->read_latency_ticks_min = UINT64_MAX;
+	bdev_io_stat->write_latency_ticks_min = UINT64_MAX;
+}
+
 static int
 bdev_channel_create(void *io_device, void *ctx_buf)
 {
@@ -3046,7 +3111,7 @@ bdev_channel_create(void *io_device, void *ctx_buf)
 		TAILQ_INSERT_TAIL(&mgmt_ch->shared_resources, shared_resource, link);
 	}
 
-	memset(&ch->stat, 0, sizeof(ch->stat));
+	bdev_io_stat_reset(&ch->stat);
 	ch->stat.ticks_rate = spdk_get_ticks_hz();
 	ch->io_outstanding = 0;
 	TAILQ_INIT(&ch->queued_resets);
@@ -3091,6 +3156,8 @@ bdev_channel_create(void *io_device, void *ctx_buf)
 		new_range->locked_ctx = range->locked_ctx;
 		TAILQ_INSERT_TAIL(&ch->locked_ranges, new_range, tailq);
 	}
+
+	ch->retry_io_poller = SPDK_POLLER_REGISTER(bdev_channel_retry_io_poller, ch, BDEV_RETRY_IO_PERIOD);
 
 	pthread_mutex_unlock(&bdev->internal.mutex);
 
@@ -3264,6 +3331,24 @@ bdev_io_stat_add(struct spdk_bdev_io_stat *total, struct spdk_bdev_io_stat *add)
 	total->read_latency_ticks += add->read_latency_ticks;
 	total->write_latency_ticks += add->write_latency_ticks;
 	total->unmap_latency_ticks += add->unmap_latency_ticks;
+	total->debug_submit_io += add->debug_submit_io;
+	total->debug_retry_io += add->debug_retry_io;
+	total->debug_failed_io += add->debug_failed_io;
+	total->debug_abort_io += add->debug_abort_io;
+
+	if (0 < add->read_latency_ticks_min && add->read_latency_ticks_min < total->read_latency_ticks_min) {
+		total->read_latency_ticks_min = add->read_latency_ticks_min;
+	}
+	if (total->read_latency_ticks_max < add->read_latency_ticks_max) {
+		total->read_latency_ticks_max = add->read_latency_ticks_max;
+	}
+
+	if (0 < add->write_latency_ticks_min && add->write_latency_ticks_min < total->write_latency_ticks_min) {
+		total->write_latency_ticks_min = add->write_latency_ticks_min;
+	}
+	if (total->write_latency_ticks_max < add->write_latency_ticks_max) {
+		total->write_latency_ticks_max = add->write_latency_ticks_max;
+	}
 }
 
 static void
@@ -3275,6 +3360,9 @@ bdev_channel_destroy(void *io_device, void *ctx_buf)
 
 	SPDK_DEBUGLOG(bdev, "Destroying channel %p for bdev %s on thread %p\n", ch, ch->bdev->name,
 		      spdk_get_thread());
+
+
+	spdk_poller_unregister(&ch->retry_io_poller);
 
 	spdk_trace_record(TRACE_BDEV_IOCH_DESTROY, 0, 0, 0, ch->bdev->name,
 			  spdk_thread_get_id(spdk_io_channel_get_thread(ch->channel)));
@@ -4887,6 +4975,16 @@ bdev_get_each_channel_stat(struct spdk_io_channel_iter *i)
 	spdk_for_each_channel_continue(i, 0);
 }
 
+static void
+bdev_reset_each_channel_stat(struct spdk_io_channel_iter *i)
+{
+	struct spdk_io_channel *ch = spdk_io_channel_iter_get_channel(i);
+	struct spdk_bdev_channel *channel = spdk_io_channel_get_ctx(ch);
+
+	bdev_io_stat_reset(&channel->stat);
+	spdk_for_each_channel_continue(i, 0);
+}
+
 void
 spdk_bdev_get_device_stat(struct spdk_bdev *bdev, struct spdk_bdev_io_stat *stat,
 			  spdk_bdev_get_device_stat_cb cb, void *cb_arg)
@@ -4918,6 +5016,23 @@ spdk_bdev_get_device_stat(struct spdk_bdev *bdev, struct spdk_bdev_io_stat *stat
 			      bdev_get_each_channel_stat,
 			      bdev_iostat_ctx,
 			      bdev_get_device_stat_done);
+}
+
+void
+spdk_bdev_reset_device_stat(struct spdk_bdev *bdev)
+{
+	assert(bdev != NULL);
+
+	/* Start with the statistics from previously deleted channel. */
+	pthread_mutex_lock(&bdev->internal.mutex);
+	bdev_io_stat_reset(&bdev->internal.stat);
+	pthread_mutex_unlock(&bdev->internal.mutex);
+
+	/* Then iterate and add the statistics from each existing channel. */
+	spdk_for_each_channel(__bdev_to_io_dev(bdev),
+			      bdev_reset_each_channel_stat,
+				  NULL,
+				  NULL);
 }
 
 int
@@ -5282,40 +5397,6 @@ spdk_bdev_queue_io_wait(struct spdk_bdev *bdev, struct spdk_io_channel *ch,
 	return 0;
 }
 
-static void
-bdev_ch_retry_io(struct spdk_bdev_channel *bdev_ch)
-{
-	struct spdk_bdev *bdev = bdev_ch->bdev;
-	struct spdk_bdev_shared_resource *shared_resource = bdev_ch->shared_resource;
-	struct spdk_bdev_io *bdev_io;
-
-	if (shared_resource->io_outstanding > shared_resource->nomem_threshold) {
-		/*
-		 * Allow some more I/O to complete before retrying the nomem_io queue.
-		 *  Some drivers (such as nvme) cannot immediately take a new I/O in
-		 *  the context of a completion, because the resources for the I/O are
-		 *  not released until control returns to the bdev poller.  Also, we
-		 *  may require several small I/O to complete before a larger I/O
-		 *  (that requires splitting) can be submitted.
-		 */
-		return;
-	}
-
-	while (!TAILQ_EMPTY(&shared_resource->nomem_io)) {
-		bdev_io = TAILQ_FIRST(&shared_resource->nomem_io);
-		TAILQ_REMOVE(&shared_resource->nomem_io, bdev_io, internal.link);
-		bdev_io->internal.ch->io_outstanding++;
-		shared_resource->io_outstanding++;
-		bdev_io->internal.status = SPDK_BDEV_IO_STATUS_PENDING;
-		bdev_io->internal.error.nvme.cdw0 = 0;
-		bdev_io->num_retries++;
-		bdev->fn_table->submit_request(spdk_bdev_io_get_io_channel(bdev_io), bdev_io);
-		if (bdev_io->internal.status == SPDK_BDEV_IO_STATUS_NOMEM) {
-			break;
-		}
-	}
-}
-
 static inline void
 bdev_io_complete(void *ctx)
 {
@@ -5359,11 +5440,23 @@ bdev_io_complete(void *ctx)
 			bdev_io->internal.ch->stat.bytes_read += bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen;
 			bdev_io->internal.ch->stat.num_read_ops++;
 			bdev_io->internal.ch->stat.read_latency_ticks += tsc_diff;
+			if (tsc_diff < bdev_io->internal.ch->stat.read_latency_ticks_min) {
+				bdev_io->internal.ch->stat.read_latency_ticks_min = tsc_diff;
+			}
+			if (tsc_diff > bdev_io->internal.ch->stat.read_latency_ticks_max) {
+				bdev_io->internal.ch->stat.read_latency_ticks_max = tsc_diff;
+			}
 			break;
 		case SPDK_BDEV_IO_TYPE_WRITE:
 			bdev_io->internal.ch->stat.bytes_written += bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen;
 			bdev_io->internal.ch->stat.num_write_ops++;
 			bdev_io->internal.ch->stat.write_latency_ticks += tsc_diff;
+			if (tsc_diff < bdev_io->internal.ch->stat.write_latency_ticks_min) {
+				bdev_io->internal.ch->stat.write_latency_ticks_min = tsc_diff;
+			}
+			if (tsc_diff > bdev_io->internal.ch->stat.write_latency_ticks_max) {
+				bdev_io->internal.ch->stat.write_latency_ticks_max = tsc_diff;
+			}
 			break;
 		case SPDK_BDEV_IO_TYPE_UNMAP:
 			bdev_io->internal.ch->stat.bytes_unmapped += bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen;
@@ -5387,8 +5480,13 @@ bdev_io_complete(void *ctx)
 			}
 			break;
 		default:
+			SPDK_DEBUGLOG(bdev, "BDEV_COMP_OHTER_IO %s, type: %d\n", bdev_io->bdev->name, bdev_io->type);
 			break;
 		}
+#ifdef DEBUG
+	} else {
+		bdev_io->internal.ch->stat.debug_failed_io++;
+#endif
 	}
 
 #ifdef SPDK_CONFIG_VTUNE
