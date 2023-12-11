@@ -385,6 +385,7 @@ bdev_get_cache_bdevs_fn(struct vbdev_ocf *vbdev, void *ctx)
     } else {
         spdk_json_write_named_string(w, "status", "Normal");
     }
+	spdk_json_write_object_end(w);
 
     spdk_json_write_object_end(w);
 }
