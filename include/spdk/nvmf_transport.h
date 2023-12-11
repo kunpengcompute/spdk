@@ -107,7 +107,7 @@ enum cache_status_type {
 	OCF_CACHE_TYPE
 };
 
-// set special value to ensure, when the state of request need to switch in ocf,
+// set special value to ensure, when the stage of request need to switch in ocf,
 // the value changed is what we assign in spdk.
 enum spdk_io_stage {
 	OCF_CACHE_STAGE = 0x5555555,
@@ -118,12 +118,12 @@ enum spdk_io_stage {
 struct nvmf_io_check {
 	struct spdk_nvmf_request *nvmf_req; //nvmf read/write io
 	struct list_head node;
-}
+};
 
 struct bypass_io_inflight {
 	struct spdk_nvmf_request *nvmf_req; //bypass io
 	struct list_head node;
-}
+};
 
 struct spdk_io_check {
 	struct list_head nvmf_io_queue;
@@ -163,7 +163,7 @@ struct spdk_nvmf_request {
 	struct spdk_poller		*poller;
 	struct spdk_bdev_io		*zcopy_bdev_io; /* Contains the bdev_io when using ZCOPY */
 	enum spdk_nvmf_zcopy_phase	zcopy_phase;
-#indef NVMF_IO_CHECK
+#ifdef NVMF_IO_CHECK
 	uint64_t ts;
 	enum spdk_io_stage		io_stage;
 	struct spdk_nvmf_request	*counterpart; /* the original req or the bypass req*/
@@ -221,7 +221,7 @@ struct spdk_nvmf_transport_poll_group {
 struct spdk_nvmf_poll_group {
 	struct spdk_thread				*thread;
 	struct spdk_poller				*poller;
-#ifdef NVMF_IO_CHECK
+#ifdef	NVMF_IO_CHECK
 	struct spdk_poller				*iopoller;
 	struct spdk_io_check				*io_check;
 #endif
