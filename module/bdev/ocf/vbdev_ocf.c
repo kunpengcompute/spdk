@@ -34,6 +34,7 @@
 #include <ocf/ocf.h>
 #include <ocf/ocf_types.h>
 #include <ocf/ocf_mngt.h>
+#include <ocf/ocf_das.h>
 
 #include "ctx.h"
 #include "data.h"
@@ -46,6 +47,10 @@
 #include "spdk/string.h"
 #include "spdk/log.h"
 #include "spdk/cpuset.h"
+#include "spdk/nvmf_transport.h"
+#include "sys/time.h"
+
+#include "spdk/nvme_failure_handle.h"
 
 static struct spdk_bdev_module ocf_if;
 
@@ -565,7 +570,7 @@ vbdev_ocf_io_submit_cb(struct ocf_io *io, int error)
 
 	if (error == 0) {
 		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
-	} else if (error == -ENOMEM) {
+	} else if (error == -OCF_ERR_NO_MEM) {
 		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_NOMEM);
 	} else {
 		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
@@ -686,6 +691,15 @@ vbdev_ocf_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io,
 static void
 vbdev_ocf_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 {
+#ifdef NVMF_IO_CHECK
+	struct spdk_nvmf_request *req = (struct spdk_nvmf_request *)(bdev_io->internal.caller_ctx);
+   	if (req->ts == UINT64_MAX) {
+		SPDK_DEBUGLOG(vbdev_ocf, "add timepoint to nvmf io req\n");
+		struct timeval tv;
+		gettimeofday(&tv, NULL);
+		req->ts = tv.tv_sec;
+	}
+#endif
 	switch (bdev_io->type) {
 	case SPDK_BDEV_IO_TYPE_READ:
 		/* User does not have to allocate io vectors for the request,
@@ -775,6 +789,26 @@ vbdev_ocf_write_json_config(struct spdk_bdev *bdev, struct spdk_json_write_ctx *
 	spdk_json_write_object_end(w);
 }
 
+static void
+vbdev_ocf_get_core_info(struct spdk_bdev *cache_bdev, struct spdk_bdev **out_core_bdev,
+    struct spdk_bdev_desc **out_core_desc, struct spdk_io_channel **out_core_channel)
+{
+    struct vbdev_ocf *vbdev = (struct vbdev_ocf *)cache_bdev->ctxt;
+
+    *out_core_bdev = vbdev->core.bdev;
+    *out_core_desc = vbdev->core.desc;
+    struct spdk_io_channel *ch = spdk_bdev_get_io_channel(vbdev->core.desc);
+    SPDK_DEBUGLOG(vbdev_ocf, "channel is %p\n", ch);
+    *out_core_channel = ch;
+}
+
+static bool
+vbdev_ocf_is_io_need_bypass(struct spdk_bdev *cache_bdev)
+{
+    struct vbdev_ocf *vbdev = (struct vbdev_ocf *)cache_bdev->ctxt;
+    return vbdev->need_bypass;
+}
+
 /* Cache vbdev function table
  * Used by bdev layer */
 static struct spdk_bdev_fn_table cache_dev_fn_table = {
@@ -784,6 +818,8 @@ static struct spdk_bdev_fn_table cache_dev_fn_table = {
 	.get_io_channel	= vbdev_ocf_get_io_channel,
 	.write_config_json = vbdev_ocf_write_json_config,
 	.dump_info_json = vbdev_ocf_dump_info_json,
+	.get_core_info_from_cache_bdev = vbdev_ocf_get_core_info,
+	.is_io_need_bypass = vbdev_ocf_is_io_need_bypass,
 };
 
 /* Poller function for the OCF queue
@@ -1274,6 +1310,8 @@ init_vbdev(const char *vbdev_name,
 	vbdev->cfg.device.cache_line_size = set_cache_line_size;
 	vbdev->cfg.cache.cache_line_size = set_cache_line_size;
 
+	vbdev->need_bypass = false;
+
 	TAILQ_INSERT_TAIL(&g_ocf_vbdev_head, vbdev, tailq);
 	return rc;
 
@@ -1459,6 +1497,18 @@ vbdev_ocf_construct(const char *vbdev_name,
 	struct spdk_bdev *core_bdev = spdk_bdev_get_by_name(core_name);
 	struct vbdev_ocf *vbdev;
 
+	if (cache_bdev == NULL) {
+		SPDK_NOTICElOG("cache device '%s' doesn't exist\n", cache_name);
+		cb(-ENODEV, NULL, cb_arg);
+		return;
+	}
+
+	if (core_bdev == NULL) {
+		SPDK_NOTICElOG("core device '%s' doesn't exist\n", core_name);
+		cb(-ENODEV, NULL, cb_arg);
+		return;
+	}
+
 	rc = init_vbdev(vbdev_name, cache_mode_name, cache_line_size, cache_name, core_name, loadq);
 	if (rc) {
 		cb(rc, NULL, cb_arg);
@@ -1469,15 +1519,6 @@ vbdev_ocf_construct(const char *vbdev_name,
 	if (vbdev == NULL) {
 		cb(-ENODEV, NULL, cb_arg);
 		return;
-	}
-
-	if (cache_bdev == NULL) {
-		SPDK_NOTICELOG("OCF bdev '%s' is waiting for cache device '%s' to connect\n",
-			       vbdev->name, cache_name);
-	}
-	if (core_bdev == NULL) {
-		SPDK_NOTICELOG("OCF bdev '%s' is waiting for core device '%s' to connect\n",
-			       vbdev->name, core_name);
 	}
 
 	rc = attach_base_bdevs(vbdev, cache_bdev, core_bdev);
@@ -1516,6 +1557,20 @@ vbdev_ocf_set_cache_mode(struct vbdev_ocf *vbdev,
 	rc = ocf_mngt_cache_set_mode(cache, cache_mode);
 	ocf_mngt_cache_unlock(cache);
 	cb(rc, vbdev, cb_arg);
+}
+
+void vbdev_ocf_set_das_qos_limit(struct vbdev_ocf *vbdev,
+            uint64_t capacity,
+            uint64_t leak_rate,
+            void (*cb)(void *, int),
+            void *cb_arg)
+{
+#ifdef DEBUG
+    set_das_limiter(vbdev->ocf_core, capacity, leak_rate);
+#else
+    SPDK_WARNLOG("DAS qos limit can be configured only in debug mode\n");
+#endif
+    cb(cb_arg, 0);
 }
 
 /* This called if new device is created in SPDK application
@@ -1794,6 +1849,34 @@ fini_start(void)
 	g_fini_started = true;
 }
 
+static void set_all_related_bdev_bypass_flag(char* name)
+{
+    struct vbdev_ocf *vbdev;
+    int len;
+    TAILQ_FOREACH(vbdev, &g_ocf_vbdev_head, tailq) {
+        SPDK_PRINTF("Checking '%s'\n", vbdev->cache.name);
+        len = strlen(name);
+        if (strncmp(name, vbdev->cache.name, len) == 0) {
+            SPDK_NOTICELOG("Marking '%s' because device '%s' was removed\n", vbdev->name, name);
+            vbdev->need_bypass = true;
+        }
+    }
+}
+
+static bool nvme_have_cas_device(char* name)
+{
+    struct vbdev_ocf *vbdev;
+    int len;
+    TAILQ_FOREACH(vbdev, &g_ocf_vbdev_head, tailq) {
+        SPDK_PRINTF("Checking '%s'\n", vbdev->cache.name);
+        len = strlen(name);
+        if (strncmp(name, vbdev->cache.name, len) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Module-global function table
  * Does not relate to vbdev instances */
 static struct spdk_bdev_module ocf_if = {
@@ -1805,4 +1888,16 @@ static struct spdk_bdev_module ocf_if = {
 	.examine_config = vbdev_ocf_examine,
 	.examine_disk   = vbdev_ocf_examine_disk,
 };
+
+struct bypass_fn_table bypass_if = {
+    .bypass_if = set_all_related_bdev_bypass_flag,
+    .have_cache = nvme_have_cas_device,
+};
+
 SPDK_BDEV_MODULE_REGISTER(ocf, &ocf_if);
+
+static void __attribute__((constructor)) _spdk_bdev_ocf_bypass_if_set(void)
+{
+    set_bypass_set_if(&bypass_if);
+}
+SPDK_LOG_REGISTER_COMPONENT(vbdev_ocf)

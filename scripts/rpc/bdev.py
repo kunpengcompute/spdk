@@ -187,6 +187,31 @@ def bdev_ocf_get_stats(client, name):
 
     return client.call('bdev_ocf_get_stats', params)
 
+def bdev_ocf_reset_stats(client, name):
+    """Reset statistics of chosen OCF block device
+
+    Args:
+        name: name of OCF bdev
+
+    Returns:
+        None
+    """
+    params = {'name': name}
+
+    return client.call('bdev_ocf_reset_stats', params)
+
+def bdev_query_status(client, name):
+    """Query state of nvme or ocf module or das module
+
+    Args:
+        name: nvme or ocf module or das module
+    
+    Returns:
+        State of choson module
+    """
+    params = {'name': name}
+
+    return client.call('bdev_query_status', params)
 
 @deprecated_alias('get_ocf_stats')
 def bdev_ocf_get_bdevs(client, name=None):
@@ -221,6 +246,24 @@ def bdev_ocf_set_cache_mode(client, name, mode):
 
     return client.call('bdev_ocf_set_cache_mode', params)
 
+def bdev_ocf_set_das_qos_limit(client, name, capacity, leak_rate):
+    """Set new DAS qos limit of OCF block device
+
+    Args:
+        name: name of OCF bdev
+        capacity: OCF DAS qos limit capacity
+        leak_rate: OCF DAS qos limit leak_rate
+
+    Returns:
+        New DAS qos limit
+    """
+    params = {
+        'name': name,
+        'capacity': capacity,
+        'leak_rate': leak_rate,
+    }
+
+    return client.call('bdev_ocf_set_das_qos_limit', params)
 
 @deprecated_alias('construct_malloc_bdev')
 def bdev_malloc_create(client, num_blocks, block_size, name=None, uuid=None, optimal_io_boundary=None):
@@ -1255,6 +1298,19 @@ def bdev_get_iostat(client, name=None):
         params['name'] = name
     return client.call('bdev_get_iostat', params)
 
+def bdev_reset_iostat(client, name=None):
+    """Reset I/O statistics for block devices.
+
+    Args:
+        name: bdev name to query (optional; if omitted, query all bdevs)
+
+    Returns:
+        Reset I/O statistics for the requested block devices.
+    """
+    params = {}
+    if name:
+        params['name'] = name
+    return client.call('bdev_reset_iostat', params)
 
 @deprecated_alias('enable_bdev_histogram')
 def bdev_enable_histogram(client, name, enable):
