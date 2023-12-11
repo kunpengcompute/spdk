@@ -77,7 +77,7 @@
 
 struct nvmf_vfio_user_req;
 
-typedef int (*nvmf_vfio_user_req_cb_fn)(struct nvmf_vfio_user_req *req, void *cb_arg);
+typedef int (*nvmf_vfio_user_req_cb_fn)(struct nvmf_vfio_user_req *vu_req, void *cb_arg, struct spdk_nvmf_request *req);
 
 /* 1 more for PRP2 list itself */
 #define NVMF_VFIO_USER_MAX_IOVECS	(NVMF_REQ_MAX_BUFFERS + 1)
@@ -1612,7 +1612,7 @@ consume_admin_cmd(struct nvmf_vfio_user_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
 }
 
 static int
-handle_cmd_rsp(struct nvmf_vfio_user_req *vu_req, void *cb_arg)
+handle_cmd_rsp(struct nvmf_vfio_user_req *vu_req, void *cb_arg, strcut spdk_nvmf_request *req)
 {
 	struct nvmf_vfio_user_sq *vu_sq = cb_arg;
 	struct nvmf_vfio_user_ctrlr *vu_ctrlr = vu_sq->ctrlr;
@@ -1621,6 +1621,7 @@ handle_cmd_rsp(struct nvmf_vfio_user_req *vu_req, void *cb_arg)
 	assert(vu_sq != NULL);
 	assert(vu_req != NULL);
 	assert(vu_ctrlr != NULL);
+	assert(req != NULL);
 
 	if (spdk_likely(vu_req->iovcnt)) {
 		vfu_unmap_sg(vu_ctrlr->endpoint->vfu_ctx, vu_req->sg, vu_req->iov, vu_req->iovcnt);
@@ -1629,11 +1630,11 @@ handle_cmd_rsp(struct nvmf_vfio_user_req *vu_req, void *cb_arg)
 	cqid = vu_sq->sq.cqid;
 
 	return post_completion(vu_ctrlr, vu_ctrlr->cqs[cqid],
-			       vu_req->req.rsp->nvme_cpl.cdw0,
+			       req->rsp->nvme_cpl.cdw0,
 			       sqid,
-			       vu_req->req.cmd->nvme_cmd.cid,
-			       vu_req->req.rsp->nvme_cpl.status.sc,
-			       vu_req->req.rsp->nvme_cpl.status.sct);
+			       req->cmd->nvme_cmd.cid,
+			       req->rsp->nvme_cpl.status.sc,
+			       req->rsp->nvme_cpl.status.sct);
 }
 
 static int
@@ -1855,7 +1856,7 @@ memory_region_remove_cb(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
 }
 
 static int
-nvmf_vfio_user_prop_req_rsp(struct nvmf_vfio_user_req *req, void *cb_arg)
+nvmf_vfio_user_prop_req_rsp(struct nvmf_vfio_user_req *req, void *cb_arg, struct spdk_nvmf_request *req)
 {
 	struct nvmf_vfio_user_sq *vu_sq = cb_arg;
 	struct nvmf_vfio_user_ctrlr *vu_ctrlr;
@@ -3500,7 +3501,7 @@ _post_completion_msg(void *ctx)
 }
 
 static int
-handle_queue_connect_rsp(struct nvmf_vfio_user_req *req, void *cb_arg)
+handle_queue_connect_rsp(struct nvmf_vfio_user_req *req, void *cb_arg, strcut spdk_nvmf_request *req)
 {
 	struct nvmf_vfio_user_poll_group *vu_group;
 	struct nvmf_vfio_user_sq *vu_sq = cb_arg;
@@ -3687,6 +3688,47 @@ nvmf_vfio_user_req_free(struct spdk_nvmf_request *req)
 	return 0;
 }
 
+#ifdef NVMF_IO_CHECK
+bool iterator_list_remove_io(struct list_head list, struct spdk_nvmf_request *req)
+{
+	struct nvmf_io_check *del_req, *q;
+
+	list_for_each_entry_safe(del_req, q, &list, node) {
+		if(del_req->nvmf_req == req) {
+			list_del(&del_req->node);
+			free(del_req);
+			del_req = NULL;
+			SPDK_DEBUGLOG(nvmf_vfio, " delete nvmf io req %p \n", req);
+			return true;
+		}
+	}
+	return false;
+}
+
+void nvmf_io_req_complete(struct spdk_nvmf_request *req, struct spdk_nvmf_request *original_req, struct spdk_nvmf_request *bypass_req,
+		bool should_call_back, bool should_free_vu_req, bool should_free_bypass_req)
+{
+	assert(original_req != NULL);
+
+	struct nvmf_vfio_user_sq *vu_sq = NULL;
+	struct nvmf_vfio_user_req *vu_req = NULL;
+	vu_req = SPDK_CONTAINEROF(original_req, struct nvmf_vfio_user_req, req);
+	vu_sq = SPDK_CONTAINEROF(original_req->qpair, struct nvmf_vfio_user_sq, qpair);
+	if (should_call_back) {
+		// copy data from param req to cpl, not from attribute req in vu_req
+		vu_req->cb_fn(vu_req, vu_req->cb_arg, req);
+	}
+	if (should_free_vu_req) {
+		_nvmf_vfio_user_req_free(vu_sq, vu_req);
+	}
+	if (should_free_bypass_req) {
+		free(bypass_req);
+		bypass_req = NULL;
+	}
+}
+
+#endif
+
 static int
 nvmf_vfio_user_req_complete(struct spdk_nvmf_request *req)
 {
@@ -3699,7 +3741,7 @@ nvmf_vfio_user_req_complete(struct spdk_nvmf_request *req)
 	vu_sq = SPDK_CONTAINEROF(req->qpair, struct nvmf_vfio_user_sq, qpair);
 
 	if (vu_req->cb_fn != NULL) {
-		if (vu_req->cb_fn(vu_req, vu_req->cb_arg) != 0) {
+		if (vu_req->cb_fn(vu_req, vu_req->cb_arg, req) != 0) {
 			fail_ctrlr(vu_sq->ctrlr);
 		}
 	}
@@ -3944,7 +3986,7 @@ handle_cmd_req(struct nvmf_vfio_user_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 			    ctrlr_id(ctrlr), cmd->opc);
 		req->rsp->nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 		req->rsp->nvme_cpl.status.sct = SPDK_NVME_SCT_GENERIC;
-		err = handle_cmd_rsp(vu_req, vu_req->cb_arg);
+		err = handle_cmd_rsp(vu_req, vu_req->cb_arg, req);
 		_nvmf_vfio_user_req_free(vu_sq, vu_req);
 		return err;
 	}
