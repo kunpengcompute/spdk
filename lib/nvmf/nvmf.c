@@ -45,10 +45,18 @@
 
 #include "nvmf_internal.h"
 #include "transport.h"
+#include "ocf/ocf_status.h"
 
 SPDK_LOG_REGISTER_COMPONENT(nvmf)
 
 #define SPDK_NVMF_DEFAULT_MAX_SUBSYSTEMS 1024
+#ifdef NVMF_IO_CHECK
+#define IO_CHECK_TIME_US	3000000
+
+int g_io_timeout_threshold = 30;
+int g_cache_fault_time_threshold = 60;
+int g_cache_fault_io_threshold = 20;
+#endif
 
 static TAILQ_HEAD(, spdk_nvmf_tgt) g_nvmf_tgts = TAILQ_HEAD_INITIALIZER(g_nvmf_tgts);
 
@@ -107,6 +115,113 @@ nvmf_poll_group_poll(void *ctx)
 	return count > 0 ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
 }
 
+#ifdef NVMF_IO_CHECK
+static void add_io_to_bypass_list(struct spdk_io_check *io_check, struct bypass_io_inflight *req)
+{
+	INIT_LIST_HEAD(&req->node);
+	list_add_tail(&req->node, &io_check->bypass_io_queue);
+	env_atomic_inc(&io_checl->bypass_io_no);
+}
+
+int g_fake_timeout = 0;
+int g_fake_timeout_10s = 0;
+
+static int iocheck_poll(void *ctx)
+{
+	struct timeval tv;
+	struct bypass_io_inflight resubmit_list;
+
+	INIT_LIST_HEAD(&resubmit_list.node);
+
+	gettimeofday(&tv, NULL);
+	uint64_t cur = tv.tv.sec;
+
+	struct nvmf_io_check *req;
+	struct spdk_nvmf_poll_group *group = ctx;
+	struct spdk_io_check *io_check = group->io_check;
+
+	list_for_each_entry(req, &io_check->nvmf_io_queue, node) {
+		if (io_check->cache_stat) {
+			break;
+		}
+		uint64_t ts_esp = (req->nvmf_req->ts != UINT64_MAX) ? (cur - req->nvmf_req->ts) : 0;
+		enum spdk_check_io_type io_type = req->nvmf_req->io_type;
+
+// 故障注入用
+#ifdef DEBUG
+		if (g_fake_timeout > 0 && io_type != SPDK_CHECK_IO_BYPASS && req->nvmf_req->io_stage == OCF_CACHE_STAGE) {
+			g_fake_timeout = 0;
+			ts_esp = g_io_timeout_threshold + 1;
+			SPDK_WARNLOG("nvmf in %lus...\n", ts_esp);
+		}
+		
+		if (g_fake_timeout_10s > 0) {
+			g_fake_timeout_10s = 0;
+			// 这里直接置cache stage，为了尽快进入异常分支
+			req->nvmf_req->io_stage = OCF_CACHE_STAGE;
+			ts_esp = g_cache_fault_time_threshold + 1;
+			SPDK_WARNLOG("nvmf in %lus...\n", ts_esp);
+			// 不改变req的io类型，但是又要让io进入超时50s
+			io_type = SPDK_CHECK_IO_BYPASS;
+		}
+#endif
+
+		if (ts_esp <= (unsigned int)g_io_timeout_threshold) {
+			break;
+		} else if (ts_esp > (unsigned int)g_io_timeout_threshold && io_type != SPDK_CHECK_IO_BYPASS && req->nvmf_req->io_stage == OCF_CACHE_STAGE) {
+			req->nvmf_req->io_type = SPDK_CHECK_IO_BYPASS;
+			SPDK_WARNLOG("nvmf io timeout req %p, ts_esp = %lu, cur %lu, req ts %lu\n", req, ts_esp, cur, req->nvmf_req->ts);
+			struct bypass_io_inflight *bypass_req = spdk_nvmf_req_to_bypass_io(req->nvmf_req);
+			INIT_LIST_HEAD(&bypass_req->node);
+			list_add_tail(&bypass_req->node, &resubmit_list.node);
+		} else if (ts_esp > (unsigned int)g_cache_fault_time_threshold && req->nvmf_req->io_stage == OCF_CACHE_STAGE) {
+			io_check->cache_stat = OCF_CACHE_INVAL;
+			spdk_nvmf_set_ocf_status(false);
+			SPDK_WARNLOG("nvmf set cache status inval\n");
+		}
+		SPDK_DEBUGLOG(nvmf, "nvmf io req %p, ts_esp = %lu, cur %lu, req ts %lu\n", req, ts_esp, cur, req->nvmf_req->ts);
+	}
+
+	/* resubmit timeout io and add to bypass queue */
+	int32_t resubmit_no = 0;
+	struct bypass_io_inflight *resend_req, *q;
+
+	list_for_each_entry_safe(resend_req, q, &resubmit_list.node, node) {
+		list_del(&resend_req->node);
+		add_io_to_bypass_list(io_check, resend_req);
+		spdk_nvmf_submit_timeout_io(resend_req);
+		resubmit_no++;
+	}
+
+	if (resubmit_no > g_cache_fault_io_threshold) {
+		io_check->cache_stat = OCF_CACHE_INVAL;
+		SPDK_WARNLOG("too much timeout %s, more than %d, set cache invalid.\n",
+			resubmit_no, g_cache_fault_io_threshold);
+		spdk_nvmf_set_ocf_status(false);
+	}
+
+	return 0;
+}
+
+
+static int io_check_init(struct spdk_nvmf_poll_group *group)
+{
+	group->io_check = calloc(1, sizeof(*group->io_check));
+	if (!group->io_check) {
+		return -1;
+	}
+	env_atomic_set(&group->io_check->nvmf_io_no, 0);
+	env_atomic_set(&group->io_check->bypass_io_no, 0);
+
+	INIT_LIST_HEAD(&group->io_check->nvmf_io_queue);
+	INIT_LIST_HEAD(&group->io_check->bypass_io_queue);
+
+	group->io_check->cache_stat = OCF_CACHE_NORMAL;
+	spdk_nvmf_set_ocf_status(true);
+	return 0;
+}
+#endif
+
 static int
 nvmf_tgt_create_poll_group(void *io_device, void *ctx_buf)
 {
@@ -134,6 +249,11 @@ nvmf_tgt_create_poll_group(void *io_device, void *ctx_buf)
 		return -ENOMEM;
 	}
 
+#ifdef NVMF_IO_CHECK
+	if (io_check_init(group)) {
+		return -ENOMEM;
+	}
+#endif
 	for (sid = 0; sid < tgt->max_subsystems; sid++) {
 		struct spdk_nvmf_subsystem *subsystem;
 
@@ -148,12 +268,15 @@ nvmf_tgt_create_poll_group(void *io_device, void *ctx_buf)
 		}
 	}
 
+
 	pthread_mutex_lock(&tgt->mutex);
 	TAILQ_INSERT_TAIL(&tgt->poll_groups, group, link);
 	pthread_mutex_unlock(&tgt->mutex);
 
 	group->poller = SPDK_POLLER_REGISTER(nvmf_poll_group_poll, group, 0);
-
+#ifdef NVMF_IO_CHECK
+	group->iopoller = SPDK_POLLER_REGISTER(iocheck_poll, group, IO_CHECK_TIME_US);
+#endif
 	SPDK_DTRACE_PROBE1(nvmf_create_poll_group, spdk_thread_get_id(thread));
 
 	return 0;
@@ -193,9 +316,14 @@ nvmf_tgt_destroy_poll_group(void *io_device, void *ctx_buf)
 	}
 
 	free(group->sgroups);
+#ifdef NVMF_IO_CHECK
+	free(group->io_check);
+#endif
 
 	spdk_poller_unregister(&group->poller);
-
+#ifdef NVMF_IO_CHECK
+	spdk_poller_unregister(&group_iopoller);
+#endif
 	if (group->destroy_cb_fn) {
 		group->destroy_cb_fn(group->destroy_cb_arg, 0);
 	}

@@ -44,7 +44,7 @@
  * It is a big number because OCF uses allocators
  * for every request it sends and receives
  */
-#define ENV_ALLOCATOR_NBUFS 32767
+#define ENV_ALLOCATOR_NBUFS 65535
 #define GET_ELEMENTS_COUNT(_limit) (_limit < 0 ? ENV_ALLOCATOR_NBUFS : _limit)
 
 /* Use unique index for env allocators */

@@ -42,6 +42,7 @@
 #include "spdk/string.h"
 #include "nvme_internal.h"
 #include "nvme_pcie_internal.h"
+#include "spdk/nvme_failure_handle.h"
 
 struct nvme_pcie_enum_ctx {
 	struct spdk_nvme_probe_ctx *probe_ctx;
@@ -157,6 +158,9 @@ _nvme_pcie_hotplug_monitor(struct spdk_nvme_probe_ctx *probe_ctx)
 		}
 
 		if (do_remove) {
+			if (has_cas_device(ctrlr->cb_ctx)) {
+				return 0;
+			}
 			nvme_robust_mutex_lock(&ctrlr->ctrlr_lock);
 			nvme_ctrlr_fail(ctrlr, true);
 			nvme_robust_mutex_unlock(&ctrlr->ctrlr_lock);
@@ -1106,6 +1110,23 @@ nvme_pcie_poll_group_free_stats(struct spdk_nvme_transport_poll_group *tgroup,
 	free(stats);
 }
 
+static struct spdk_nvme_ctrlr
+*_find_failed_ctrlr(struct spdk_pci_device *dev)
+{
+	struct spdk_nvme_ctrlr *ctrlr, *tmp;
+	struct nvme_pcie_ctrlr *pctrlr;
+
+	TAILQ_FOREACH_SAFE(ctrlr, &g_spdk_nvme_driver->shared_attached_ctrlrs, tailq, tmp) {
+
+		pctrlr = nvme_pcie_ctrlr(ctrlr);
+
+		if (dev == pctrlr->devhandle) {
+			return ctrlr;
+		}
+	}
+	return NULL;
+}
+
 static struct spdk_pci_id nvme_pci_driver_id[] = {
 	{
 		.class_id = SPDK_PCI_CLASS_NVME,
@@ -1168,4 +1189,13 @@ const struct spdk_nvme_transport_ops pcie_ops = {
 	.poll_group_free_stats = nvme_pcie_poll_group_free_stats
 };
 
+struct ctrlr_detect_fn_table failed_disk_detect_if = {
+	.ctrlr_detector = _find_failed_ctrlr,
+};
+
 SPDK_NVME_TRANSPORT_REGISTER(pcie, &pcie_ops);
+
+static void __attribute__((constructor)) _set_nvme_failure_detect_if_set(void)
+{
+	set_failure_detect_if(&failed_disk_detect_if);
+}

@@ -38,6 +38,8 @@
 #include "spdk/env.h"
 #include "spdk/log.h"
 #include "spdk/string.h"
+#include "spdk/thread.h"
+#include "spdk/nvme_failure_handle.h"
 
 #define SYSFS_PCI_DRIVERS	"/sys/bus/pci/drivers"
 
@@ -262,6 +264,7 @@ pci_device_rte_dev_event(const char *device_name,
 				can_detach = !dev->internal.attached;
 				/* prevent any further attaches */
 				dev->internal.pending_removal = true;
+				set_bypass_flag(dev);
 				break;
 			}
 		}
