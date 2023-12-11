@@ -1717,18 +1717,18 @@ void spdk_bdev_get_io_stat(struct spdk_bdev *bdev, struct spdk_io_channel *ch,
 			   struct spdk_bdev_io_stat *stat);
 
 /**
- * Reset I/O statistics for this channel
+ * Reset I/O statistics for this channel.
  *
  * \param bdev_io_stat The per-channel statistics.
- * 
+ *
  */
-void bdev_io_stat_reset(struct spdk_bdev_io_stat *stat);
-
+void bdev_io_stat_reset(struct spdk_bdev_io_stat *bdev_io_stat);
+ 
 /**
  * Reset I/O statistics per channel for the block device.
  *
  * \param bdev Block device.
- * 
+ *
  */
 void spdk_bdev_reset_device_stat(struct spdk_bdev *bdev);
 
