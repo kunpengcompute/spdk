@@ -3046,12 +3046,12 @@ bdev_channel_retry_io_poller(void *ctx)
 void
 bdev_io_stat_reset(struct spdk_bdev_io_stat *bdev_io_stat)
 {
-	memset(bdev_io_stat, 0, sizeof(bdev_io_stat));
+	memset(bdev_io_stat, 0, sizeof(*bdev_io_stat));
 
 	bdev_io_stat->read_latency_ticks_min = UINT64_MAX;
 	bdev_io_stat->write_latency_ticks_min = UINT64_MAX;
 }
-
+ 
 static int
 bdev_channel_create(void *io_device, void *ctx_buf)
 {
@@ -3335,14 +3335,14 @@ bdev_io_stat_add(struct spdk_bdev_io_stat *total, struct spdk_bdev_io_stat *add)
 	total->debug_retry_io += add->debug_retry_io;
 	total->debug_failed_io += add->debug_failed_io;
 	total->debug_abort_io += add->debug_abort_io;
-
+	 
 	if (0 < add->read_latency_ticks_min && add->read_latency_ticks_min < total->read_latency_ticks_min) {
 		total->read_latency_ticks_min = add->read_latency_ticks_min;
 	}
 	if (total->read_latency_ticks_max < add->read_latency_ticks_max) {
 		total->read_latency_ticks_max = add->read_latency_ticks_max;
 	}
-
+ 
 	if (0 < add->write_latency_ticks_min && add->write_latency_ticks_min < total->write_latency_ticks_min) {
 		total->write_latency_ticks_min = add->write_latency_ticks_min;
 	}
@@ -4980,7 +4980,7 @@ bdev_reset_each_channel_stat(struct spdk_io_channel_iter *i)
 {
 	struct spdk_io_channel *ch = spdk_io_channel_iter_get_channel(i);
 	struct spdk_bdev_channel *channel = spdk_io_channel_get_ctx(ch);
-
+ 
 	bdev_io_stat_reset(&channel->stat);
 	spdk_for_each_channel_continue(i, 0);
 }
@@ -5022,19 +5022,19 @@ void
 spdk_bdev_reset_device_stat(struct spdk_bdev *bdev)
 {
 	assert(bdev != NULL);
-
-	/* Start with the statistics from previously deleted channel. */
+ 
+	/* Start with the statistics from previously deleted channels. */
 	pthread_mutex_lock(&bdev->internal.mutex);
 	bdev_io_stat_reset(&bdev->internal.stat);
 	pthread_mutex_unlock(&bdev->internal.mutex);
-
+ 
 	/* Then iterate and add the statistics from each existing channel. */
 	spdk_for_each_channel(__bdev_to_io_dev(bdev),
 			      bdev_reset_each_channel_stat,
-				  NULL,
-				  NULL);
+			      NULL,
+			      NULL);
 }
-
+ 
 int
 spdk_bdev_nvme_admin_passthru(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 			      const struct spdk_nvme_cmd *cmd, void *buf, size_t nbytes,
