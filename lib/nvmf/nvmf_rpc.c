@@ -2563,7 +2563,7 @@ SPDK_RPC_REGISTER("nvmf_set_req_timeout", rpc_nvmf_set_req_timeout,
 
 static void
 rpc_nvmf_set_req_timeout_10s(struct spdk_jsonrpc_request *request,
-				 const struct json_json_val *params)
+				 const struct spdk_json_val *params)
 {
 	if (params != NULL) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
@@ -2667,7 +2667,7 @@ static const struct spdk_json_object_decoder rpc_cache_fault_time_threshold_deco
 };
 
 static void
-rpc_nvmf_set_cache_fault_time_threshold(struct spdk_jsonrpc_request *request.
+rpc_nvmf_set_cache_fault_time_threshold(struct spdk_jsonrpc_request *request,
 				 const struct spdk_json_val *params)
 {
 	struct rpc_cache_fault_time_threshold_ctx *ctx;
@@ -2727,7 +2727,7 @@ static const struct spdk_json_object_decoder rpc_cache_fault_io_threshold_decode
 };
 
 static void
-rpc_nvmf_set_cache_fault_io_threshold(struct spdk_jsonrpc_request *request.
+rpc_nvmf_set_cache_fault_io_threshold(struct spdk_jsonrpc_request *request,
 				 const struct spdk_json_val *params)
 {
 	struct rpc_cache_fault_io_threshold_ctx *ctx;
@@ -2751,7 +2751,7 @@ rpc_nvmf_set_cache_fault_io_threshold(struct spdk_jsonrpc_request *request.
 	int io_number = ctx->number;
 	if (io_number < MIN_CACHE_FAULT_IO_NUMBER || io_number > MAX_CACHE_FAULT_IO_NUMBER) {
 		spdk_jsonrpc_send_error_response(request, -EINVAL,
-							 "Input param error, io number should bigger than 10 and less than 1000.");
+							 "Input param error, io number should bigger than 10 and less than 1000");
 		goto cleanup;
 	}
 

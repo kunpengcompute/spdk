@@ -158,7 +158,7 @@ _nvme_pcie_hotplug_monitor(struct spdk_nvme_probe_ctx *probe_ctx)
 		}
 
 		if (do_remove) {
-			if (has_cas_device(ctrlr->cb_ctx)) {
+			if (have_cas_device(ctrlr->cb_ctx)) {
 				return 0;
 			}
 			nvme_robust_mutex_lock(&ctrlr->ctrlr_lock);
