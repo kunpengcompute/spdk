@@ -41,6 +41,7 @@
 #include "spdk/string.h"
 #include "spdk/util.h"
 #include "spdk/bit_array.h"
+#include "ocf/ocf_status.h"
 
 #include "spdk_internal/assert.h"
 
@@ -2538,4 +2539,228 @@ rpc_nvmf_subsystem_get_listeners(struct spdk_jsonrpc_request *request,
 	_rpc_nvmf_subsystem_query(request, params, rpc_nvmf_get_listeners_paused);
 }
 SPDK_RPC_REGISTER("nvmf_subsystem_get_listeners", rpc_nvmf_subsystem_get_listeners,
+		  SPDK_RPC_RUNTIME);
+
+extern int g_fake_timeout;
+extern int g_fake_timeout_10s;
+
+static void
+rpc_nvmf_set_req_timeout(struct spdk_jsonrpc_request *request,
+				 const struct spdk_json_val *params)
+{
+	if (params != NULL) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+								"set req timeout method requires no parameters");
+		return;
+	}
+
+	g_fake_timeout = 1;
+	SPDK_WARNLOG("Set timeout to %d.\n", g_fake_timeout);
+	spdk_jsonrpc_send_bool_response(request, true);
+}
+SPDK_RPC_REGISTER("nvmf_set_req_timeout", rpc_nvmf_set_req_timeout,
+		  SPDK_RPC_RUNTIME);
+
+static void
+rpc_nvmf_set_req_timeout_10s(struct spdk_jsonrpc_request *request,
+				 const struct json_json_val *params)
+{
+	if (params != NULL) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+								"set req timeout 10s method requires no parameters");
+		return;
+	}
+
+	g_fake_timeout_10s = 1;
+	SPDK_WARNLOG("Set timeout 10s to %d.\n", g_fake_timeout_10s);
+	spdk_jsonrpc_send_bool_response(request, true);
+}
+SPDK_RPC_REGISTER("nvmf_set_req_timeout_10s", rpc_nvmf_set_req_timeout_10s,
+		  SPDK_RPC_RUNTIME);
+
+static void
+rpc_nvmf_set_ocf_cache_invalid(struct spdk_jsonrpc_request *request,
+				 const struct spdk_json_val *params)
+{
+	if (params != NULL) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+								"set req timeout method requires no parameters");
+		return;
+	}
+
+	spdk_nvmf_set_ocf_status(false);
+	spdk_jsonrpc_send_bool_response(request, true);
+}
+SPDK_RPC_REGISTER("nvmf_set_ocf_cache_invalid", rpc_nvmf_set_ocf_cache_invalid,
+		  SPDK_RPC_RUNTIME);
+
+#define TEN_SECONDS 10
+#define TEN_MINUTES_IN_SECOND 600
+#define MIN_CACHE_FAULT_IO_NUMBER 10
+#define MAX_CACHE_FAULT_IO_NUMBER 1000
+
+extern int g_io_timeout_threshold;
+extern int g_cache_fault_time_threshold;
+struct rpc_io_timeout_threshold_ctx {
+	int time;
+};
+
+static const struct spdk_json_object_decoder rpc_io_timeout_threshold_decoders[] = {
+	{ "time", offsetof(struct rpc_io_timeout_threshold_ctx, time), spdk_json_decode_int32 },
+};
+
+static void
+rpc_nvmf_set_io_timeout_threshold(struct spdk_jsonrpc_request *request,
+				 const struct spdk_json_val *params)
+{
+	struct rpc_io_timeout_threshold_ctx *ctx;
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		SPDK_WARNLOG("Alloc memory failed.\n");
+		spdk_jsonrpc_send_error_response(request, -ENOMEM, spdk_strerror(ENOMEM));
+		return;
+	}
+
+	if (spdk_json_decode_object(params,
+				rpc_io_timeout_threshold_decoders,
+				SPDK_COUNTOF(rpc_io_timeout_threshold_decoders),
+				ctx)) {
+		spdk_jsonrpc_send_error_response(request, -EINVAL,
+							"Failed to parse the request");
+
+		goto cleanup;
+	}
+
+	int cmd_time = ctx->time;
+	if (cmd_time < TEN_SECONDS || cmd_time > TEN_MINUTES_IN_SECOND) {
+		spdk_jsonrpc_send_error_response(request, -EINVAL,
+							 "Input param error, time should bigger than 10 and less equal than 600s.");
+		goto cleanup;
+	}
+
+	// 不能比cache失效的超时时间长
+	if (cmd_time >= g_cache_fault_time_threshold) {
+		SPDK_WARNLOG("Cache fault time %d should not bigger than io time out %d, set fail!.\n",
+			g_cache_fault_time_threshold, cmd_time);
+		spdk_jsonrpc_send_error_response(request, -EINVAL,
+							"Input param error, time should not bigger than cache fault time");
+
+		goto cleanup;
+	}
+
+	g_io_timeout_threshold = cmd_time;
+	SPDK_WARNLOG("Set io timeout threshold to %d.\n", g_io_timeout_threshold);
+	spdk_jsonrpc_send_bool_response(request, true);
+
+cleanup:
+	free(ctx);
+}
+SPDK_RPC_REGISTER("nvmf_set_io_timeout_threshold", rpc_nvmf_set_io_timeout_threshold,
+		  SPDK_RPC_RUNTIME);
+
+struct rpc_cache_fault_time_threshold_ctx {
+	int time;
+};
+
+static const struct spdk_json_object_decoder rpc_cache_fault_time_threshold_decoders[] = {
+	{ "time", offsetof(struct rpc_cache_fault_time_threshold_ctx, time), spdk_json_decode_int32 },
+};
+
+static void
+rpc_nvmf_set_cache_fault_time_threshold(struct spdk_jsonrpc_request *request.
+				 const struct spdk_json_val *params)
+{
+	struct rpc_cache_fault_time_threshold_ctx *ctx;
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		SPDK_WARNLOG("Alloc memory failed.\n");
+		spdk_jsonrpc_send_error_response(request, -ENOMEM, spdk_strerror(ENOMEM));
+		return;
+	}
+	
+	if (spdk_json_decode_object(params,
+				rpc_cache_fault_time_threshold_decoders,
+				SPDK_COUNTOF(rpc_cache_fault_time_threshold_decoders),
+				ctx)) {
+		spdk_jsonrpc_send_error_response(request, -EINVAL,
+							"Failed to parse the request");
+
+		goto cleanup;
+	}
+
+	int cmd_time = ctx->time;
+	if (cmd_time < TEN_SECONDS || cmd_time > TEN_MINUTES_IN_SECOND) {
+		spdk_jsonrpc_send_error_response(request, -EINVAL,
+							 "Input param error, time should bigger than 10 and less equal than 600s.");
+		goto cleanup;
+	}
+
+	// 不能比io超时时间短
+	if (cmd_time >= g_io_timeout_threshold) {
+		SPDK_WARNLOG("Cache fault time %d should not smaller than io time out %d, set fail!.\n",
+			cmd_time, g_io_timeout_threshold);
+		spdk_jsonrpc_send_error_response(request, -EINVAL,
+							"Input param error, time should not smaller than io time out time");
+
+		goto cleanup;
+	}
+
+	g_cache_fault_time_threshold = cmd_time;
+	SPDK_WARNLOG("Set cache fault time threshold to %d.\n", g_cache_fault_time_threshold);
+	spdk_jsonrpc_send_bool_response(request, true);
+
+cleanup:
+	free(ctx);
+}
+SPDK_RPC_REGISTER("nvmf_set_cache_fault_time_threshold", rpc_nvmf_set_cache_fault_time_threshold,
+		  SPDK_RPC_RUNTIME);
+
+
+extern int g_cache_fault_io_threshold;
+
+struct rpc_cache_fault_io_threshold_ctx {
+	int number;
+};
+
+static const struct spdk_json_object_decoder rpc_cache_fault_io_threshold_decoders[] = {
+	{ "number", offsetof(struct rpc_cache_fault_io_threshold_ctx,  number), spdk_json_decode_int32 },
+};
+
+static void
+rpc_nvmf_set_cache_fault_io_threshold(struct spdk_jsonrpc_request *request.
+				 const struct spdk_json_val *params)
+{
+	struct rpc_cache_fault_io_threshold_ctx *ctx;
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		SPDK_WARNLOG("Alloc memory failed.\n");
+		spdk_jsonrpc_send_error_response(request, -ENOMEM, spdk_strerror(ENOMEM));
+		return;
+	}
+	
+	if (spdk_json_decode_object(params,
+				rpc_cache_fault_io_threshold_decoders,
+				SPDK_COUNTOF(rpc_cache_fault_io_threshold_decoders),
+				ctx)) {
+		spdk_jsonrpc_send_error_response(request, -EINVAL,
+							"Failed to parse the request");
+
+		goto cleanup;
+	}
+
+	int io_number = ctx->number;
+	if (io_number < MIN_CACHE_FAULT_IO_NUMBER || io_number > MAX_CACHE_FAULT_IO_NUMBER) {
+		spdk_jsonrpc_send_error_response(request, -EINVAL,
+							 "Input param error, io number should bigger than 10 and less than 1000.");
+		goto cleanup;
+	}
+
+	g_cache_fault_io_threshold = io_number;
+	SPDK_WARNLOG("Set cache fault io threshold to %d.\n", g_cache_fault_io_threshold);
+	spdk_jsonrpc_send_bool_response(request, true);
+
+cleanup:
+	free(ctx);
+}
+SPDK_RPC_REGISTER("nvmf_set_cache_fault_io_threshold", rpc_nvmf_set_cache_fault_io_threshold,
 		  SPDK_RPC_RUNTIME);
