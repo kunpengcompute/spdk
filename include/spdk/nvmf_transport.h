@@ -163,7 +163,7 @@ struct spdk_nvmf_request {
 	struct spdk_poller		*poller;
 	struct spdk_bdev_io		*zcopy_bdev_io; /* Contains the bdev_io when using ZCOPY */
 	enum spdk_nvmf_zcopy_phase	zcopy_phase;
-#ifdef NVMF_IO_CHECK
+#ifdef	NVMF_IO_CHECK
 	uint64_t ts;
 	enum spdk_io_stage		io_stage;
 	struct spdk_nvmf_request	*counterpart; /* the original req or the bypass req*/
