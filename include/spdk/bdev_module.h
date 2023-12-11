@@ -271,8 +271,8 @@ struct spdk_bdev_fn_table {
 	int (*get_memory_domains)(void *ctx, struct spdk_memory_domain **domains, int array_size);
 
 	void (*get_core_info_from_cache_bdev)(struct spdk_bdev *cache_bdev, struct spdk_bdev **out_core_bdev,
-						struct spdk_bdev_desc **out_core_desc, struct spdk_io_cahnnel **out_core_channel);
-	
+						struct spdk_bdev_desc **out_core_desc, struct spdk_io_channel **out_core_channel);
+
 	bool (*is_io_need_bypass)(struct spdk_bdev *cache_bdev);
 };
 
@@ -573,7 +573,7 @@ typedef void (*spdk_bdev_io_get_aux_buf_cb)(struct spdk_io_channel *ch,
 /*
 	Before add/delete any member of this struct, must confirm offset of
 	__bdev_io_internal_fields.caller_ctx is not change; because caller_ctx
-	is used in src/utils/utils_io.c
+	is used in src/utils/utils_io.c.
 */
 struct spdk_bdev_io {
 	/** The block device that this I/O belongs to. */
