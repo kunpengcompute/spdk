@@ -431,7 +431,7 @@ rpc_bdev_reset_iostat(struct spdk_jsonrpc_request *request,
 	}
 	spdk_jsonrpc_send_bool_response(request, true);
 }
-SPDK_RPC_REGISTER("bdev_reset_iostat", rpc_bdev_reset_iostat, SPDK_RPC_RUNTIME);
+SPDK_RPC_REGISTER("bdev_reset_iostat", rpc_bdev_reset_iostat, SPDK_RPC_RUNTIME)
 
 static void
 rpc_dump_bdev_info(struct spdk_json_write_ctx *w,

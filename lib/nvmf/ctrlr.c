@@ -3926,7 +3926,7 @@ static int nvmf_io_list_push(struct spdk_io_check *io_check, struct spdk_nvmf_re
 	return 0;
 }
 
-struct bypass_io_inflight *spdk_nmvf_req_to_bypass_io(struct spdk_nvmf_request *origin_io)
+struct bypass_io_inflight *spdk_nvmf_req_to_bypass_io(struct spdk_nvmf_request *origin_io)
 {
 	struct bypass_io_inflight *retry_io = calloc(1, sizeof(*retry_io));
 	retry_io->nvmf_req = calloc(1, sizeof(*retry_io->nvmf_req));
@@ -3956,7 +3956,7 @@ int spdk_nvmf_submit_timeout_io(void *retry_req)
 	struct bypass_io_inflight *retry_io = (struct bypass_io_inflight *)retry_req;
 	struct spdk_nvmf_request *req = retry_io->nvmf_req;
 	struct spdk_nvme_cmd *cmd = &req->cmd->nvme_cmd;
-	struct spdk_nmve_cpl *response = &req->rsp->nvme_cpl;
+	struct spdk_nvme_cpl *response = &req->rsp->nvme_cpl;
 	struct spdk_bdev *core_bdev = NULL;
 	struct spdk_bdev_desc *core_desc = NULL;
 	struct spdk_io_channel *core_ch = NULL;
@@ -3980,7 +3980,7 @@ int spdk_nvmf_submit_timeout_io(void *retry_req)
 				bdev->fn_table->get_core_info_from_cache_bdev(bdev, &core_bdev, &core_desc, &core_ch);
 				return nvmf_bdev_ctrlr_write_cmd(core_bdev, core_desc, core_ch, req);
 			} else {
-				SPDK_ERRLOG("SPDK OCF no get_core_info_from_cache_bdev func.\n");
+				SPDK_ERRLOG("SPDK OCF but no get_core_info_from_cache_bdev func.\n");
 			}
 			break;
 		default:
@@ -4097,21 +4097,21 @@ nvmf_ctrlr_process_io_cmd(struct spdk_nvmf_request *req)
 		switch (cmd->opc) {
 		case SPDK_NVME_OPC_READ:
 			if ((bdev->fn_table->is_io_need_bypass != NULL) && (bdev->fn_table->is_io_need_bypass(bdev))) {
-				bdev->fn_table->get_core_info_from_cache_bdev(bdev, &core_bdev, *core_desc, &core_ch);
+				bdev->fn_table->get_core_info_from_cache_bdev(bdev, &core_bdev, &core_desc, &core_ch);
 				return nvmf_bdev_ctrlr_read_cmd(core_bdev, core_desc, core_ch, req);
 			}
 			if (!spdk_nvmf_get_ocf_status()) {
-				bdev->fn_table->get_core_info_from_cache_bdev(bdev, &core_bdev, *core_desc, &core_ch);
+				bdev->fn_table->get_core_info_from_cache_bdev(bdev, &core_bdev, &core_desc, &core_ch);
 				return nvmf_bdev_ctrlr_read_cmd(core_bdev, core_desc, core_ch, req);
 			}
 			return nvmf_bdev_ctrlr_read_cmd(bdev, desc, ch, req);
 		case SPDK_NVME_OPC_WRITE:
 			if ((bdev->fn_table->is_io_need_bypass != NULL) && (bdev->fn_table->is_io_need_bypass(bdev))) {
-				bdev->fn_table->get_core_info_from_cache_bdev(bdev, &core_bdev, *core_desc, &core_ch);
+				bdev->fn_table->get_core_info_from_cache_bdev(bdev, &core_bdev, &core_desc, &core_ch);
 				return nvmf_bdev_ctrlr_write_cmd(core_bdev, core_desc, core_ch, req);
 			}
 			if (!spdk_nvmf_get_ocf_status()) {
-				bdev->fn_table->get_core_info_from_cache_bdev(bdev, &core_bdev, *core_desc, &core_ch);
+				bdev->fn_table->get_core_info_from_cache_bdev(bdev, &core_bdev, &core_desc, &core_ch);
 				return nvmf_bdev_ctrlr_write_cmd(core_bdev, core_desc, core_ch, req);
 			}
 			return nvmf_bdev_ctrlr_write_cmd(bdev, desc, ch, req);

@@ -120,7 +120,7 @@ static void add_io_to_bypass_list(struct spdk_io_check *io_check, struct bypass_
 {
 	INIT_LIST_HEAD(&req->node);
 	list_add_tail(&req->node, &io_check->bypass_io_queue);
-	env_atomic_inc(&io_checl->bypass_io_no);
+	env_atomic_inc(&io_check->bypass_io_no);
 }
 
 int g_fake_timeout = 0;
@@ -134,7 +134,7 @@ static int iocheck_poll(void *ctx)
 	INIT_LIST_HEAD(&resubmit_list.node);
 
 	gettimeofday(&tv, NULL);
-	uint64_t cur = tv.tv.sec;
+	uint64_t cur = tv.tv_sec;
 
 	struct nvmf_io_check *req;
 	struct spdk_nvmf_poll_group *group = ctx;
@@ -195,7 +195,7 @@ static int iocheck_poll(void *ctx)
 
 	if (resubmit_no > g_cache_fault_io_threshold) {
 		io_check->cache_stat = OCF_CACHE_INVAL;
-		SPDK_WARNLOG("too much timeout %s, more than %d, set cache invalid.\n",
+		SPDK_WARNLOG("too much timeout %d, more than %d, set cache invalid.\n",
 			resubmit_no, g_cache_fault_io_threshold);
 		spdk_nvmf_set_ocf_status(false);
 	}
@@ -322,7 +322,7 @@ nvmf_tgt_destroy_poll_group(void *io_device, void *ctx_buf)
 
 	spdk_poller_unregister(&group->poller);
 #ifdef NVMF_IO_CHECK
-	spdk_poller_unregister(&group_iopoller);
+	spdk_poller_unregister(&group->iopoller);
 #endif
 	if (group->destroy_cb_fn) {
 		group->destroy_cb_fn(group->destroy_cb_arg, 0);
