@@ -1498,13 +1498,13 @@ vbdev_ocf_construct(const char *vbdev_name,
 	struct vbdev_ocf *vbdev;
 
 	if (cache_bdev == NULL) {
-		SPDK_NOTICElOG("cache device '%s' doesn't exist\n", cache_name);
+		SPDK_NOTICELOG("cache device '%s' doesn't exist\n", cache_name);
 		cb(-ENODEV, NULL, cb_arg);
 		return;
 	}
 
 	if (core_bdev == NULL) {
-		SPDK_NOTICElOG("core device '%s' doesn't exist\n", core_name);
+		SPDK_NOTICELOG("core device '%s' doesn't exist\n", core_name);
 		cb(-ENODEV, NULL, cb_arg);
 		return;
 	}
