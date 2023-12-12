@@ -60,26 +60,26 @@ if __name__ == "__main__":
     # get stats of ocf
     def bdev_ocf_get_stats(args):
         stat = rpc.bdev.bdev_ocf_get_stats(args.client,
-                                            name=args.name)
+                                           name=args.name)
         if not stat:
             print("empty object")
             exit(1)
   
         print_order = ['usage', 'requests', 'blocks', 'debug_io', 'errors']
         group = {'usage': [['occupancy', 'free', 'clean', 'dirty']],
-                'requests': [['rd_hits', 'rd_partial_misses', 'rd_full_misses', 'rd_total', 'rd_pt'],
-                             ['wr_hits', 'wr_partial_misses', 'wr_full_misses', 'wr_total', 'wr_pt'],
-                             ['pf_partial_misses', 'pf_full_miss', 'pf_total', 'pf_pt'],
-                             ['serviced', 'total']],
-                'blocks': [['core_volume_rd', 'core_volume_wr', 'core_volume_total'],
-                           ['cache_volume_rd', 'cache_volume_wr', 'cache_volume_total'],
-                           ['volume_rd', 'volume_wr', 'volume_total'],
-                           ['prefetch_total'],
-                           ['das_limit_io_total']],
-                'debug_io': [['entry_rd', 'entry_wr']],
-                'errors': [['core_volume_rd', 'core_volume_wr', 'core_volume_total'],
-                           ['cache_volume_rd', 'cache_volume_wr', 'cache_volume_total'],
-                           ['total']]}
+                 'requests': [['rd_hits', 'rd_partial_misses', 'rd_full_misses', 'rd_total', 'rd_pt'],
+                              ['wr_hits', 'wr_partial_misses', 'wr_full_misses', 'wr_total', 'wr_pt'],
+                              ['pf_partial_misses', 'pf_full_miss', 'pf_total', 'pf_pt'],
+                              ['serviced', 'total']],
+                 'blocks': [['core_volume_rd', 'core_volume_wr', 'core_volume_total'],
+                            ['cache_volume_rd', 'cache_volume_wr', 'cache_volume_total'],
+                            ['volume_rd', 'volume_wr', 'volume_total'],
+                            ['prefetch_total'],
+                            ['das_limit_io_total']],
+                 'debug_io': [['entry_rd', 'entry_wr']],
+                 'errors': [['core_volume_rd', 'core_volume_wr', 'core_volume_total'],
+                            ['cache_volume_rd', 'cache_volume_wr', 'cache_volume_total'],
+                            ['total']]}
         for key in print_order:
             value = group[key]
             table = prettytable.PrettyTable()
@@ -94,10 +94,10 @@ if __name__ == "__main__":
                 for idx, metric_name in enumerate(metrics):
                     if (idx == len(metrics)-1):
                         table.add_row([metric_name, stat[key][metric_name]['count'],
-                                    stat[key][metric_name]['percentage'], stat[key][metric_name]['units']], divider=True)
+                                  stat[key][metric_name]['percentage'], stat[key][metric_name]['units']], divider=True)
                     else:
                         table.add_row([metric_name, stat[key][metric_name]['count'],
-                                    stat[key][metric_name]['percentage'], stat[key][metric_name]['units']], divider=False)
+                                  stat[key][metric_name]['percentage'], stat[key][metric_name]['units']], divider=False)
             print(table, '\n')
 
     ocf_stats_parser = subparsers.add_parser('bdev_ocf_get_stats', aliases=['get_ocf_stats'],
@@ -151,7 +151,7 @@ if __name__ == "__main__":
             print(table, '\n')
 
     iostat_parser = subparsers.add_parser('bdev_get_iostat', aliases=['get_bdevs_iostat'],
-                                help='Display current I/O statistics of all the blockdevs or required blockdev.')
+                              help='Display current I/O statistics of all the blockdevs or required blockdev.')
     iostat_parser.add_argument('-b', '--name', help="Name of the Blockdev. Example: Nvme0n1", required=False)
     iostat_parser.set_defaults(func=bdev_get_iostat)
 
@@ -168,7 +168,7 @@ if __name__ == "__main__":
     # query status of nvme or module
     def bdev_query_status(args):
         print_dict(rpc.bdev.bdev_query_status(args.client,
-                                            name=args.name))
+                                             name=args.name))
     p = subparsers.add_parser('bdev_query_status', help='Query state of nvme or ocf module or das module')
     p.add_argument('name', help='das or nvme or ocf', choices=['das', 'nvme', 'ocf'])
     p.set_defaults(func=bdev_query_status)
