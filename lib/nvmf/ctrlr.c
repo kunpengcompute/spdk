@@ -32,7 +32,6 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include "sys/time.h"
 #include "spdk/stdinc.h"
 #include "nvmf_internal.h"
 #include "transport.h"

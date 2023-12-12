@@ -38,8 +38,6 @@
 #include "spdk/env.h"
 #include "spdk/log.h"
 #include "spdk/string.h"
-#include "spdk/thread.h"
-#include "spdk/nvme_failure_handle.h"
 
 #define SYSFS_PCI_DRIVERS	"/sys/bus/pci/drivers"
 
