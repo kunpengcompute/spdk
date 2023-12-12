@@ -4004,10 +4004,11 @@ nvmf_ctrlr_process_io_cmd(struct spdk_nvmf_request *req)
 	struct spdk_nvme_cpl *response = &req->rsp->nvme_cpl;
 	struct spdk_nvmf_subsystem_pg_ns_info *ns_info;
 	enum spdk_nvme_ana_state ana_state;
+#ifdef NVMF_IO_CHECK
 	struct spdk_bdev *core_bdev = NULL;
 	struct spdk_bdev_desc *core_desc = NULL;
 	struct spdk_io_channel *core_ch = NULL;
-
+#endif
 	/* pre-set response details for this command */
 	response->status.sc = SPDK_NVME_SC_SUCCESS;
 	nsid = cmd->nsid;
@@ -4096,6 +4097,7 @@ nvmf_ctrlr_process_io_cmd(struct spdk_nvmf_request *req)
 #endif
 		switch (cmd->opc) {
 		case SPDK_NVME_OPC_READ:
+#ifdef NVMF_IO_CHECK
 			if ((bdev->fn_table->is_io_need_bypass != NULL) && (bdev->fn_table->is_io_need_bypass(bdev))) {
 				bdev->fn_table->get_core_info_from_cache_bdev(bdev, &core_bdev, &core_desc, &core_ch);
 				return nvmf_bdev_ctrlr_read_cmd(core_bdev, core_desc, core_ch, req);
@@ -4104,8 +4106,10 @@ nvmf_ctrlr_process_io_cmd(struct spdk_nvmf_request *req)
 				bdev->fn_table->get_core_info_from_cache_bdev(bdev, &core_bdev, &core_desc, &core_ch);
 				return nvmf_bdev_ctrlr_read_cmd(core_bdev, core_desc, core_ch, req);
 			}
+#endif
 			return nvmf_bdev_ctrlr_read_cmd(bdev, desc, ch, req);
 		case SPDK_NVME_OPC_WRITE:
+#ifdef NVMF_IO_CHECK
 			if ((bdev->fn_table->is_io_need_bypass != NULL) && (bdev->fn_table->is_io_need_bypass(bdev))) {
 				bdev->fn_table->get_core_info_from_cache_bdev(bdev, &core_bdev, &core_desc, &core_ch);
 				return nvmf_bdev_ctrlr_write_cmd(core_bdev, core_desc, core_ch, req);
@@ -4114,6 +4118,7 @@ nvmf_ctrlr_process_io_cmd(struct spdk_nvmf_request *req)
 				bdev->fn_table->get_core_info_from_cache_bdev(bdev, &core_bdev, &core_desc, &core_ch);
 				return nvmf_bdev_ctrlr_write_cmd(core_bdev, core_desc, core_ch, req);
 			}
+#endif
 			return nvmf_bdev_ctrlr_write_cmd(bdev, desc, ch, req);
 		case SPDK_NVME_OPC_COMPARE:
 			return nvmf_bdev_ctrlr_compare_cmd(bdev, desc, ch, req);
