@@ -624,7 +624,7 @@ def nvmf_set_io_timeout_threshold(client, time):
     return client.call('nvmf_set_io_timeout_threshold', params)
 
 def nvmf_set_cache_fault_time_threshold(client, time):
-    """Set cache fault threshold
+    """Set cache fault threashold
 
     Args:
         cache fault threshold: timeout in second
@@ -650,7 +650,6 @@ def nvmf_set_cache_fault_io_threshold(client, number):
     params = {'number': number}
 
     return client.call('nvmf_set_cache_fault_io_threshold', params)
-
 
 def nvmf_set_crdt(client, crdt1=None, crdt2=None, crdt3=None):
     """Set the 3 crdt (Command Retry Delay Time) values
