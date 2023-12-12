@@ -365,13 +365,13 @@ free_rpc_bdev_query_status(struct rpc_bdev_query_status *r)
 }
 
 static const struct spdk_json_object_decoder rpc_bdev_query_status_decoders[] = {
-    {"name", offsetof(struct rpc_bdev_query_status, name), spdk_json_decode_string, true},
+	{"name", offsetof(struct rpc_bdev_query_status, name), spdk_json_decode_string, true},
 };
 
 static void
 bdev_get_cache_bdevs_fn(struct vbdev_ocf *vbdev, void *ctx)
 {
-	struct spdk_json_write_ctx *w =ctx;
+	struct spdk_json_write_ctx *w = ctx;
 
 	spdk_json_write_object_begin(w);
 	spdk_json_write_named_string(w, "name", vbdev->name);
@@ -434,7 +434,7 @@ rpc_bdev_query_status(struct spdk_jsonrpc_request *request,
 		goto end;
 	}
 end:
-    free_rpc_bdev_query_status(&req);
+	free_rpc_bdev_query_status(&req);
 }
 SPDK_RPC_REGISTER("bdev_query_status", rpc_bdev_query_status, SPDK_RPC_RUNTIME)
 
@@ -600,9 +600,9 @@ SPDK_RPC_REGISTER("bdev_ocf_set_cache_mode", rpc_bdev_ocf_set_cache_mode, SPDK_R
 
 
 struct rpc_bdev_ocf_set_das_qos_limit {
-	char *name;         /*main vbdev */
-	uint64_t capacity;  /* OCF das limiter capacity */
-	uint64_t leak_rate; /* OCF das limiter leak_rate */
+	char *name;			/*main vbdev */
+	uint64_t capacity;	/* OCF das limiter capacity */
+	uint64_t leak_rate;	/* OCF das limiter leak_rate */
 };
 
 static void
@@ -634,7 +634,7 @@ das_qos_limit_cb(void *cb_arg, int status)
 
 static void
 rpc_bdev_ocf_set_das_qos_limit(struct spdk_jsonrpc_request *request,
-            const struct spdk_json_val *params)
+			    const struct spdk_json_val *params)
 {
 	struct rpc_bdev_ocf_set_das_qos_limit req = {NULL};
 	struct vbdev_ocf *vbdev;

@@ -55,13 +55,13 @@ vbdev_ocf_stats_reset(ocf_cache_t cache, char *core_name)
 	ocf_core_t core;
 
 	status = ocf_core_get_by_name(cache, core_name, strlen(core_name), &core);
-	if(status) {
+	if (status) {
 		return status;
 	}
 
 	ocf_core_stats_initialize(core);
 
-return 0;
+	return 0;
 }
 
 #define WJSON_STAT(w, stats, group, field, units) \
