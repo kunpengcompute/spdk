@@ -51,17 +51,17 @@ vbdev_ocf_stats_get(ocf_cache_t cache, char *core_name, struct vbdev_ocf_stats *
 int
 vbdev_ocf_stats_reset(ocf_cache_t cache, char *core_name)
 {
-    int status;
-    ocf_core_t core;
+	int status;
+	ocf_core_t core;
 
-    status = ocf_core_get_by_name(cache, core_name, strlen(core_name), &core);
-    if(status) {
-        return status;
-    }
-    
-    ocf_core_stats_initialize(core);
+	status = ocf_core_get_by_name(cache, core_name, strlen(core_name), &core);
+	if (status) {
+		return status;
+	}
 
-    return 0;
+	ocf_core_stats_initialize(core);
+
+	return 0;
 }
 
 #define WJSON_STAT(w, stats, group, field, units) \
@@ -98,9 +98,9 @@ vbdev_ocf_stats_write_json(struct spdk_json_write_ctx *w, struct vbdev_ocf_stats
 	WJSON_STAT(w, stats, reqs, wr_pt, "Requests");
 
 	WJSON_STAT(w, stats, reqs, pf_partial_misses, "Requests");
-    WJSON_STAT(w, stats, reqs, pf_full_miss, "Requests");
-    WJSON_STAT(w, stats, reqs, pf_total, "Requests");
-    WJSON_STAT(w, stats, reqs, pf_pt, "Requests");
+	WJSON_STAT(w, stats, reqs, pf_full_miss, "Requests");
+	WJSON_STAT(w, stats, reqs, pf_total, "Requests");
+	WJSON_STAT(w, stats, reqs, pf_pt, "Requests");
 
 	WJSON_STAT(w, stats, reqs, serviced, "Requests");
 	WJSON_STAT(w, stats, reqs, total, "Requests");
@@ -117,12 +117,12 @@ vbdev_ocf_stats_write_json(struct spdk_json_write_ctx *w, struct vbdev_ocf_stats
 	WJSON_STAT(w, stats, blocks, volume_wr, "4KiB blocks");
 	WJSON_STAT(w, stats, blocks, volume_total, "4KiB blocks");
 	WJSON_STAT(w, stats, blocks, prefetch_total, "4KiB blocks");
-    WJSON_STAT(w, stats, blocks, das_limit_io_total, "4KiB blocks");
-    spdk_json_write_object_end(w);
-	
-    spdk_json_write_named_object_begin(w, "debug_io");
-    WJSON_STAT(w, stats, debug_io, entry_rd, "Requests");
-    WJSON_STAT(w, stats, debug_io, entry_wr, "Requests");
+	WJSON_STAT(w, stats, blocks, das_limit_io_total, "4KiB blocks");
+	spdk_json_write_object_end(w);
+
+	spdk_json_write_named_object_begin(w, "debug_io");
+	WJSON_STAT(w, stats, debug_io, entry_rd, "Requests");
+	WJSON_STAT(w, stats, debug_io, entry_wr, "Requests");
 	spdk_json_write_object_end(w);
 
 	spdk_json_write_named_object_begin(w, "errors");

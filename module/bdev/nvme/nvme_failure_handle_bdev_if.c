@@ -28,7 +28,7 @@ void _do_set_bypass_flag(void *ctx)
     ctrlr = (struct nvme_ctrlr *)ctx;
     RB_FOREACH_SAFE(ns, nvme_ns_tree, &ctrlr->namespaces, tmp) {
         // 获取cache设备的名称
-        cache_name =  ns->bdev->disk.name;
+        cache_name = ns->bdev->disk.name;
         g_bypass_if.bypass_if(cache_name);
     }
 }
@@ -40,7 +40,7 @@ bool have_cas_device(void *ctx)
     struct nvme_ctrlr *ctrlr = (struct nvme_ctrlr *)ctx;
     RB_FOREACH_SAFE(ns, nvme_ns_tree, &ctrlr->namespaces, tmp) {
         // 获取cache设备的名称
-        dev_name =  ns->bdev->disk.name;
+        dev_name = ns->bdev->disk.name;
         if (g_bypass_if.have_cache(dev_name))
             return true;
     }
