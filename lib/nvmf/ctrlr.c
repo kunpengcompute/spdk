@@ -36,9 +36,6 @@
 #include "spdk/stdinc.h"
 #include "nvmf_internal.h"
 #include "transport.h"
-#ifdef NVMF_IO_CHECK
-#include "spdk/bdev_module.h"
-#endif
 #include "spdk/bit_array.h"
 #include "spdk/endian.h"
 #include "spdk/thread.h"
@@ -3907,89 +3904,6 @@ spdk_nvmf_request_zcopy_end(struct spdk_nvmf_request *req, bool commit)
 	nvmf_bdev_ctrlr_zcopy_end(req, commit);
 }
 
-#ifdef NVMF_IO_CHECK
-static int nvmf_io_list_push(struct spdk_io_check *io_check, struct spdk_nvmf_request *req)
-{
-	struct nvmf_io_check *nvmf_io = calloc(1, sizeof(*nvmf_io));
-	if (!nvmf_io) {
-		SPDK_ERRLOG("no memory\n");
-		return -1;
-	}
-
-	nvmf_io->nvmf_req = req;
-
-	INIT_LIST_HEAD(&nvmf_io->node);
-
-	list_add_tail(&nvmf_io->node, &io_check->nvmf_io_queue);
-	env_atomic_inc(&io_check->nvmf_io_no);
-
-	return 0;
-}
-
-struct bypass_io_inflight *spdk_nvmf_req_to_bypass_io(struct spdk_nvmf_request *origin_io)
-{
-	struct bypass_io_inflight *retry_io = calloc(1, sizeof(*retry_io));
-	retry_io->nvmf_req = calloc(1, sizeof(*retry_io->nvmf_req));
-	memcpy(retry_io->nvmf_req, origin_io, sizeof(*origin_io));
- 
-	retry_io->nvmf_req->io_type = SPDK_CHECK_IO_NORMAL;
-	retry_io->nvmf_req->arrive_complete = false;
-	retry_io->nvmf_req->counterpart = origin_io;
-	origin_io->counterpart = retry_io->nvmf_req;
-
-	return retry_io;
-}
-
-void spdk_nvmf_free_bypass_io(struct bypass_io_inflight *retry_io)
-{
-	if (retry_io) {
-		if (retry_io->nvmf_req != NULL) {
-			free(retry_io->nvmf_req);
-		}
-		free(retry_io);
-	}
-	return;
-}
-
-int spdk_nvmf_submit_timeout_io(void *retry_req)
-{
-	struct bypass_io_inflight *retry_io = (struct bypass_io_inflight *)retry_req;
-	struct spdk_nvmf_request *req = retry_io->nvmf_req;
-	struct spdk_nvme_cmd *cmd = &req->cmd->nvme_cmd;
-	struct spdk_nvme_cpl *response = &req->rsp->nvme_cpl;
-	struct spdk_bdev *core_bdev = NULL;
-	struct spdk_bdev_desc *core_desc = NULL;
-	struct spdk_io_channel *core_ch = NULL;
-	struct spdk_bdev *bdev;
-
-	/* pre-set response details for this command */
-	response->status.sc = SPDK_NVME_SC_SUCCESS;
-	bdev = req->bdev;
-
-	switch (cmd->opc) {
-		case SPDK_NVME_OPC_READ:
-			if (bdev->fn_table->get_core_info_from_cache_bdev != NULL) {
-				bdev->fn_table->get_core_info_from_cache_bdev(bdev, &core_bdev, &core_desc, &core_ch);
-				return nvmf_bdev_ctrlr_read_cmd(core_bdev, core_desc, core_ch, req);
-			} else {
-				SPDK_ERRLOG("SPDK OCF no get_core_info_from_cache_bdev func.\n");
-			}
-			break;
-		case SPDK_NVME_OPC_WRITE:
-			if (bdev->fn_table->get_core_info_from_cache_bdev != NULL) {
-				bdev->fn_table->get_core_info_from_cache_bdev(bdev, &core_bdev, &core_desc, &core_ch);
-				return nvmf_bdev_ctrlr_write_cmd(core_bdev, core_desc, core_ch, req);
-			} else {
-				SPDK_ERRLOG("SPDK OCF but no get_core_info_from_cache_bdev func.\n");
-			}
-			break;
-		default:
-			return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
-	}
-	return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
-}
-#endif
-
 int
 nvmf_ctrlr_process_io_cmd(struct spdk_nvmf_request *req)
 {
@@ -4004,11 +3918,6 @@ nvmf_ctrlr_process_io_cmd(struct spdk_nvmf_request *req)
 	struct spdk_nvme_cpl *response = &req->rsp->nvme_cpl;
 	struct spdk_nvmf_subsystem_pg_ns_info *ns_info;
 	enum spdk_nvme_ana_state ana_state;
-#ifdef NVMF_IO_CHECK
-	struct spdk_bdev *core_bdev = NULL;
-	struct spdk_bdev_desc *core_desc = NULL;
-	struct spdk_io_channel *core_ch = NULL;
-#endif
 	/* pre-set response details for this command */
 	response->status.sc = SPDK_NVME_SC_SUCCESS;
 	nsid = cmd->nsid;
@@ -4080,45 +3989,10 @@ nvmf_ctrlr_process_io_cmd(struct spdk_nvmf_request *req)
 		assert(req->zcopy_phase == NVMF_ZCOPY_PHASE_INIT);
 		return nvmf_bdev_ctrlr_zcopy_start(bdev, desc, ch, req);
 	} else {
-#ifdef NVMF_IO_CHECK
-		if (cmd->opc == SPDK_NVME_OPC_WRITE || cmd->opc == SPDK_NVME_OPC_READ) {
-			struct spdk_io_check *io_check = req->qpair->group->io_check;
-			if (nvmf_io_list_push(io_check, req)) {
-				SPDK_DEBUGLOG(nvmf, "nvmf push io failed\n");
-				return SPDK_NVMF_REQUEST_EXEC_STATUS_ASYNCHRONOUS;
-			}
-			req->io_type = SPDK_CHECK_IO_NORMAL;
-			req->io_stage = OCF_CACHE_STAGE;
-			req->ts = UINT64_MAX;
-			req->arrive_complete = false;
-			req->counterpart = NULL;
-			req->bdev = bdev;
-		}
-#endif
 		switch (cmd->opc) {
 		case SPDK_NVME_OPC_READ:
-#ifdef NVMF_IO_CHECK
-			if ((bdev->fn_table->is_io_need_bypass != NULL) && (bdev->fn_table->is_io_need_bypass(bdev))) {
-				bdev->fn_table->get_core_info_from_cache_bdev(bdev, &core_bdev, &core_desc, &core_ch);
-				return nvmf_bdev_ctrlr_read_cmd(core_bdev, core_desc, core_ch, req);
-			}
-			if (!spdk_nvmf_get_ocf_status()) {
-				bdev->fn_table->get_core_info_from_cache_bdev(bdev, &core_bdev, &core_desc, &core_ch);
-				return nvmf_bdev_ctrlr_read_cmd(core_bdev, core_desc, core_ch, req);
-			}
-#endif
 			return nvmf_bdev_ctrlr_read_cmd(bdev, desc, ch, req);
 		case SPDK_NVME_OPC_WRITE:
-#ifdef NVMF_IO_CHECK
-			if ((bdev->fn_table->is_io_need_bypass != NULL) && (bdev->fn_table->is_io_need_bypass(bdev))) {
-				bdev->fn_table->get_core_info_from_cache_bdev(bdev, &core_bdev, &core_desc, &core_ch);
-				return nvmf_bdev_ctrlr_write_cmd(core_bdev, core_desc, core_ch, req);
-			}
-			if (!spdk_nvmf_get_ocf_status()) {
-				bdev->fn_table->get_core_info_from_cache_bdev(bdev, &core_bdev, &core_desc, &core_ch);
-				return nvmf_bdev_ctrlr_write_cmd(core_bdev, core_desc, core_ch, req);
-			}
-#endif
 			return nvmf_bdev_ctrlr_write_cmd(bdev, desc, ch, req);
 		case SPDK_NVME_OPC_COMPARE:
 			return nvmf_bdev_ctrlr_compare_cmd(bdev, desc, ch, req);
@@ -4180,53 +4054,6 @@ _nvmf_request_complete(void *ctx)
 	bool paused;
 	uint8_t opcode;
 
-#ifdef NVMF_IO_CHECK
-	struct spdk_io_check *io_check = req->qpair->group->io_check;
-	bool should_free_vu_req = false, should_free_bypass_req = false;
-	bool should_call_back = false;
-
-	struct spdk_nvmf_request *original_req =NULL, *bypass_req = NULL;
-
-	if (req->cmd->nvme_cmd.opc == SPDK_NVME_OPC_READ || req->cmd->nvme_cmd.opc == SPDK_NVME_OPC_WRITE){
-		if (req->io_type == SPDK_CHECK_IO_NORMAL) {
-			should_call_back = true;
-			// if there isn't the counterpart, the request is the original one
-			if (req->counterpart == NULL) {
-				original_req = req;
-				// leave the check list
-				if (iterator_list_remove_io(io_check->nvmf_io_queue, req)) {
-					env_atomic_dec(&io_check->nvmf_io_no);
-				}
-				should_free_vu_req = true;
-			} else {
-				// the req is the bypass req
-				if (iterator_list_remove_io(io_check->bypass_io_queue, req)) {
-					env_atomic_dec(&io_check->bypass_io_no);
-				}
-				original_req = req->counterpart;
-				if (req->counterpart->arrive_complete) {
-					should_free_vu_req =  true;
-					should_free_bypass_req = true;
-					bypass_req = req;
-				}
-			}
-		} else {
-			// the req is the original one, and req time out
-			assert(req->counterpart != NULL);
-			if (iterator_list_remove_io(io_check->nvmf_io_queue, req)) {
-				env_atomic_dec(&io_check->nvmf_io_no);
-			}
-			original_req = req;
-			if (req->counterpart->arrive_complete) {
-				should_free_vu_req =  true;
-				should_free_bypass_req = true;
-				bypass_req = req->counterpart;
-			}
-		}
-		req->arrive_complete = true;
-	}
-#endif
-
 	rsp->sqid = 0;
 	rsp->status.p = 0;
 	rsp->cid = req->cmd->nvme_cmd.cid;
@@ -4280,20 +4107,9 @@ _nvmf_request_complete(void *ctx)
 		break;
 	}
 
-#ifdef NVMF_IO_CHECK
-	// read io or write io process
-	if (req->cmd->nvme_cmd.opc == SPDK_NVME_OPC_READ || req->cmd->nvme_cmd.opc == SPDK_NVME_OPC_WRITE){
-		nvmf_io_req_complete(req, original_req, bypass_req, should_call_back, should_free_vu_req, should_free_bypass_req);
-	} else  {
-#endif
-
 	if (nvmf_transport_req_complete(req)) {
 		SPDK_ERRLOG("Transport request completion error!\n");
 	}
-
-#ifdef NVMF_IO_CHECK
-	}
-#endif
 
 
 	/* AER cmd is an exception */

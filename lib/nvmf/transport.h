@@ -61,13 +61,6 @@ int nvmf_transport_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 
 int nvmf_transport_req_free(struct spdk_nvmf_request *req);
 
-#ifdef NVMF_IO_CHECK
-bool iterator_list_remove_io(struct list_head list, struct spdk_nvmf_request *req);
-
-void nvmf_io_req_complete(struct spdk_nvmf_request *req, struct spdk_nvmf_request *original_req,
-		struct spdk_nvmf_request *bypass_req, bool should_call_back, bool should_free_vu_req, bool should_free_bypass_req);
-#endif
-
 int nvmf_transport_req_complete(struct spdk_nvmf_request *req);
 
 void nvmf_transport_qpair_fini(struct spdk_nvmf_qpair *qpair,

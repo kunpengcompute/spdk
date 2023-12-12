@@ -691,15 +691,6 @@ vbdev_ocf_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io,
 static void
 vbdev_ocf_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 {
-#ifdef NVMF_IO_CHECK
-	struct spdk_nvmf_request *req = (struct spdk_nvmf_request *)(bdev_io->internal.caller_ctx);
-	if (req->ts == UINT64_MAX) {
-		SPDK_DEBUGLOG(vbdev_ocf, "add timepoint to  nvmf io req\n");
-		struct timeval tv;
-		gettimeofday(&tv, NULL);
-		req->ts = tv.tv_sec;
-	}
-#endif
 	switch (bdev_io->type) {
 	case SPDK_BDEV_IO_TYPE_READ:
 		/* User does not have to allocate io vectors for the request,
