@@ -2540,7 +2540,7 @@ rpc_nvmf_subsystem_get_listeners(struct spdk_jsonrpc_request *request,
 }
 SPDK_RPC_REGISTER("nvmf_subsystem_get_listeners", rpc_nvmf_subsystem_get_listeners,
 		  SPDK_RPC_RUNTIME);
-
+#ifdef NVMF_IO_CHECK
 extern int g_fake_timeout;
 extern int g_fake_timeout_10s;
 
@@ -2764,3 +2764,4 @@ cleanup:
 }
 SPDK_RPC_REGISTER("nvmf_set_cache_fault_io_threshold", rpc_nvmf_set_cache_fault_io_threshold,
 		  SPDK_RPC_RUNTIME);
+#endif
