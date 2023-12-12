@@ -380,11 +380,6 @@ bdev_get_cache_bdevs_fn(struct vbdev_ocf *vbdev, void *ctx)
 	spdk_json_write_named_object_begin(w, "cache");
 	spdk_json_write_named_string(w, "name", vbdev->cache.name);
 	spdk_json_write_named_bool(w, "attached", vbdev->cache.attached);
-	if (vbdev->need_bypass) {
-		spdk_json_write_named_string(w, "status", "Invalid");
-	} else {
-		spdk_json_write_named_string(w, "status", "Normal");
-	}
 	spdk_json_write_object_end(w);
 
 	spdk_json_write_object_end(w);

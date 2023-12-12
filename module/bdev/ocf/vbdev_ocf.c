@@ -1279,8 +1279,6 @@ init_vbdev(const char *vbdev_name,
 	vbdev->cfg.device.cache_line_size = set_cache_line_size;
 	vbdev->cfg.cache.cache_line_size = set_cache_line_size;
 
-	vbdev->need_bypass = false;
-
 	TAILQ_INSERT_TAIL(&g_ocf_vbdev_head, vbdev, tailq);
 	return rc;
 
