@@ -87,7 +87,7 @@ def bdev_nvme_opal_revert(client, nvme_ctrlr_name, password):
     return client.call('bdev_nvme_opal_revert', params)
 
 def bdev_nvme_add_error_injection(client, name, opc, cmd_type, do_not_submit, timeout_in_us,
-                                   err_count, sct, sc):
+                                  err_count, sct, sc):
     """Add error injection
 
     Args:
@@ -104,8 +104,8 @@ def bdev_nvme_add_error_injection(client, name, opc, cmd_type, do_not_submit, ti
         True on success, RPC error otherwise
     """
     params = {'name': name,
-               'opc': opc,
-               'cmd_type': cmd_type}
+              'opc': opc,
+              'cmd_type': cmd_type}
 
     if do_not_submit:
         params['do_not_submit'] = do_not_submit
@@ -119,6 +119,7 @@ def bdev_nvme_add_error_injection(client, name, opc, cmd_type, do_not_submit, ti
         params['sc'] = sc
 
     return client.call('bdev_nvme_add_error_injection', params)
+
 
 def bdev_nvme_remove_error_injection(client, name, opc, cmd_type):
     """Remove error injection

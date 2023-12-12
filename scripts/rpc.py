@@ -336,21 +336,21 @@ if __name__ == "__main__":
     p.set_defaults(func=bdev_ocf_set_cache_mode)
 
     def bdev_ocf_set_das_qos_limit(args):
-            rpc.bdev.bdev_ocf_set_das_qos_limit(args.client,
-                                                name=args.name,
-                                                capacity=args.capacity,
-                                                leak_rate=args.leak_rate)
+        rpc.bdev.bdev_ocf_set_das_qos_limit(args.client,
+                                            name=args.name,
+                                            capacity=args.capacity,
+                                            leak_rate=args.leak_rate)
 
-        p = subparsers.add_parser('bdev_ocf_set_das_qos_limit',
-                                    help='Set DAS QoS rate limit of OCF block device')
-        p.add_argument('name', help='Name of OCF bdev')
-        p.add_argument('--capacity',
-                        help='Das qos limiter capacity. (>=0, example: 2000). 0 means no das prefetch',
-                        type=int, required=False)
-        p.add_argument('--leak-rate',
-                      help="Das qos limiter leak_rate. (>=20, example: 100). The minimum value is 20",
-                      type=int, required=False)
-        p.set_defaults(func=bdev_ocf_set_das_qos_limit)
+    p = subparsers.add_parser('bdev_ocf_set_das_qos_limit',
+                              help='Set DAS QoS rate limit of OCF block device')
+    p.add_argument('name', help='Name of OCF bdev')
+    p.add_argument('--capacity',
+                   help='Das qos limiter capacity. (>=0, example: 2000). 0 means no das prefetch',
+                   type=int, required=False)
+    p.add_argument('--leak-rate',
+                   help="Das qos limiter leak_rate. (>=20, example: 100). The minimum value is 20",
+                   type=int, required=False)
+    p.set_defaults(func=bdev_ocf_set_das_qos_limit)
 
     def bdev_malloc_create(args):
         num_blocks = (args.total_size * 1024 * 1024) // args.block_size
@@ -1066,8 +1066,8 @@ if __name__ == "__main__":
     p.add_argument('-t', '--cmd-type', help="""Type of NVMe command. Valid values are: admin, io""", required=True)
     p.add_argument('-o', '--opc', help="""Opcode of the NVMe command.""", required=True, type=int)
     p.add_argument('-s', '--do-not-submit',
-                    help="""Set to true if request should not be submitted to the controller (default false)""",
-                    default=False, dest="do_not_submit", action='store_true')
+                   help="""Set to true if request should not be submitted to the controller (default false)""",
+                   default=False, dest="do_not_submit", action='store_true')
     p.add_argument('-w', '--timeout-in-us', help="""Wait specified microseconds when do_not_submit is true""", type=int)
     p.add_argument('-e', '--err-count', help="""Number of matching NVMe commands to inject errors (default 1)""", type=int, default=1)
     p.add_argument('-u', '--sct', help="""Status code type""", type=int)
@@ -2365,10 +2365,10 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
 
     def nvmf_set_io_timeout_threshold(args):
         print_dict(rpc.nvmf.nvmf_set_io_timeout_threshold(args.client, time=args.time))
-    
+
     p = subparsers.add_parser('nvmf_set_io_timeout_threshold',
                               help='Set io timeout threshold.')
-    
+
     p.add_argument('time', help='timeout threshold in second', type=int)
 
     p.set_defaults(func=nvmf_set_io_timeout_threshold)
@@ -2385,7 +2385,7 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
 
     def nvmf_set_cache_fault_io_threshold(args):
         print_dict(rpc.nvmf.nvmf_set_cache_fault_io_threshold(args.client, number=args.number))
-    
+
     p = subparsers.add_parser('nvmf_set_cache_fault_io_threshold',
                               help='Set cache fault io threshold.')
 
