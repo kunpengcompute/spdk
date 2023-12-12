@@ -565,11 +565,6 @@ typedef void (*spdk_bdev_io_get_aux_buf_cb)(struct spdk_io_channel *ch,
 
 #define BDEV_IO_NUM_CHILD_IOV 32
 
-/*
-	Before add/delete any member of this struct, must confirm offset of
-	__bdev_io_internal_fields.caller_ctx is not change; because caller_ctx
-	is used in src/utils/utils_io.c.
-*/
 struct spdk_bdev_io {
 	/** The block device that this I/O belongs to. */
 	struct spdk_bdev *bdev;

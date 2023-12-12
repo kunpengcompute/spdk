@@ -50,8 +50,6 @@
 #include "spdk/nvmf_transport.h"
 #include "sys/time.h"
 
-#include "spdk/nvme_failure_handle.h"
-
 static struct spdk_bdev_module ocf_if;
 
 static TAILQ_HEAD(, vbdev_ocf) g_ocf_vbdev_head

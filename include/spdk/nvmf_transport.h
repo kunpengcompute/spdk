@@ -90,10 +90,6 @@ enum spdk_nvmf_zcopy_phase {
 	NVMF_ZCOPY_PHASE_INIT_FAILED  /* Failed to get the buffers */
 };
 
-/*
-	Before add/delete any member of this struct, must confirm offset of
-	io_stage is not change; because io_stage is used in src/utils/utils_io.c.
-*/
 struct spdk_nvmf_request {
 	struct spdk_nvmf_qpair		*qpair;
 	uint32_t			length;
