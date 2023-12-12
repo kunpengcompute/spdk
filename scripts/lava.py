@@ -121,9 +121,9 @@ if __name__ == "__main__":
             print("empty object")
             exit(1)
         brief = ['tick_rate', 'ticks']
-        group = [['bytes_read', 'num_read_ops', 'read_latency_ticks',
+        group = [['bytes_read', 'num_read_ops', 'read_latency_ticks', 
                   'read_latency_ticks_min', 'read_latency_ticks_max', 'read_latency_ticks_avg'],
-                 ['bytes_written', 'num_write_ops', 'write_latency_ticks',
+                 ['bytes_written', 'num_write_ops', 'write_latency_ticks', 
                   'write_latency_ticks_min', 'write_latency_ticks_max', 'write_latency_ticks_avg'],
                  ['bytes_unmapped', 'num_unmap_ops', 'unmap_latency_ticks'],
                  ['debug_submit_io', 'debug_retry_io', 'debug_failed_io', 'debug_abort_io']]
