@@ -83,3 +83,5 @@ def bdev_nvme_opal_revert(client, nvme_ctrlr_name, password):
         'nvme_ctrlr_name': nvme_ctrlr_name,
         'password': password,
     }
+
+    return client.call('bdev_nvme_opal_revert', params)

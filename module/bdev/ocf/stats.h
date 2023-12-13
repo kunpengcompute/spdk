@@ -35,7 +35,6 @@
 #define VBDEV_OCF_STATS_H
 
 #include "spdk/json.h"
-#include "ocf/ocf_status.h"
 #include <ocf/ocf.h>
 #include <ocf/ocf_das.h>
 
