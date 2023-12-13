@@ -47,8 +47,6 @@
 #include "spdk/string.h"
 #include "spdk/log.h"
 #include "spdk/cpuset.h"
-#include "spdk/nvmf_transport.h"
-#include "sys/time.h"
 
 static struct spdk_bdev_module ocf_if;
 

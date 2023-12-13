@@ -33,8 +33,10 @@
  */
 
 #include "spdk/stdinc.h"
+
 #include "nvmf_internal.h"
 #include "transport.h"
+
 #include "spdk/bit_array.h"
 #include "spdk/endian.h"
 #include "spdk/thread.h"
@@ -3916,6 +3918,7 @@ nvmf_ctrlr_process_io_cmd(struct spdk_nvmf_request *req)
 	struct spdk_nvme_cpl *response = &req->rsp->nvme_cpl;
 	struct spdk_nvmf_subsystem_pg_ns_info *ns_info;
 	enum spdk_nvme_ana_state ana_state;
+
 	/* pre-set response details for this command */
 	response->status.sc = SPDK_NVME_SC_SUCCESS;
 	nsid = cmd->nsid;
@@ -4108,7 +4111,6 @@ _nvmf_request_complete(void *ctx)
 	if (nvmf_transport_req_complete(req)) {
 		SPDK_ERRLOG("Transport request completion error!\n");
 	}
-
 
 	/* AER cmd is an exception */
 	if (sgroup && !is_aer) {
