@@ -262,7 +262,6 @@ pci_device_rte_dev_event(const char *device_name,
 				can_detach = !dev->internal.attached;
 				/* prevent any further attaches */
 				dev->internal.pending_removal = true;
-				// set_bypass_flag(dev);
 				break;
 			}
 		}
