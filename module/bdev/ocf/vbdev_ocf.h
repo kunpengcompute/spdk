@@ -163,7 +163,7 @@ struct vbdev_ocf {
 	ocf_cache_t                  ocf_cache;
 	ocf_core_t                   ocf_core;
 
-	bool                         need_bypass;
+	bool            need_bypass;
 
 	/* Parameters */
 	struct vbdev_ocf_config      cfg;
@@ -212,13 +212,13 @@ void vbdev_ocf_set_cache_mode(
 	void (*cb)(int, struct vbdev_ocf *, void *),
 	void *cb_arg);
 
-/* Set a new capacit & leak_rate on OCF bdev das qos limiter */
+/* Set a new capacity & leak_rate on OCF bdev das qos limiter */
 void vbdev_ocf_set_das_qos_limit(
-	struct vbdev_ocf *vbdev,
-	uint64_t capacity,
-	uint64_t leak_rate,
-	void (*cb)(void *, int),
-	void *cb_arg);
+    struct vbdev_ocf *vbdev,
+    uint64_t capacity,
+    uint64_t leak_rate,
+    void (*cb)(void *, int),
+    void *cb_arg);
 
 typedef void (*vbdev_ocf_foreach_fn)(struct vbdev_ocf *, void *);
 

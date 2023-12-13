@@ -271,170 +271,170 @@ SPDK_RPC_REGISTER_ALIAS_DEPRECATED(bdev_ocf_get_stats, get_ocf_stats)
 
 /* Structure to hold the parameters for this RPC method. */
 struct rpc_bdev_ocf_reset_stats {
-	char *name;             /* main vbdev name */
+    char *name;         /* main vbdev name */
 };
 
 static void
 free_rpc_bdev_ocf_reset_stats(struct rpc_bdev_ocf_reset_stats *r)
 {
-	if (r->name) {
-		free(r->name);
-	}
+    if (r->name) {
+        free(r->name);
+    }
 }
 
 /* Structure to decode the input parameters for this RPC method. */
 static const struct spdk_json_object_decoder rpc_bdev_ocf_reset_stats_decoders[] = {
-	{"name", offsetof(struct rpc_bdev_ocf_reset_stats, name), spdk_json_decode_string},
+    {"name", offsetof(struct rpc_bdev_ocf_reset_stats, name), spdk_json_decode_string},
 };
 
 static void
 rpc_bdev_ocf_reset_stats_cmpl(ocf_cache_t cache, void *priv, int error)
 {
-	struct get_ocf_stats_ctx *ctx = (struct get_ocf_stats_ctx *) priv;
-	if (error) {
-		goto end;
-	}
+    struct get_ocf_stats_ctx *ctx = (struct get_ocf_stats_ctx *) priv;
+    if (error) {
+        goto end;
+    }
 
-	error = vbdev_ocf_stats_reset(cache, ctx->core_name);
+    error = vbdev_ocf_stats_reset(cache, ctx->core_name);
 
-	ocf_mngt_cache_read_unlock(cache);
+    ocf_mngt_cache_read_unlock(cache);
 
 end:
-	if (error) {
-		spdk_jsonrpc_send_error_response_fmt(ctx->request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
-							"Could not reset stats: %s",
-							spdk_strerror(-error));
-	} else {
-		spdk_jsonrpc_send_bool_response(ctx->request, true);
-	}
-	free(ctx);
+    if (error) {
+        spdk_jsonrpc_send_error_response_fmt(ctx->request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+                            "Could not reset stats: %s",
+                            spdk_strerror(-error));
+    } else {
+        spdk_jsonrpc_send_bool_response(ctx->request, true);
+    }
+    free(ctx);
 }
 
 static void
 rpc_bdev_ocf_reset_stats(struct spdk_jsonrpc_request *request,
-			 const struct spdk_json_val *params)
+            const struct spdk_json_val *params)
 {
-	struct rpc_bdev_ocf_reset_stats req = {NULL};
-	struct vbdev_ocf *vbdev;
-	struct get_ocf_stats_ctx *ctx;
+    struct rpc_bdev_ocf_reset_stats req = {NULL};
+    struct vbdev_ocf *vbdev;
+    struct get_ocf_stats_ctx *ctx;
 
-	ctx = calloc(1, sizeof(*ctx));
-	if (!ctx) {
-		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
-						 "Not enough memory to process request");
-		goto end;
-	}
+    ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+                        "Not enough memory to process request");
+        goto end;
+    }
 
-	if (spdk_json_decode_object(params, rpc_bdev_ocf_reset_stats_decoders,
-				    SPDK_COUNTOF(rpc_bdev_ocf_reset_stats_decoders),
-				    &req)) {
-		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
-						 "Invalid parameters");
-		free(ctx);
-		goto end;
-	}
+    if (spdk_json_decode_object(params, rpc_bdev_ocf_reset_stats_decoders,
+                    SPDK_COUNTOF(rpc_bdev_ocf_reset_stats_decoders),
+                    &req)) {
+        spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+                        "Invalid parameters");
+        free(ctx);
+        goto end;
+    }
 
-	vbdev = vbdev_ocf_get_by_name(req.name);
-	if (vbdev == NULL) {
-		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
-						 spdk_strerror(ENODEV));
-		free(ctx);
-		goto end;
-	}
+    vbdev = vbdev_ocf_get_by_name(req.name);
+    if (vbdev == NULL) {
+        spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+                        spdk_strerror(ENODEV));
+        free(ctx);
+        goto end;
+    }
 
-	ctx->core_name = vbdev->core.name;
-	ctx->request = request;
-	ocf_mngt_cache_read_lock(vbdev->ocf_cache, rpc_bdev_ocf_reset_stats_cmpl, ctx);
+    ctx->core_name = vbdev->core.name;
+    ctx->request = request;
+    ocf_mngt_cache_read_lock(vbdev->ocf_cache, rpc_bdev_ocf_reset_stats_cmpl, ctx);
 
 end:
-	free_rpc_bdev_ocf_reset_stats(&req);
+    free_rpc_bdev_ocf_reset_stats(&req);
 }
 
 SPDK_RPC_REGISTER("bdev_ocf_reset_stats", rpc_bdev_ocf_reset_stats, SPDK_RPC_RUNTIME)
 
 struct rpc_bdev_query_status {
-	char *name;
+    char *name;
 };
 
 static void
 free_rpc_bdev_query_status(struct rpc_bdev_query_status *r)
 {
-	if (r->name) {
-		free(r->name);
-	}
+    if (r->name) {
+        free(r->name);
+    }
 }
 
 static const struct spdk_json_object_decoder rpc_bdev_query_status_decoders[] = {
-	{"name", offsetof(struct rpc_bdev_query_status, name), spdk_json_decode_string, true},
+    {"name", offsetof(struct rpc_bdev_query_status, name), spdk_json_decode_string, true},
 };
 
 static void
 bdev_get_cache_bdevs_fn(struct vbdev_ocf *vbdev, void *ctx)
 {
-	struct spdk_json_write_ctx *w = ctx;
+    struct spdk_json_write_ctx *w =ctx;
 
-	spdk_json_write_object_begin(w);
-	spdk_json_write_named_string(w, "name", vbdev->name);
-	spdk_json_write_named_bool(w, "started", vbdev->state.started);
+    spdk_json_write_object_begin(w);
+    spdk_json_write_named_string(w, "name", vbdev->name);
+    spdk_json_write_named_bool(w, "started", vbdev->state.started);
 
-	spdk_json_write_named_object_begin(w, "cache");
-	spdk_json_write_named_string(w, "name", vbdev->cache.name);
-	spdk_json_write_named_bool(w, "attached", vbdev->cache.attached);
-	if (vbdev->need_bypass) {
-		spdk_json_write_named_string(w, "status", "Invalid");
-	} else {
-		spdk_json_write_named_string(w, "status", "Normal");
-	}
+    spdk_json_write_named_object_begin(w, "cache");
+    spdk_json_write_named_string(w, "name", vbdev->cache.name);
+    spdk_json_write_named_bool(w, "attached", vbdev->cache.attached);
+    if (vbdev->need_bypass) {
+        spdk_json_write_named_string(w, "status", "Invalid");
+    } else {
+        spdk_json_write_named_string(w, "status", "Normal");
+    }
 	spdk_json_write_object_end(w);
 
-	spdk_json_write_object_end(w);
+    spdk_json_write_object_end(w);
 }
 
 static void
 bdev_get_ocf_status(void *ctx)
 {
-	struct spdk_json_write_ctx *w = ctx;
-	if (spdk_nvmf_get_ocf_status()) {
-		spdk_json_write_string(w, "Normal");
-	} else {
-		spdk_json_write_string(w, "Invalid");
-	}
+    struct spdk_json_write_ctx *w = ctx;
+    if (spdk_nvmf_get_ocf_status()) {
+        spdk_json_write_string(w, "Normal");
+    } else {
+        spdk_json_write_string(w, "Invalid");
+    }
 }
 
 static void
 rpc_bdev_query_status(struct spdk_jsonrpc_request *request,
             const struct spdk_json_val *params)
 {
-	struct rpc_bdev_query_status req = {NULL};
-	struct spdk_json_write_ctx *w;
+    struct rpc_bdev_query_status req = {NULL};
+    struct spdk_json_write_ctx *w;
 
-	if (spdk_json_decode_object(params, rpc_bdev_query_status_decoders,
-				SPDK_COUNTOF(rpc_bdev_query_status_decoders),
-				&req)) {
-		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
-						"Invalid parameters");
-		goto end;
-	}
+    if (spdk_json_decode_object(params, rpc_bdev_query_status_decoders,
+                SPDK_COUNTOF(rpc_bdev_query_status_decoders),
+                &req)) {
+        spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+                        "Invalid parameters");
+        goto end;
+    }
 
-	if (!strcmp(req.name, "das")) {
-		spdk_jsonrpc_send_bool_response(request, das_get_status());
-	} else if (!strcmp(req.name, "nvme")) {
-		w = spdk_jsonrpc_begin_result(request);
-		spdk_json_write_array_begin(w);
-		vbdev_ocf_foreach(bdev_get_cache_bdevs_fn, w);
-		spdk_json_write_array_end(w);
-		spdk_jsonrpc_end_result(request, w);
-	} else if (!strcmp(req.name, "ocf")) {
-		w = spdk_jsonrpc_begin_result(request);
-		bdev_get_ocf_status(w);
-		spdk_jsonrpc_end_result(request, w);
-	} else {
-		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
-						 "Invalid parameters");
-		goto end;
-	}
+    if (!strcmp(req.name, "das")) {
+        spdk_jsonrpc_send_bool_response(request, das_get_status());
+    } else if (!strcmp(req.name, "nvme")) {
+        w = spdk_jsonrpc_begin_result(request);
+        spdk_json_write_array_begin(w);
+        vbdev_ocf_foreach(bdev_get_cache_bdevs_fn, w);
+        spdk_json_write_array_end(w);
+        spdk_jsonrpc_end_result(request, w);
+    } else if (!strcmp(req.name, "ocf")) {
+        w = spdk_jsonrpc_begin_result(request);
+        bdev_get_ocf_status(w);
+        spdk_jsonrpc_end_result(request, w);
+    } else {
+        spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+                        "Invalid parameters");
+        goto end;
+    }
 end:
-	free_rpc_bdev_query_status(&req);
+    free_rpc_bdev_query_status(&req);
 }
 SPDK_RPC_REGISTER("bdev_query_status", rpc_bdev_query_status, SPDK_RPC_RUNTIME)
 
@@ -600,65 +600,66 @@ SPDK_RPC_REGISTER("bdev_ocf_set_cache_mode", rpc_bdev_ocf_set_cache_mode, SPDK_R
 
 
 struct rpc_bdev_ocf_set_das_qos_limit {
-	char *name;			/*main vbdev */
-	uint64_t capacity;	/* OCF das limiter capacity */
-	uint64_t leak_rate;	/* OCF das limiter leak_rate */
+    char *name;         /*main vbdev */
+    uint64_t capacity;  /* OCF das limiter capacity */
+    uint64_t leak_rate; /* OCF das limiter leak_rate */
+
 };
 
 static void
 free_rpc_bdev_ocf_set_das_qos_limit(struct rpc_bdev_ocf_set_das_qos_limit *r)
 {
-	free(r->name);
+    free(r->name);
 }
 
 /* Structure to decode the input parameters for this RPC method. */
 static const struct spdk_json_object_decoder rpc_bdev_ocf_set_das_qos_limit_decoders[] = {
-	{"name", offsetof(struct rpc_bdev_ocf_set_das_qos_limit, name), spdk_json_decode_string},
-	{"capacity", offsetof(struct rpc_bdev_ocf_set_das_qos_limit, capacity), spdk_json_decode_uint64, true},
-	{"leak_rate", offsetof(struct rpc_bdev_ocf_set_das_qos_limit, leak_rate), spdk_json_decode_uint64, true},
+    {"name", offsetof(struct rpc_bdev_ocf_set_das_qos_limit, name), spdk_json_decode_string},
+    {"capacity", offsetof(struct rpc_bdev_ocf_set_das_qos_limit, capacity), spdk_json_decode_uint64, true},
+    {"leak_rate", offsetof(struct rpc_bdev_ocf_set_das_qos_limit, leak_rate), spdk_json_decode_uint64, true},
 };
 
 static void
 das_qos_limit_cb(void *cb_arg, int status)
 {
-	struct spdk_jsonrpc_request *request = cb_arg;
+    struct spdk_jsonrpc_request *request = cb_arg;
 
-	if (status) {
-		spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
-						     "Could not set OCF vbdev das qos limit: %d",
-						     status);
-	} else {
-		spdk_jsonrpc_send_bool_response(request, true);
-	}
+    if (status) {
+        spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+                            "Could not set OCF vbdev das qos limit: %d",
+                            status);
+    } else {
+        spdk_jsonrpc_send_bool_response(request, true);
+    }
 }
 
 static void
 rpc_bdev_ocf_set_das_qos_limit(struct spdk_jsonrpc_request *request,
-			    const struct spdk_json_val *params)
+                const struct spdk_json_val *params)
 {
-	struct rpc_bdev_ocf_set_das_qos_limit req = {NULL};
-	struct vbdev_ocf *vbdev;
-	int status;
+    struct rpc_bdev_ocf_set_das_qos_limit req = {NULL};
+    struct vbdev_ocf *vbdev;
+    int status;
 
-	status = spdk_json_decode_object(params, rpc_bdev_ocf_set_das_qos_limit_decoders,
-					 SPDK_COUNTOF(rpc_bdev_ocf_set_das_qos_limit_decoders),
-					 &req);
-	if (status) {
-		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
-						 "Invalid parameters");
-		goto end;
-	}
+    status = spdk_json_decode_object(params, rpc_bdev_ocf_set_das_qos_limit_decoders,
+                    SPDK_COUNTOF(rpc_bdev_ocf_set_das_qos_limit_decoders),
+                    &req);
+    if (status) {
+        spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+                        "Invalid parameters");
+        goto end;
+    }
 
-	vbdev = vbdev_ocf_get_by_name(req.name);
-	if (vbdev == NULL) {
-		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
-						 spdk_strerror(ENODEV));
-		goto end;
-	}
+    vbdev = vbdev_ocf_get_by_name(req.name);
+    if (vbdev == NULL) {
+        spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+                        spdk_strerror(ENODEV));
+        goto end;
+    }
 
-	vbdev_ocf_set_das_qos_limit(vbdev, req.capacity, req.leak_rate, das_qos_limit_cb, request);
+    vbdev_ocf_set_das_qos_limit(vbdev, req.capacity, req.leak_rate, das_qos_limit_cb, request);
 
 end:
-	free_rpc_bdev_ocf_set_das_qos_limit(&req);
+    free_rpc_bdev_ocf_set_das_qos_limit(&req);
 }
 SPDK_RPC_REGISTER("bdev_ocf_set_das_qos_limit", rpc_bdev_ocf_set_das_qos_limit, SPDK_RPC_RUNTIME)
