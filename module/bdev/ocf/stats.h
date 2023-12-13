@@ -39,6 +39,7 @@
 #include <ocf/ocf.h>
 #include <ocf/ocf_das.h>
 
+
 struct vbdev_ocf_stats {
 	struct ocf_stats_usage usage;
 	struct ocf_stats_requests reqs;

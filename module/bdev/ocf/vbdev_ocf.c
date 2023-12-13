@@ -693,8 +693,8 @@ vbdev_ocf_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_i
 {
 #ifdef NVMF_IO_CHECK
 	struct spdk_nvmf_request *req = (struct spdk_nvmf_request *)(bdev_io->internal.caller_ctx);
-   	if (req->ts == UINT64_MAX) {
-		SPDK_DEBUGLOG(vbdev_ocf, "add timepoint to nvmf io req\n");
+	if (req->ts == UINT64_MAX) {
+		SPDK_DEBUGLOG(vbdev_ocf, "add timepoint to  nvmf io req\n");
 		struct timeval tv;
 		gettimeofday(&tv, NULL);
 		req->ts = tv.tv_sec;
@@ -791,22 +791,22 @@ vbdev_ocf_write_json_config(struct spdk_bdev *bdev, struct spdk_json_write_ctx *
 
 static void
 vbdev_ocf_get_core_info(struct spdk_bdev *cache_bdev, struct spdk_bdev **out_core_bdev,
-    struct spdk_bdev_desc **out_core_desc, struct spdk_io_channel **out_core_channel)
+	struct spdk_bdev_desc **out_core_desc, struct spdk_io_channel **out_core_channel)
 {
-    struct vbdev_ocf *vbdev = (struct vbdev_ocf *)cache_bdev->ctxt;
+	struct vbdev_ocf *vbdev = (struct vbdev_ocf *)cache_bdev->ctxt;
 
-    *out_core_bdev = vbdev->core.bdev;
-    *out_core_desc = vbdev->core.desc;
-    struct spdk_io_channel *ch = spdk_bdev_get_io_channel(vbdev->core.desc);
-    SPDK_DEBUGLOG(vbdev_ocf, "channel is %p\n", ch);
-    *out_core_channel = ch;
+	*out_core_bdev = vbdev->core.bdev;
+	*out_core_desc = vbdev->core.desc;
+	struct spdk_io_channel *ch = spdk_bdev_get_io_channel(vbdev->core.desc);
+	SPDK_DEBUGLOG(vbdev_ocf, "channel is %p\n", ch);
+	*out_core_channel = ch;
 }
 
 static bool
 vbdev_ocf_is_io_need_bypass(struct spdk_bdev *cache_bdev)
 {
-    struct vbdev_ocf *vbdev = (struct vbdev_ocf *)cache_bdev->ctxt;
-    return vbdev->need_bypass;
+	struct vbdev_ocf *vbdev = (struct vbdev_ocf *)cache_bdev->ctxt;
+	return vbdev->need_bypass;
 }
 
 /* Cache vbdev function table
@@ -1560,17 +1560,17 @@ vbdev_ocf_set_cache_mode(struct vbdev_ocf *vbdev,
 }
 
 void vbdev_ocf_set_das_qos_limit(struct vbdev_ocf *vbdev,
-            uint64_t capacity,
-            uint64_t leak_rate,
-            void (*cb)(void *, int),
-            void *cb_arg)
+			 uint64_t capacity,
+			 uint64_t leak_rate,
+			 void (*cb)(void *, int),
+			 void *cb_arg)
 {
 #ifdef DEBUG
-    set_das_limiter(vbdev->ocf_core, capacity, leak_rate);
+	set_das_limiter(vbdev->ocf_core, capacity, leak_rate);
 #else
-    SPDK_WARNLOG("DAS qos limit can be configured only in debug mode\n");
+	SPDK_WARNLOG("DAS qos limit can be configured only in debug mode\n");
 #endif
-    cb(cb_arg, 0);
+	cb(cb_arg, 0);
 }
 
 /* This called if new device is created in SPDK application
@@ -1851,30 +1851,30 @@ fini_start(void)
 
 static void set_all_related_bdev_bypass_flag(char* name)
 {
-    struct vbdev_ocf *vbdev;
-    int len;
-    TAILQ_FOREACH(vbdev, &g_ocf_vbdev_head, tailq) {
-        SPDK_PRINTF("Checking '%s'\n", vbdev->cache.name);
-        len = strlen(name);
-        if (strncmp(name, vbdev->cache.name, len) == 0) {
-            SPDK_NOTICELOG("Marking '%s' because device '%s' was removed\n", vbdev->name, name);
-            vbdev->need_bypass = true;
-        }
-    }
+	struct vbdev_ocf *vbdev;
+	int len;
+	TAILQ_FOREACH(vbdev, &g_ocf_vbdev_head, tailq) {
+		SPDK_PRINTF("Checking '%s'\n", vbdev->cache.name);
+		len = strlen(name);
+		if (strncmp(name, vbdev->cache.name, len) == 0) {
+			SPDK_NOTICELOG("Marking '%s' because device '%s' was removed\n", vbdev->name, name);
+			vbdev->need_bypass = true;
+		}
+	}
 }
 
 static bool nvme_have_cas_device(char* name)
 {
-    struct vbdev_ocf *vbdev;
-    int len;
-    TAILQ_FOREACH(vbdev, &g_ocf_vbdev_head, tailq) {
-        SPDK_PRINTF("Checking '%s'\n", vbdev->cache.name);
-        len = strlen(name);
-        if (strncmp(name, vbdev->cache.name, len) == 0) {
-            return true;
-        }
-    }
-    return false;
+	struct vbdev_ocf *vbdev;
+	int len;
+	TAILQ_FOREACH(vbdev, &g_ocf_vbdev_head, tailq) {
+		SPDK_PRINTF("Checking '%s'\n", vbdev->cache.name);
+		len = strlen(name);
+		if (strncmp(name, vbdev->cache.name, len) == 0) {
+			return true;
+		}
+	}
+	return false;
 }
 
 /* Module-global function table
@@ -1890,14 +1890,14 @@ static struct spdk_bdev_module ocf_if = {
 };
 
 struct bypass_fn_table bypass_if = {
-    .bypass_if = set_all_related_bdev_bypass_flag,
-    .have_cache = nvme_have_cas_device,
+	.bypass_if = set_all_related_bdev_bypass_flag,
+	.have_cache = nvme_have_cas_device,
 };
-
 SPDK_BDEV_MODULE_REGISTER(ocf, &ocf_if);
 
-static void __attribute__((constructor)) _spdk_bdev_ocf_bypass_if_set(void)
+static void __attribute__((constructor)) _spdk_bdev_ocf_bypass_if_set(void) 
 {
-    set_bypass_set_if(&bypass_if);
+	set_bypass_set_if(&bypass_if);
 }
+
 SPDK_LOG_REGISTER_COMPONENT(vbdev_ocf)
