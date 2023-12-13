@@ -148,12 +148,12 @@ nvmf_tgt_create_poll_group(void *io_device, void *ctx_buf)
 		}
 	}
 
-
 	pthread_mutex_lock(&tgt->mutex);
 	TAILQ_INSERT_TAIL(&tgt->poll_groups, group, link);
 	pthread_mutex_unlock(&tgt->mutex);
 
 	group->poller = SPDK_POLLER_REGISTER(nvmf_poll_group_poll, group, 0);
+
 	SPDK_DTRACE_PROBE1(nvmf_create_poll_group, spdk_thread_get_id(thread));
 
 	return 0;
