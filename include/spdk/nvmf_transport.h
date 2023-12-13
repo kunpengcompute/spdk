@@ -38,7 +38,6 @@
 #ifndef SPDK_NVMF_TRANSPORT_H_
 #define SPDK_NVMF_TRANSPORT_H_
 
-#include <sys/queue.h>
 #include "spdk/bdev.h"
 #include "spdk/nvme_spec.h"
 #include "spdk/nvmf.h"
@@ -115,6 +114,7 @@ struct spdk_nvmf_request {
 	struct spdk_poller		*poller;
 	struct spdk_bdev_io		*zcopy_bdev_io; /* Contains the bdev_io when using ZCOPY */
 	enum spdk_nvmf_zcopy_phase	zcopy_phase;
+
 	TAILQ_ENTRY(spdk_nvmf_request)	link;
 };
 

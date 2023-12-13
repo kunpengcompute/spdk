@@ -230,7 +230,7 @@ rpc_bdev_get_iostat_cb(struct spdk_bdev *bdev,
 
 		spdk_json_write_named_uint64(w, "write_latency_ticks_max", stat->write_latency_ticks_max);
 
-		spdk_json_write_named_uint64(w, "write_latency_ticks_avg", stat->num_read_ops == 0 ? 0:(stat->bytes_written / stat->num_write_ops));
+		spdk_json_write_named_uint64(w, "write_latency_ticks_avg", stat->num_write_ops == 0 ? 0:(stat->bytes_written / stat->num_write_ops));
 
 		spdk_json_write_named_uint64(w, "unmap_latency_ticks", stat->unmap_latency_ticks);
 

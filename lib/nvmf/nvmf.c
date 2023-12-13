@@ -45,7 +45,6 @@
 
 #include "nvmf_internal.h"
 #include "transport.h"
-#include "ocf/ocf_status.h"
 
 SPDK_LOG_REGISTER_COMPONENT(nvmf)
 

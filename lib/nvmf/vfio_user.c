@@ -77,6 +77,8 @@
 
 struct nvmf_vfio_user_req;
 
+typedef int (*nvmf_vfio_user_req_cb_fn)(struct nvmf_vfio_user_req *req, void *cb_arg);
+
 /* 1 more for PRP2 list itself */
 #define NVMF_VFIO_USER_MAX_IOVECS	(NVMF_REQ_MAX_BUFFERS + 1)
 
@@ -185,6 +187,7 @@ struct nvmf_vfio_user_req  {
 	struct spdk_nvme_cmd			cmd;
 
 	enum nvmf_vfio_user_req_state		state;
+	nvmf_vfio_user_req_cb_fn		cb_fn;
 	void					*cb_arg;
 
 	/* old CC before prop_set_cc fabric command */

@@ -41,7 +41,6 @@
 #include "spdk/string.h"
 #include "spdk/util.h"
 #include "spdk/bit_array.h"
-#include "ocf/ocf_status.h"
 
 #include "spdk_internal/assert.h"
 
