@@ -3688,47 +3688,6 @@ nvmf_vfio_user_req_free(struct spdk_nvmf_request *req)
 	return 0;
 }
 
-#ifdef NVMF_IO_CHECK
-bool iterator_list_remove_io(struct list_head list, struct spdk_nvmf_request *req)
-{
-	struct nvmf_io_check *del_req, *q;
-
-	list_for_each_entry_safe(del_req, q, &list, node) {
-		if(del_req->nvmf_req == req) {
-			list_del(&del_req->node);
-			free(del_req);
-			del_req = NULL;
-			SPDK_DEBUGLOG(nvmf_vfio, " delete nvmf io req %p \n", req);
-			return true;
-		}
-	}
-	return false;
-}
-
-void nvmf_io_req_complete(struct spdk_nvmf_request *req, struct spdk_nvmf_request *original_req, struct spdk_nvmf_request *bypass_req,
-		bool should_call_back, bool should_free_vu_req, bool should_free_bypass_req)
-{
-	assert(original_req != NULL);
-
-	struct nvmf_vfio_user_sq *vu_sq = NULL;
-	struct nvmf_vfio_user_req *vu_req = NULL;
-	vu_req = SPDK_CONTAINEROF(original_req, struct nvmf_vfio_user_req, req);
-	vu_sq = SPDK_CONTAINEROF(original_req->qpair, struct nvmf_vfio_user_sq, qpair);
-	if (should_call_back) {
-		// copy data from param req to cpl, not from attribute req in vu_req
-		vu_req->cb_fn(vu_req, vu_req->cb_arg, req);
-	}
-	if (should_free_vu_req) {
-		_nvmf_vfio_user_req_free(vu_sq, vu_req);
-	}
-	if (should_free_bypass_req) {
-		free(bypass_req);
-		bypass_req = NULL;
-	}
-}
-
-#endif
-
 static int
 nvmf_vfio_user_req_complete(struct spdk_nvmf_request *req)
 {

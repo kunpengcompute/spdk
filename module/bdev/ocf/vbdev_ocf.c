@@ -50,8 +50,6 @@
 #include "spdk/nvmf_transport.h"
 #include "sys/time.h"
 
-#include "spdk/nvme_failure_handle.h"
-
 static struct spdk_bdev_module ocf_if;
 
 static TAILQ_HEAD(, vbdev_ocf) g_ocf_vbdev_head
@@ -691,15 +689,6 @@ vbdev_ocf_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io,
 static void
 vbdev_ocf_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 {
-#ifdef NVMF_IO_CHECK
-	struct spdk_nvmf_request *req = (struct spdk_nvmf_request *)(bdev_io->internal.caller_ctx);
-	if (req->ts == UINT64_MAX) {
-		SPDK_DEBUGLOG(vbdev_ocf, "add timepoint to  nvmf io req\n");
-		struct timeval tv;
-		gettimeofday(&tv, NULL);
-		req->ts = tv.tv_sec;
-	}
-#endif
 	switch (bdev_io->type) {
 	case SPDK_BDEV_IO_TYPE_READ:
 		/* User does not have to allocate io vectors for the request,
@@ -789,26 +778,6 @@ vbdev_ocf_write_json_config(struct spdk_bdev *bdev, struct spdk_json_write_ctx *
 	spdk_json_write_object_end(w);
 }
 
-static void
-vbdev_ocf_get_core_info(struct spdk_bdev *cache_bdev, struct spdk_bdev **out_core_bdev,
-	struct spdk_bdev_desc **out_core_desc, struct spdk_io_channel **out_core_channel)
-{
-	struct vbdev_ocf *vbdev = (struct vbdev_ocf *)cache_bdev->ctxt;
-
-	*out_core_bdev = vbdev->core.bdev;
-	*out_core_desc = vbdev->core.desc;
-	struct spdk_io_channel *ch = spdk_bdev_get_io_channel(vbdev->core.desc);
-	SPDK_DEBUGLOG(vbdev_ocf, "channel is %p\n", ch);
-	*out_core_channel = ch;
-}
-
-static bool
-vbdev_ocf_is_io_need_bypass(struct spdk_bdev *cache_bdev)
-{
-	struct vbdev_ocf *vbdev = (struct vbdev_ocf *)cache_bdev->ctxt;
-	return vbdev->need_bypass;
-}
-
 /* Cache vbdev function table
  * Used by bdev layer */
 static struct spdk_bdev_fn_table cache_dev_fn_table = {
@@ -818,8 +787,6 @@ static struct spdk_bdev_fn_table cache_dev_fn_table = {
 	.get_io_channel	= vbdev_ocf_get_io_channel,
 	.write_config_json = vbdev_ocf_write_json_config,
 	.dump_info_json = vbdev_ocf_dump_info_json,
-	.get_core_info_from_cache_bdev = vbdev_ocf_get_core_info,
-	.is_io_need_bypass = vbdev_ocf_is_io_need_bypass,
 };
 
 /* Poller function for the OCF queue
@@ -1309,8 +1276,6 @@ init_vbdev(const char *vbdev_name,
 	}
 	vbdev->cfg.device.cache_line_size = set_cache_line_size;
 	vbdev->cfg.cache.cache_line_size = set_cache_line_size;
-
-	vbdev->need_bypass = false;
 
 	TAILQ_INSERT_TAIL(&g_ocf_vbdev_head, vbdev, tailq);
 	return rc;
@@ -1849,34 +1814,6 @@ fini_start(void)
 	g_fini_started = true;
 }
 
-static void set_all_related_bdev_bypass_flag(char* name)
-{
-	struct vbdev_ocf *vbdev;
-	int len;
-	TAILQ_FOREACH(vbdev, &g_ocf_vbdev_head, tailq) {
-		SPDK_PRINTF("Checking '%s'\n", vbdev->cache.name);
-		len = strlen(name);
-		if (strncmp(name, vbdev->cache.name, len) == 0) {
-			SPDK_NOTICELOG("Marking '%s' because device '%s' was removed\n", vbdev->name, name);
-			vbdev->need_bypass = true;
-		}
-	}
-}
-
-static bool nvme_have_cas_device(char* name)
-{
-	struct vbdev_ocf *vbdev;
-	int len;
-	TAILQ_FOREACH(vbdev, &g_ocf_vbdev_head, tailq) {
-		SPDK_PRINTF("Checking '%s'\n", vbdev->cache.name);
-		len = strlen(name);
-		if (strncmp(name, vbdev->cache.name, len) == 0) {
-			return true;
-		}
-	}
-	return false;
-}
-
 /* Module-global function table
  * Does not relate to vbdev instances */
 static struct spdk_bdev_module ocf_if = {
@@ -1889,15 +1826,6 @@ static struct spdk_bdev_module ocf_if = {
 	.examine_disk   = vbdev_ocf_examine_disk,
 };
 
-struct bypass_fn_table bypass_if = {
-	.bypass_if = set_all_related_bdev_bypass_flag,
-	.have_cache = nvme_have_cas_device,
-};
 SPDK_BDEV_MODULE_REGISTER(ocf, &ocf_if);
-
-static void __attribute__((constructor)) _spdk_bdev_ocf_bypass_if_set(void) 
-{
-	set_bypass_set_if(&bypass_if);
-}
 
 SPDK_LOG_REGISTER_COMPONENT(vbdev_ocf)

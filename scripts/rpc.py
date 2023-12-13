@@ -1049,44 +1049,6 @@ if __name__ == "__main__":
         '-n', '--num', help='the number of commands you want to fail', type=int, default=1)
     p.set_defaults(func=bdev_error_inject_error)
 
-    # bdev_nvme_add_error_injection
-    def bdev_nvme_add_error_injection(args):
-        print_dict(rpc.nvme.bdev_nvme_add_error_injection(args.client,
-                                                          name=args.nvme_name,
-                                                          cmd_type=args.cmd_type,
-                                                          opc=args.opc,
-                                                          do_not_submit=args.do_not_submit,
-                                                          timeout_in_us=args.timeout_in_us,
-                                                          err_count=args.err_count,
-                                                          sct=args.sct,
-                                                          sc=args.sc))
-    p = subparsers.add_parser('bdev_nvme_add_error_injection',
-                              help='Add a NVMe command error injection.')
-    p.add_argument('-n', '--nvme-name', help="""Name of the operating NVMe controller""", required=True)
-    p.add_argument('-t', '--cmd-type', help="""Type of NVMe command. Valid values are: admin, io""", required=True)
-    p.add_argument('-o', '--opc', help="""Opcode of the NVMe command.""", required=True, type=int)
-    p.add_argument('-s', '--do-not-submit',
-                   help="""Set to true if request should not be submitted to the controller (default false)""",
-                   default=False, dest="do_not_submit", action='store_true')
-    p.add_argument('-w', '--timeout-in-us', help="""Wait specified microseconds when do_not_submit is true""", type=int)
-    p.add_argument('-e', '--err-count', help="""Number of matching NVMe commands to inject errors (default 1)""", type=int, default=1)
-    p.add_argument('-u', '--sct', help="""Status code type""", type=int)
-    p.add_argument('-c', '--sc', help="""Status code""", type=int)
-    p.set_defaults(func=bdev_nvme_add_error_injection)
-
-    # bdev_nvme_remove_error_injection
-    def bdev_nvme_remove_error_injection(args):
-        print_dict(rpc.nvme.bdev_nvme_remove_error_injection(args.client,
-                                                             name=args.nvme_name,
-                                                             cmd_type=args.cmd_type,
-                                                             opc=args.opc))
-    p = subparsers.add_parser('bdev_nvme_remove_error_injection',
-                              help='Removes a NVMe command error injection.')
-    p.add_argument('-n', '--nvme-name', help="""Name of the operating NVMe controller""", required=True)
-    p.add_argument('-t', '--cmd-type', help="""Type of nvme cmd. Valid values are: admin, io""", required=True)
-    p.add_argument('-o', '--opc', help="""Opcode of the nvme cmd.""", required=True, type=int)
-    p.set_defaults(func=bdev_nvme_remove_error_injection)
-
     def bdev_nvme_apply_firmware(args):
         print_dict(rpc.bdev.bdev_nvme_apply_firmware(args.client,
                                                      bdev_name=args.bdev_name,
@@ -2339,59 +2301,6 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
         'nvmf_get_stats', help='Display current statistics for NVMf subsystem')
     p.add_argument('-t', '--tgt-name', help='The name of the parent NVMe-oF target (optional)', type=str)
     p.set_defaults(func=nvmf_get_stats)
-
-    def nvmf_set_req_timeout(args):
-        print_dict(rpc.nvmf.nvmf_set_req_timeout(args.client))
-
-    p = subparsers.add_parser('nvmf_set_req_timeout',
-                              help='Set req to time out.')
-    p.set_defaults(func=nvmf_set_req_timeout)
-
-    def nvmf_set_req_timeout_10s(args):
-        print_dict(rpc.nvmf.nvmf_set_req_timeout_10s(args.client))
-
-    p = subparsers.add_parser('nvmf_set_req_timeout_10s',
-                              help='Set req to time out.')
-    p.set_defaults(func=nvmf_set_req_timeout_10s)
-
-
-    def nvmf_set_ocf_cache_invalid(args):
-        print_dict(rpc.nvmf.nvmf_set_ocf_cache_invalid(args.client))
-
-    p = subparsers.add_parser('nvmf_set_ocf_cache_invalid',
-                              help='Set ocf invalid.')
-
-    p.set_defaults(func=nvmf_set_ocf_cache_invalid)
-
-    def nvmf_set_io_timeout_threshold(args):
-        print_dict(rpc.nvmf.nvmf_set_io_timeout_threshold(args.client, time=args.time))
-
-    p = subparsers.add_parser('nvmf_set_io_timeout_threshold',
-                              help='Set io timeout threshold.')
-
-    p.add_argument('time', help='timeout threshold in second', type=int)
-
-    p.set_defaults(func=nvmf_set_io_timeout_threshold)
-
-    def nvmf_set_cache_fault_time_threshold(args):
-        print_dict(rpc.nvmf.nvmf_set_cache_fault_time_threshold(args.client, time=args.time))
-
-    p = subparsers.add_parser('nvmf_set_cache_fault_time_threshold',
-                              help='Set cache fault time threshold.')
-
-    p.add_argument('time', help='cache fault time threshold in second', type=int)
-
-    p.set_defaults(func=nvmf_set_cache_fault_time_threshold)
-
-    def nvmf_set_cache_fault_io_threshold(args):
-        print_dict(rpc.nvmf.nvmf_set_cache_fault_io_threshold(args.client, number=args.number))
-
-    p = subparsers.add_parser('nvmf_set_cache_fault_io_threshold',
-                              help='Set cache fault io threshold.')
-
-    p.add_argument('number', help='cache fault io number threshold', type=int)
-
-    p.set_defaults(func=nvmf_set_cache_fault_io_threshold)
 
     def nvmf_set_crdt(args):
         print_dict(rpc.nvmf.nvmf_set_crdt(args.client, args.crdt1, args.crdt2, args.crdt3))

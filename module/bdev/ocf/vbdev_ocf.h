@@ -163,8 +163,6 @@ struct vbdev_ocf {
 	ocf_cache_t                  ocf_cache;
 	ocf_core_t                   ocf_core;
 
-	bool                         need_bypass;
-
 	/* Parameters */
 	struct vbdev_ocf_config      cfg;
 	struct vbdev_ocf_state       state;

@@ -45,10 +45,6 @@
 #include "spdk/nvmf_cmd.h"
 #include "spdk/nvmf_spec.h"
 #include "spdk/memory.h"
-#ifdef NVMF_IO_CHECK
-#include "ocf_env_list.h"
-#include "ocf_env.h"
-#endif
 
 #define SPDK_NVMF_MAX_SGL_ENTRIES	16
 
@@ -94,50 +90,6 @@ enum spdk_nvmf_zcopy_phase {
 	NVMF_ZCOPY_PHASE_INIT_FAILED  /* Failed to get the buffers */
 };
 
-#ifdef NVMF_IO_CHECK
-enum spdk_check_io_type {
-	SPDK_CHECK_IO_NORMAL = 0,
-	SPDK_CHECK_IO_BYPASS,
-	SPDK_CHECK_IO_TYPE
-};
-
-enum cache_status_type {
-	OCF_CACHE_NORMAL = 0,
-	OCF_CACHE_INVAL,
-	OCF_CACHE_TYPE
-};
-
-// set special value to ensure, when the stage of request need to switch in ocf,
-// the value changed is what we assign in spdk.
-enum spdk_io_stage {
-	OCF_CACHE_STAGE = 0x5555555,
-	OCF_CORE_STAGE,
-	OCF_IO_STAGE_TYPE
-};
-
-struct nvmf_io_check {
-	struct spdk_nvmf_request *nvmf_req; //nvmf read/write io
-	struct list_head node;
-};
-
-struct bypass_io_inflight {
-	struct spdk_nvmf_request *nvmf_req; //bypass io
-	struct list_head node;
-};
-
-struct spdk_io_check {
-	struct list_head nvmf_io_queue;
-	env_atomic nvmf_io_no;
-	struct list_head bypass_io_queue;
-	env_atomic bypass_io_no;
-	enum cache_status_type cache_stat;
-};
-#endif
-
-/*
-	Before add/delete any member of this struct, must confirm offset of
-	io_stage is not change; because io_stage is used in src/utils/utils_io.c.
-*/
 struct spdk_nvmf_request {
 	struct spdk_nvmf_qpair		*qpair;
 	uint32_t			length;
@@ -163,14 +115,6 @@ struct spdk_nvmf_request {
 	struct spdk_poller		*poller;
 	struct spdk_bdev_io		*zcopy_bdev_io; /* Contains the bdev_io when using ZCOPY */
 	enum spdk_nvmf_zcopy_phase	zcopy_phase;
-#ifdef	NVMF_IO_CHECK
-	uint64_t ts;
-	enum spdk_io_stage		io_stage;
-	struct spdk_nvmf_request	*counterpart; /* the original req or the bypass req*/
-	bool arrive_complete; /* spdk_nvmf_request arrive _nvmf_request_complete() */
-	enum spdk_check_io_type io_type;
-	void *bdev;
-#endif
 	TAILQ_ENTRY(spdk_nvmf_request)	link;
 };
 
@@ -221,10 +165,6 @@ struct spdk_nvmf_transport_poll_group {
 struct spdk_nvmf_poll_group {
 	struct spdk_thread				*thread;
 	struct spdk_poller				*poller;
-#ifdef	NVMF_IO_CHECK
-	struct spdk_poller				*iopoller;
-	struct spdk_io_check				*io_check;
-#endif
 
 	TAILQ_HEAD(, spdk_nvmf_transport_poll_group)	tgroups;
 
