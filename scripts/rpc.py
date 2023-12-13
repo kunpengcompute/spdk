@@ -335,23 +335,6 @@ if __name__ == "__main__":
     p.add_argument('mode', help='OCF cache mode', choices=['wb', 'wt', 'pt', 'wa', 'wi', 'wo'])
     p.set_defaults(func=bdev_ocf_set_cache_mode)
 
-    def bdev_ocf_set_das_qos_limit(args):
-        rpc.bdev.bdev_ocf_set_das_qos_limit(args.client,
-                                            name=args.name,
-                                            capacity=args.capacity,
-                                            leak_rate=args.leak_rate)
-
-    p = subparsers.add_parser('bdev_ocf_set_das_qos_limit',
-                              help='Set DAS QoS rate limit of OCF block device')
-    p.add_argument('name', help='Name of OCF bdev')
-    p.add_argument('--capacity',
-                   help='Das qos limiter capacity. (>=0, example: 2000). 0 means no das prefetch',
-                   type=int, required=False)
-    p.add_argument('--leak-rate',
-                   help="Das qos limiter leak_rate. (>=20, example: 100). The minimum value is 20",
-                   type=int, required=False)
-    p.set_defaults(func=bdev_ocf_set_das_qos_limit)
-
     def bdev_malloc_create(args):
         num_blocks = (args.total_size * 1024 * 1024) // args.block_size
         print_json(rpc.bdev.bdev_malloc_create(args.client,

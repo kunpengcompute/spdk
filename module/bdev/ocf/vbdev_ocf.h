@@ -210,14 +210,6 @@ void vbdev_ocf_set_cache_mode(
 	void (*cb)(int, struct vbdev_ocf *, void *),
 	void *cb_arg);
 
-/* Set a new capacit & leak_rate on OCF bdev das qos limiter */
-void vbdev_ocf_set_das_qos_limit(
-	struct vbdev_ocf *vbdev,
-	uint64_t capacity,
-	uint64_t leak_rate,
-	void (*cb)(void *, int),
-	void *cb_arg);
-
 typedef void (*vbdev_ocf_foreach_fn)(struct vbdev_ocf *, void *);
 
 /* Execute fn for each OCF device that is online or waits for base devices */
