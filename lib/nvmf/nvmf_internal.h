@@ -386,10 +386,6 @@ void nvmf_get_discovery_log_page(struct spdk_nvmf_tgt *tgt, const char *hostnqn,
 				 uint32_t iovcnt, uint64_t offset, uint32_t length,
 				 struct spdk_nvme_transport_id *cmd_source_trid);
 
-
-struct bypass_io_inflight *spdk_nvmf_req_to_bypass_io(struct spdk_nvmf_request *origin_io);
-void spdk_nvmf_free_bypass_io(struct bypass_io_inflight *retry_io);
-int spdk_nvmf_submit_timeout_io(void *retry_req);
 void nvmf_ctrlr_destruct(struct spdk_nvmf_ctrlr *ctrlr);
 int nvmf_ctrlr_process_admin_cmd(struct spdk_nvmf_request *req);
 int nvmf_ctrlr_process_io_cmd(struct spdk_nvmf_request *req);
