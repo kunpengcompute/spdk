@@ -34,7 +34,6 @@
 #include <ocf/ocf.h>
 #include <ocf/ocf_types.h>
 #include <ocf/ocf_mngt.h>
-#include <ocf/ocf_das.h>
 
 #include "ctx.h"
 #include "data.h"
@@ -1522,20 +1521,6 @@ vbdev_ocf_set_cache_mode(struct vbdev_ocf *vbdev,
 	rc = ocf_mngt_cache_set_mode(cache, cache_mode);
 	ocf_mngt_cache_unlock(cache);
 	cb(rc, vbdev, cb_arg);
-}
-
-void vbdev_ocf_set_das_qos_limit(struct vbdev_ocf *vbdev,
-			 uint64_t capacity,
-			 uint64_t leak_rate,
-			 void (*cb)(void *, int),
-			 void *cb_arg)
-{
-#ifdef DEBUG
-	set_das_limiter(vbdev->ocf_core, capacity, leak_rate);
-#else
-	SPDK_WARNLOG("DAS qos limit can be configured only in debug mode\n");
-#endif
-	cb(cb_arg, 0);
 }
 
 /* This called if new device is created in SPDK application

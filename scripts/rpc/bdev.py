@@ -249,24 +249,6 @@ def bdev_ocf_set_cache_mode(client, name, mode):
 
     return client.call('bdev_ocf_set_cache_mode', params)
 
-def bdev_ocf_set_das_qos_limit(client, name, capacity, leak_rate):
-    """Set new DAS qos limit of OCF block device
-
-    Args:
-        name: name of OCF bdev
-        capacity: OCF DAS qos limit capacity
-        leak_rate: OCF DAS qos limit leak_rate
-
-    Returns:
-        New DAS qos limit
-    """
-    params = {
-        'name': name,
-        'capacity': capacity,
-        'leak_rate': leak_rate,
-    }
-
-    return client.call('bdev_ocf_set_das_qos_limit', params)
 
 @deprecated_alias('construct_malloc_bdev')
 def bdev_malloc_create(client, num_blocks, block_size, name=None, uuid=None, optimal_io_boundary=None):
