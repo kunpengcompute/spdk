@@ -386,17 +386,6 @@ bdev_get_cache_bdevs_fn(struct vbdev_ocf *vbdev, void *ctx)
 }
 
 static void
-bdev_get_ocf_status(void *ctx)
-{
-	struct spdk_json_write_ctx *w = ctx;
-	if (spdk_nvmf_get_ocf_status()) {
-		spdk_json_write_string(w, "Normal");
-	} else {
-		spdk_json_write_string(w, "Invalid");
-	}
-}
-
-static void
 rpc_bdev_query_status(struct spdk_jsonrpc_request *request,
             const struct spdk_json_val *params)
 {
@@ -418,10 +407,6 @@ rpc_bdev_query_status(struct spdk_jsonrpc_request *request,
 		spdk_json_write_array_begin(w);
 		vbdev_ocf_foreach(bdev_get_cache_bdevs_fn, w);
 		spdk_json_write_array_end(w);
-		spdk_jsonrpc_end_result(request, w);
-	} else if (!strcmp(req.name, "ocf")) {
-		w = spdk_jsonrpc_begin_result(request);
-		bdev_get_ocf_status(w);
 		spdk_jsonrpc_end_result(request, w);
 	} else {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
