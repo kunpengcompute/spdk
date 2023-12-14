@@ -244,6 +244,11 @@ DEFINE_STUB(spdk_bdev_reset, int, (struct spdk_bdev_desc *desc, struct spdk_io_c
 				   spdk_bdev_io_completion_cb cb, void *cb_arg), 0);
 DEFINE_STUB_V(spdk_bdev_free_io, (struct spdk_bdev_io *bdev_io));
 
+DEFINE_STUB(spdk_bdev_io_type_supported,
+	    bool,
+	    (struct spdk_bdev *bdev, enum spdk_bdev_io_type io_type),
+	    true);
+
 struct spdk_io_channel *
 spdk_accel_engine_get_io_channel(void)
 {
