@@ -102,6 +102,10 @@ struct rpc_compress_set_pmd {
 	enum compress_pmd pmd;
 };
 
+struct rpc_compressdev_zlib_module_wbits {
+       int32_t wbits;
+};
+
 static const struct spdk_json_object_decoder rpc_compress_pmd_decoder[] = {
 	{"pmd", offsetof(struct rpc_compress_set_pmd, pmd), spdk_json_decode_int32},
 };
@@ -136,10 +140,72 @@ rpc_bdev_compress_set_pmd(struct spdk_jsonrpc_request *request,
 
 	spdk_jsonrpc_send_bool_response(request, true);
 }
+
+
+static const struct spdk_json_object_decoder rpc_compressdev_zlib_module_set_wbits_decoder[] = {
+       {"wbits", offsetof(struct rpc_compressdev_zlib_module_wbits, wbits), spdk_json_decode_int32},
+};
+
+static bool isWbitsValid(int32_t windowbits, uint8_t* algo)
+{
+    static const int ZLIB_MAX_WBITS    = 15;
+    static const int ZLIB_MIN_WBITS    = 8;
+    static const int GZIP_MAX_WBITS    = 31;
+    static const int GZIP_MIN_WBITS    = 25;
+    static const int DEFLATE_MAX_WBITS = -8;
+    static const int DEFLATE_MIN_WBITS = -15;
+
+    bool isValid = false;
+    *algo = RTE_COMP_ALGO_DEFLATE;
+    if ((windowbits >= ZLIB_MIN_WBITS) && (windowbits <= ZLIB_MAX_WBITS)) {
+        isValid = true;
+        *algo = RTE_COMP_ALGO_DEFLATE_ZLIB;
+    } else if ((windowbits >= GZIP_MIN_WBITS) && (windowbits <= GZIP_MAX_WBITS)) {
+        isValid = true;
+        *algo = RTE_COMP_ALGO_DEFLATE_GZIP;
+    } else if ((windowbits >= DEFLATE_MIN_WBITS) && (windowbits <= DEFLATE_MAX_WBITS)) {
+        isValid = true;
+    }
+
+    return isValid;
+}
+
+static void
+rpc_compressdev_zlib_module_set_wbits(struct spdk_jsonrpc_request *request,
+                 const struct spdk_json_val *params)
+{
+       struct rpc_compressdev_zlib_module_wbits req;
+
+       if (spdk_json_decode_object(params, rpc_compressdev_zlib_module_set_wbits_decoder,
+                                   SPDK_COUNTOF(rpc_compressdev_zlib_module_set_wbits_decoder),
+                                   &req)) {
+               SPDK_ERRLOG("spdk_json_decode_object failed\n");
+               spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_PARSE_ERROR,
+                                                "spdk_json_decode_object failed");
+               return;
+       }
+  
+       uint8_t algo;
+       if (!isWbitsValid(req.wbits, &algo)) {
+            SPDK_ERRLOG("spdk set zlib wbits failed, wbits: %d\n", req.wbits);
+            spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,                                                "spdk set zlib wbits failed, deflate algo window size: -15 ~ -8 deflate raw, 8~15 zlib, 25~31 gzip");
+           return;
+       }
+
+       accel_compressdev_set_window_size(req.wbits, algo);
+
+
+       spdk_jsonrpc_send_bool_response(request, true);
+}
+
+
 SPDK_RPC_REGISTER("bdev_compress_set_pmd", rpc_bdev_compress_set_pmd,
 		  SPDK_RPC_STARTUP | SPDK_RPC_RUNTIME)
 SPDK_RPC_REGISTER_ALIAS_DEPRECATED(bdev_compress_set_pmd, set_compress_pmd)
 SPDK_RPC_REGISTER_ALIAS_DEPRECATED(bdev_compress_set_pmd, compress_set_pmd)
+
+SPDK_RPC_REGISTER("compressdev_zlib_module_set_wbits", rpc_compressdev_zlib_module_set_wbits,
+          SPDK_RPC_STARTUP)
 
 /* Structure to hold the parameters for this RPC method. */
 struct rpc_construct_compress {

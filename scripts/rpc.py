@@ -239,8 +239,16 @@ if __name__ == "__main__":
                                        pmd=args.pmd)
     p = subparsers.add_parser('bdev_compress_set_pmd', aliases=['set_compress_pmd', 'compress_set_pmd'],
                               help='Set pmd option for a compress disk')
-    p.add_argument('-p', '--pmd', type=int, help='0 = auto-select, 1= QAT only, 2 = ISAL only')
+    p.add_argument('-p', '--pmd', type=int, help='0 = auto-select, 1= QAT only, 2 = ISAL only, 3 = zlib only')
     p.set_defaults(func=bdev_compress_set_pmd)
+
+    def compressdev_zlib_module_set_wbits(args):
+        rpc.bdev.compressdev_zlib_module_set_wbits(args.client, wbits=args.wbits)
+
+    p = subparsers.add_parser('compressdev_zlib_module_set_wbits', help='compressdev zlib module set window size.')
+    p.add_argument('-w', '--wbits', type=int, help='8~15 zlib, 24~31 gzip')
+    p.set_defaults(func=compressdev_zlib_module_set_wbits)
+
 
     def bdev_compress_get_orphans(args):
         print_dict(rpc.bdev.bdev_compress_get_orphans(args.client,
