@@ -43,12 +43,21 @@
 
 #define AESNI_MB "crypto_aesni_mb"
 #define QAT "crypto_qat"
+#define OPENSSL "crypto_openssl"
 
 /* Supported ciphers */
 #define AES_CBC "AES_CBC" /* QAT and AESNI_MB */
 #define AES_XTS "AES_XTS" /* QAT only */
 
 typedef void (*spdk_delete_crypto_complete)(void *cb_arg, int bdeverrno);
+
+/**
+ * set crypto driver.
+ *
+ * \param driver_name Driver name that need to be initialized.
+ * \return 0 on success, other on failure.
+ */
+int bdev_crypto_set_driver(const char *driver_name);
 
 /**
  * Create new crypto bdev.

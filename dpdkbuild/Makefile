@@ -55,9 +55,15 @@ endif
 
 ifeq ($(CONFIG_CRYPTO),y)
 # crypto/qat is just a stub, the compress/qat pmd is used instead
-DPDK_DRIVERS += crypto crypto/aesni_mb
+DPDK_DRIVERS += crypto
+ifeq ($(CONFIG_IPSEC_MB),y)
+DPDK_DRIVERS += crypto/aesni_mb
 DPDK_CFLAGS += -I$(IPSEC_MB_DIR)
 DPDK_LDFLAGS += -L$(IPSEC_MB_DIR)
+endif
+ifeq ($(CONFIG_CRYPTO_OPENSSL),y)
+DPDK_DRIVERS += crypto/openssl
+endif
 endif
 
 ifeq ($(CONFIG_REDUCE),y)

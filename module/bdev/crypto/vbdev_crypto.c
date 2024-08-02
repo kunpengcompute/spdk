@@ -59,7 +59,7 @@ static int g_mbuf_offset;
  * Note that the string names are defined by the DPDK PMD in question so be
  * sure to use the exact names.
  */
-#define MAX_NUM_DRV_TYPES 2
+#define MAX_NUM_DRV_TYPES 3
 
 /* The VF spread is the number of queue pairs between virtual functions, we use this to
  * load balance the QAT device.
@@ -68,7 +68,17 @@ static int g_mbuf_offset;
 static uint8_t g_qat_total_qp = 0;
 static uint8_t g_next_qat_index;
 
-const char *g_driver_names[MAX_NUM_DRV_TYPES] = { AESNI_MB, QAT };
+enum bdev_crypto_driver_type {
+	BDEV_CRYPTO_DRIVER_AESNI_MB = 0,
+	BDEV_CRYPTO_DRIVER_QAT,
+	BDEV_CRYPTO_DRIVER_OPENSSL,
+	BDEV_CRYPTO_DRIVER_LAST
+};
+static const char *g_driver_names[] = {
+	[BDEV_CRYPTO_DRIVER_AESNI_MB]	= AESNI_MB,
+	[BDEV_CRYPTO_DRIVER_QAT]	= QAT,
+	[BDEV_CRYPTO_DRIVER_OPENSSL]	= OPENSSL,
+};
 
 /* Global list of available crypto devices. */
 struct vbdev_dev {
@@ -91,6 +101,7 @@ struct device_qp {
 };
 static TAILQ_HEAD(, device_qp) g_device_qp_qat = TAILQ_HEAD_INITIALIZER(g_device_qp_qat);
 static TAILQ_HEAD(, device_qp) g_device_qp_aesni_mb = TAILQ_HEAD_INITIALIZER(g_device_qp_aesni_mb);
+static TAILQ_HEAD(, device_qp) g_device_qp_openssl = TAILQ_HEAD_INITIALIZER(g_device_qp_openssl);
 static pthread_mutex_t g_device_qp_lock = PTHREAD_MUTEX_INITIALIZER;
 
 
@@ -139,8 +150,7 @@ uint8_t g_number_of_claimed_volumes = 0;
 #define AES_CBC_IV_LENGTH	16
 #define AES_CBC_KEY_LENGTH	16
 #define AES_XTS_KEY_LENGTH	16	/* XTS uses 2 keys, each of this size. */
-#define AESNI_MB_NUM_QP		64
-
+#define DRIVER_NUM_QP		64
 /* Common for suported devices. */
 #define IV_OFFSET            (sizeof(struct rte_crypto_op) + \
 				sizeof(struct rte_crypto_sym_op))
@@ -242,6 +252,28 @@ struct crypto_bdev_io {
 	struct spdk_io_channel *ch;
 };
 
+static enum bdev_crypto_driver_type g_bdev_crypto_driver =
+	BDEV_CRYPTO_DRIVER_AESNI_MB;
+
+int
+bdev_crypto_set_driver(const char *driver_name)
+{
+	if (strcmp(driver_name, AESNI_MB) == 0) {
+		g_bdev_crypto_driver = BDEV_CRYPTO_DRIVER_AESNI_MB;
+	} else if (strcmp(driver_name, QAT) == 0) {
+		g_bdev_crypto_driver = BDEV_CRYPTO_DRIVER_QAT;
+	} else if (strcmp(driver_name, OPENSSL) == 0) {
+		g_bdev_crypto_driver = BDEV_CRYPTO_DRIVER_OPENSSL;
+	}  else {
+		SPDK_ERRLOG("Unsupported driver %s\n", driver_name);
+		return -EINVAL;
+	}
+
+	SPDK_NOTICELOG("Using driver %s\n", driver_name);
+
+	return 0;
+}
+
 /* Called by vbdev_crypto_init_crypto_drivers() to init each discovered crypto device */
 static int
 create_vbdev_dev(uint8_t index, uint16_t num_lcores)
@@ -325,6 +357,8 @@ create_vbdev_dev(uint8_t index, uint16_t num_lcores)
 		dev_qp_head = (struct device_qps *)&g_device_qp_qat;
 	} else if (strcmp(device->cdev_info.driver_name, AESNI_MB) == 0) {
 		dev_qp_head = (struct device_qps *)&g_device_qp_aesni_mb;
+	} else if (strcmp(device->cdev_info.driver_name, OPENSSL) == 0) {
+		dev_qp_head = (struct device_qps *)&g_device_qp_openssl;
 	} else {
 		rc = -EINVAL;
 		goto err;
@@ -383,7 +417,8 @@ vbdev_crypto_init_crypto_drivers(void)
 	struct device_qp *dev_qp;
 	unsigned int max_sess_size = 0, sess_size;
 	uint16_t num_lcores = rte_lcore_count();
-	char aesni_args[32];
+	const char *driver_name = g_driver_names[g_bdev_crypto_driver];
+	char driver_args[32];
 
 	/* Only the first call, via RPC or module init should init the crypto drivers. */
 	if (g_session_mp != NULL) {
@@ -391,10 +426,10 @@ vbdev_crypto_init_crypto_drivers(void)
 	}
 
 	/* We always init AESNI_MB */
-	snprintf(aesni_args, sizeof(aesni_args), "max_nb_queue_pairs=%d", AESNI_MB_NUM_QP);
-	rc = rte_vdev_init(AESNI_MB, aesni_args);
+	snprintf(driver_args, sizeof(driver_args), "max_nb_queue_pairs=%d", DRIVER_NUM_QP);
+	rc = rte_vdev_init(driver_name, driver_args);
 	if (rc) {
-		SPDK_ERRLOG("error creating virtual PMD %s\n", AESNI_MB);
+		SPDK_ERRLOG("error creating virtual PMD %s\n", driver_name);
 		return -EINVAL;
 	}
 
@@ -1423,6 +1458,14 @@ _assign_device_qp(struct vbdev_crypto *crypto_bdev, struct device_qp *device_qp,
 				break;
 			}
 		}
+	} else if (strcmp(crypto_bdev->drv_name, OPENSSL) == 0) {
+		TAILQ_FOREACH(device_qp, &g_device_qp_openssl, link) {
+			if (device_qp->in_use == false) {
+				crypto_ch->device_qp = device_qp;
+				device_qp->in_use = true;
+				break;
+			}
+		}
 	}
 	pthread_mutex_unlock(&g_device_qp_lock);
 }
@@ -1639,6 +1682,7 @@ vbdev_crypto_finish(void)
 	struct device_qp *dev_qp;
 	unsigned i;
 	int rc;
+	const char *driver_name = g_driver_names[g_bdev_crypto_driver];
 
 	while ((name = TAILQ_FIRST(&g_bdev_names))) {
 		TAILQ_REMOVE(&g_bdev_names, name, link);
@@ -1666,7 +1710,7 @@ vbdev_crypto_finish(void)
 		}
 		free(device);
 	}
-	rc = rte_vdev_uninit(AESNI_MB);
+	rc = rte_vdev_uninit(driver_name);
 	if (rc) {
 		SPDK_ERRLOG("%d from rte_vdev_uninit\n", rc);
 	}
@@ -1678,6 +1722,11 @@ vbdev_crypto_finish(void)
 
 	while ((dev_qp = TAILQ_FIRST(&g_device_qp_aesni_mb))) {
 		TAILQ_REMOVE(&g_device_qp_aesni_mb, dev_qp, link);
+		free(dev_qp);
+	}
+
+    while ((dev_qp = TAILQ_FIRST(&g_device_qp_openssl))) {
+		TAILQ_REMOVE(&g_device_qp_openssl, dev_qp, link);
 		free(dev_qp);
 	}
 

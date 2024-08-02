@@ -190,4 +190,37 @@ cleanup:
 	free_rpc_delete_crypto(&req);
 }
 SPDK_RPC_REGISTER("bdev_crypto_delete", rpc_bdev_crypto_delete, SPDK_RPC_RUNTIME)
+
+struct rpc_set_driver {
+	char *driver_name;
+};
+
+static const struct spdk_json_object_decoder rpc_set_driver_decoders[] = {
+	{"driver_name", offsetof(struct rpc_set_driver, driver_name), spdk_json_decode_string},
+};
+
+static void
+rpc_bdev_crypto_set_driver(struct spdk_jsonrpc_request *request,
+			      const struct spdk_json_val *params)
+{
+	struct rpc_set_driver req = {};
+	int rc;
+
+	if (spdk_json_decode_object(params, rpc_set_driver_decoders,
+				    SPDK_COUNTOF(rpc_set_driver_decoders), &req)) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_PARSE_ERROR,
+						 "spdk_json_decode_object failed");
+		return;
+	}
+
+	rc = bdev_crypto_set_driver(req.driver_name);
+	free(req.driver_name);
+	if (rc) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "incorrect driver name");
+	} else {
+		spdk_jsonrpc_send_bool_response(request, true);
+	}
+}
+SPDK_RPC_REGISTER("bdev_crypto_set_driver", rpc_bdev_crypto_set_driver, SPDK_RPC_STARTUP)
 SPDK_RPC_REGISTER_ALIAS_DEPRECATED(bdev_crypto_delete, delete_crypto_bdev)

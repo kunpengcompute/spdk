@@ -102,6 +102,16 @@ def bdev_compress_get_orphans(client, name=None):
         params['name'] = name
     return client.call('bdev_compress_get_orphans', params)
 
+def bdev_crypto_set_driver(client, driver_name):
+    """Set driver options for the bdev crypto.
+
+    Args:
+        driver: crypto_qat, crypto_aesni_mb or crypto_openssl
+    """
+    params = {'driver_name': driver_name}
+
+    return client.call('bdev_crypto_set_driver', params)
+
 
 @deprecated_alias('construct_crypto_bdev')
 def bdev_crypto_create(client, base_bdev_name, name, crypto_pmd, key, cipher=None, key2=None):

@@ -250,6 +250,13 @@ if __name__ == "__main__":
     p.add_argument('-b', '--name', help="Name of a comp bdev. Example: COMP_Nvme0n1", required=False)
     p.set_defaults(func=bdev_compress_get_orphans)
 
+    def bdev_crypto_set_driver(args):
+        rpc.bdev.bdev_crypto_set_driver(args.client,
+                                       driver_name=args.driver_name)
+    p = subparsers.add_parser('bdev_crypto_set_driver', help='Set driver option for a crypto disk')
+    p.add_argument('-d', '--driver-name', help='crypto_qat, crypto_aesni_mb or crypto_openssl', type=str)
+    p.set_defaults(func=bdev_crypto_set_driver)
+
     def bdev_crypto_create(args):
         print_json(rpc.bdev.bdev_crypto_create(args.client,
                                                base_bdev_name=args.base_bdev_name,
