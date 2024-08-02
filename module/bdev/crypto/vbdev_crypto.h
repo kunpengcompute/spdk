@@ -75,6 +75,8 @@ int create_crypto_disk(const char *bdev_name, const char *vbdev_name,
 		       const char *crypto_pmd, const char *key,
 		       const char *cipher, const char *key2);
 
+int vbdev_cryptodev_set_engine(const char *engine_name);
+
 /**
  * Delete crypto bdev.
  *

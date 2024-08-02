@@ -45,6 +45,7 @@
 #include <rte_cryptodev.h>
 #include <rte_cryptodev_pmd.h>
 #include <rte_mbuf_dyn.h>
+#include <openssl/engine.h>
 
 /* Used to store IO context in mbuf */
 static const struct rte_mbuf_dynfield rte_mbuf_dynfield_io_context = {
@@ -158,6 +159,15 @@ uint8_t g_number_of_claimed_volumes = 0;
 #define IV_OFFSET            (sizeof(struct rte_crypto_op) + \
 				sizeof(struct rte_crypto_sym_op))
 #define QUEUED_OP_OFFSET (IV_OFFSET + AES_CBC_IV_LENGTH)
+
+
+/* Engine names */
+#define VBDEV_CRYPTODEV_ENGINE_KAE "crypto_engine_kae"
+
+enum vbdev_cryptodev_engine_type {
+    VBDEV_CRYPTO_ENGINE_KAE,  // kae engine
+	VBDEV_CRYPTO_ENGINE_LAST
+};
 
 static void _complete_internal_io(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg);
 static void _complete_internal_read(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg);
@@ -403,6 +413,44 @@ err:
 static void shinfo_free_cb(void *arg1, void *arg2)
 {
 }
+
+int
+vbdev_cryptodev_set_engine(const char *engine_name)
+{
+	enum vbdev_cryptodev_engine_type vbdev_cryptodev_engine;
+
+	if (strcmp(engine_name, VBDEV_CRYPTODEV_ENGINE_KAE) == 0) {
+		vbdev_cryptodev_engine = VBDEV_CRYPTO_ENGINE_KAE;
+	} else {
+		vbdev_cryptodev_engine = VBDEV_CRYPTO_ENGINE_LAST;
+	}
+
+    if (vbdev_cryptodev_engine == VBDEV_CRYPTO_ENGINE_LAST){
+		SPDK_ERRLOG("Unsupported engine %s\n", engine_name);
+		return -EINVAL;
+	}
+
+	if (vbdev_cryptodev_engine == VBDEV_CRYPTO_ENGINE_KAE){
+        // init kae engine
+	    OPENSSL_init_crypto(OPENSSL_INIT_LOAD_CONFIG, NULL);
+        ENGINE *engine = ENGINE_by_id("kae");
+        if (engine == NULL) {
+		   SPDK_ERRLOG("engine is NULL!\n");
+           return -EINVAL;
+        }
+        ENGINE_init(engine);
+        // set engine
+        if (ENGINE_set_default(engine, ENGINE_METHOD_ALL) == 1) {
+		   SPDK_NOTICELOG("engine set success!\n");
+        } else {
+		   SPDK_ERRLOG("engine set fail!\n");
+		   return -EINVAL;
+        }
+    }
+	SPDK_NOTICELOG("Using engine %s\n", engine_name);
+	return 0;
+}
+
 
 /* This is called from the module's init function. We setup all crypto devices early on as we are unable
  * to easily dynamically configure queue pairs after the drivers are up and running.  So, here, we

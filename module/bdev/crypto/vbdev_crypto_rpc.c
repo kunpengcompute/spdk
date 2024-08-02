@@ -149,6 +149,40 @@ cleanup:
 SPDK_RPC_REGISTER("bdev_crypto_create", rpc_bdev_crypto_create, SPDK_RPC_RUNTIME)
 SPDK_RPC_REGISTER_ALIAS_DEPRECATED(bdev_crypto_create, construct_crypto_bdev)
 
+
+struct rpc_set_engine {
+    char *engine_name;
+};
+
+static const struct spdk_json_object_decoder rpc_set_engine_decoders[] = {
+    {"engine_name", offsetof(struct rpc_set_engine, engine_name), spdk_json_decode_string},
+};
+
+static void
+rpc_bdev_cryptodev_set_engine(struct spdk_jsonrpc_request *request,
+			      const struct spdk_json_val *params)
+{
+	struct rpc_set_engine req = {};
+	int rc;
+
+	if (spdk_json_decode_object(params, rpc_set_engine_decoders,
+				    SPDK_COUNTOF(rpc_set_engine_decoders), &req)) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_PARSE_ERROR,
+						 "spdk_json_decode_object failed");
+		return;
+	}
+
+	rc = vbdev_cryptodev_set_engine(req.engine_name);
+	free(req.engine_name);
+	if (rc) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "incorrect engine name");
+	} else {
+		spdk_jsonrpc_send_bool_response(request, true);
+	}
+}
+SPDK_RPC_REGISTER("bdev_cryptodev_set_engine", rpc_bdev_cryptodev_set_engine, SPDK_RPC_RUNTIME)
+
 struct rpc_delete_crypto {
 	char *name;
 };

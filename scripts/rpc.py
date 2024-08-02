@@ -275,6 +275,16 @@ if __name__ == "__main__":
     p.add_argument('-k2', '--key2', help="2nd key for cipher AET_XTS", default=None)
     p.set_defaults(func=bdev_crypto_create)
 
+    def bdev_cryptodev_set_engine(args):
+        print_json(rpc.bdev.bdev_cryptodev_set_engine(args.client,
+                                                       engine_name=args.engine_name))
+
+    p = subparsers.add_parser('bdev_cryptodev_set_engine',
+                                help='Set crypto vdev engine')
+    p.add_argument('-e', '--engine-name', help='The engine, can be one of crypto_engine_kae', type=str)
+    p.set_defaults(func=bdev_cryptodev_set_engine)
+
+
     def bdev_crypto_delete(args):
         rpc.bdev.bdev_crypto_delete(args.client,
                                     name=args.name)

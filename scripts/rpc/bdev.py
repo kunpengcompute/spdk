@@ -64,6 +64,17 @@ def bdev_compress_create(client, base_bdev_name, pm_path, lb_size):
     return client.call('bdev_compress_create', params)
 
 
+def bdev_cryptodev_set_engine(client, engine_name):
+    """Set the BDEV cryptodev engine.
+
+    Args:
+        engine_name: The engine, can be set crypto_engine_kae
+    """
+    params = {'engine_name': engine_name}
+
+    return client.call('bdev_cryptodev_set_engine', params)
+
+
 @deprecated_alias('delete_compress_bdev')
 def bdev_compress_delete(client, name):
     """Delete compress virtual block device.
