@@ -45,6 +45,7 @@
 #include <rte_cryptodev.h>
 #include <rte_cryptodev_pmd.h>
 #include <rte_mbuf_dyn.h>
+#include <openssl/engine.h>
 
 /* Used to store IO context in mbuf */
 static const struct rte_mbuf_dynfield rte_mbuf_dynfield_io_context = {
@@ -59,7 +60,7 @@ static int g_mbuf_offset;
  * Note that the string names are defined by the DPDK PMD in question so be
  * sure to use the exact names.
  */
-#define MAX_NUM_DRV_TYPES 2
+#define MAX_NUM_DRV_TYPES 3
 
 /* The VF spread is the number of queue pairs between virtual functions, we use this to
  * load balance the QAT device.
@@ -68,7 +69,17 @@ static int g_mbuf_offset;
 static uint8_t g_qat_total_qp = 0;
 static uint8_t g_next_qat_index;
 
-const char *g_driver_names[MAX_NUM_DRV_TYPES] = { AESNI_MB, QAT };
+enum bdev_crypto_driver_type {
+	BDEV_CRYPTO_DRIVER_AESNI_MB = 0,
+	BDEV_CRYPTO_DRIVER_QAT,
+	BDEV_CRYPTO_DRIVER_OPENSSL,
+	BDEV_CRYPTO_DRIVER_LAST
+};
+static const char *g_driver_names[] = {
+	[BDEV_CRYPTO_DRIVER_AESNI_MB]	= AESNI_MB,
+	[BDEV_CRYPTO_DRIVER_QAT]	= QAT,
+	[BDEV_CRYPTO_DRIVER_OPENSSL]	= OPENSSL,
+};
 
 /* Global list of available crypto devices. */
 struct vbdev_dev {
@@ -91,6 +102,7 @@ struct device_qp {
 };
 static TAILQ_HEAD(, device_qp) g_device_qp_qat = TAILQ_HEAD_INITIALIZER(g_device_qp_qat);
 static TAILQ_HEAD(, device_qp) g_device_qp_aesni_mb = TAILQ_HEAD_INITIALIZER(g_device_qp_aesni_mb);
+static TAILQ_HEAD(, device_qp) g_device_qp_openssl = TAILQ_HEAD_INITIALIZER(g_device_qp_openssl);
 static pthread_mutex_t g_device_qp_lock = PTHREAD_MUTEX_INITIALIZER;
 
 
@@ -138,13 +150,24 @@ uint8_t g_number_of_claimed_volumes = 0;
 /* Specific to AES_CBC. */
 #define AES_CBC_IV_LENGTH	16
 #define AES_CBC_KEY_LENGTH	16
+/* Specific to AES_CTR. */
+#define AES_CTR_IV_LENGTH	16
+#define AES_CTR_KEY_LENGTH	16
 #define AES_XTS_KEY_LENGTH	16	/* XTS uses 2 keys, each of this size. */
-#define AESNI_MB_NUM_QP		64
-
+#define DRIVER_NUM_QP		64
 /* Common for suported devices. */
 #define IV_OFFSET            (sizeof(struct rte_crypto_op) + \
 				sizeof(struct rte_crypto_sym_op))
 #define QUEUED_OP_OFFSET (IV_OFFSET + AES_CBC_IV_LENGTH)
+
+
+/* Engine names */
+#define VBDEV_CRYPTODEV_ENGINE_KAE "crypto_engine_kae"
+
+enum vbdev_cryptodev_engine_type {
+    VBDEV_CRYPTO_ENGINE_KAE,  // kae engine
+	VBDEV_CRYPTO_ENGINE_LAST
+};
 
 static void _complete_internal_io(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg);
 static void _complete_internal_read(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg);
@@ -163,7 +186,7 @@ struct bdev_names {
 	 */
 	uint8_t			*key;		/* key per bdev */
 	char			*drv_name;	/* name of the crypto device driver */
-	char			*cipher;	/* AES_CBC or AES_XTS */
+	char			*cipher;	/* AES_CBC , AES_CTR or AES_XTS */
 	uint8_t			*key2;		/* key #2 for AES_XTS, per bdev */
 	TAILQ_ENTRY(bdev_names)	link;
 };
@@ -192,8 +215,10 @@ static TAILQ_HEAD(, vbdev_crypto) g_vbdev_crypto = TAILQ_HEAD_INITIALIZER(g_vbde
 /* Shared mempools between all devices on this system */
 static struct rte_mempool *g_session_mp = NULL;
 static struct rte_mempool *g_session_mp_priv = NULL;
-static struct spdk_mempool *g_mbuf_mp = NULL;		/* mbuf mempool */
+static struct rte_mempool *g_mbuf_mp = NULL;            /* mbuf mempool */
 static struct rte_mempool *g_crypto_op_mp = NULL;	/* crypto operations, must be rte* mempool */
+
+static struct rte_mbuf_ext_shared_info g_shinfo = {};   /* used by DPDK mbuf macro */
 
 /* For queueing up crypto operations that we can't submit for some reason */
 struct vbdev_crypto_op {
@@ -239,6 +264,28 @@ struct crypto_bdev_io {
 	struct spdk_bdev_io_wait_entry bdev_io_wait;
 	struct spdk_io_channel *ch;
 };
+
+static enum bdev_crypto_driver_type g_bdev_crypto_driver =
+	BDEV_CRYPTO_DRIVER_AESNI_MB;
+
+int
+bdev_crypto_set_driver(const char *driver_name)
+{
+	if (strcmp(driver_name, AESNI_MB) == 0) {
+		g_bdev_crypto_driver = BDEV_CRYPTO_DRIVER_AESNI_MB;
+	} else if (strcmp(driver_name, QAT) == 0) {
+		g_bdev_crypto_driver = BDEV_CRYPTO_DRIVER_QAT;
+	} else if (strcmp(driver_name, OPENSSL) == 0) {
+		g_bdev_crypto_driver = BDEV_CRYPTO_DRIVER_OPENSSL;
+	}  else {
+		SPDK_ERRLOG("Unsupported driver %s\n", driver_name);
+		return -EINVAL;
+	}
+
+	SPDK_NOTICELOG("Using driver %s\n", driver_name);
+
+	return 0;
+}
 
 /* Called by vbdev_crypto_init_crypto_drivers() to init each discovered crypto device */
 static int
@@ -323,6 +370,8 @@ create_vbdev_dev(uint8_t index, uint16_t num_lcores)
 		dev_qp_head = (struct device_qps *)&g_device_qp_qat;
 	} else if (strcmp(device->cdev_info.driver_name, AESNI_MB) == 0) {
 		dev_qp_head = (struct device_qps *)&g_device_qp_aesni_mb;
+	} else if (strcmp(device->cdev_info.driver_name, OPENSSL) == 0) {
+		dev_qp_head = (struct device_qps *)&g_device_qp_openssl;
 	} else {
 		rc = -EINVAL;
 		goto err;
@@ -359,6 +408,50 @@ err:
 	return rc;
 }
 
+/* Dummy function used by DPDK to free ext attached buffers to mbufs, we free them ourselves but
+ * this callback has to be here. */
+static void shinfo_free_cb(void *arg1, void *arg2)
+{
+}
+
+int
+vbdev_cryptodev_set_engine(const char *engine_name)
+{
+	enum vbdev_cryptodev_engine_type vbdev_cryptodev_engine;
+
+	if (strcmp(engine_name, VBDEV_CRYPTODEV_ENGINE_KAE) == 0) {
+		vbdev_cryptodev_engine = VBDEV_CRYPTO_ENGINE_KAE;
+	} else {
+		vbdev_cryptodev_engine = VBDEV_CRYPTO_ENGINE_LAST;
+	}
+
+    if (vbdev_cryptodev_engine == VBDEV_CRYPTO_ENGINE_LAST){
+		SPDK_ERRLOG("Unsupported engine %s\n", engine_name);
+		return -EINVAL;
+	}
+
+	if (vbdev_cryptodev_engine == VBDEV_CRYPTO_ENGINE_KAE){
+        // init kae engine
+	    OPENSSL_init_crypto(OPENSSL_INIT_LOAD_CONFIG, NULL);
+        ENGINE *engine = ENGINE_by_id("kae");
+        if (engine == NULL) {
+		   SPDK_ERRLOG("engine is NULL!\n");
+           return -EINVAL;
+        }
+        ENGINE_init(engine);
+        // set engine
+        if (ENGINE_set_default(engine, ENGINE_METHOD_ALL) == 1) {
+		   SPDK_NOTICELOG("engine set success!\n");
+        } else {
+		   SPDK_ERRLOG("engine set fail!\n");
+		   return -EINVAL;
+        }
+    }
+	SPDK_NOTICELOG("Using engine %s\n", engine_name);
+	return 0;
+}
+
+
 /* This is called from the module's init function. We setup all crypto devices early on as we are unable
  * to easily dynamically configure queue pairs after the drivers are up and running.  So, here, we
  * configure the max capabilities of each device and assign threads to queue pairs as channels are
@@ -375,7 +468,8 @@ vbdev_crypto_init_crypto_drivers(void)
 	struct device_qp *dev_qp;
 	unsigned int max_sess_size = 0, sess_size;
 	uint16_t num_lcores = rte_lcore_count();
-	char aesni_args[32];
+	const char *driver_name = g_driver_names[g_bdev_crypto_driver];
+	char driver_args[32];
 
 	/* Only the first call, via RPC or module init should init the crypto drivers. */
 	if (g_session_mp != NULL) {
@@ -383,10 +477,10 @@ vbdev_crypto_init_crypto_drivers(void)
 	}
 
 	/* We always init AESNI_MB */
-	snprintf(aesni_args, sizeof(aesni_args), "max_nb_queue_pairs=%d", AESNI_MB_NUM_QP);
-	rc = rte_vdev_init(AESNI_MB, aesni_args);
+	snprintf(driver_args, sizeof(driver_args), "max_nb_queue_pairs=%d", DRIVER_NUM_QP);
+	rc = rte_vdev_init(driver_name, driver_args);
 	if (rc) {
-		SPDK_ERRLOG("error creating virtual PMD %s\n", AESNI_MB);
+		SPDK_ERRLOG("error creating virtual PMD %s\n", driver_name);
 		return -EINVAL;
 	}
 
@@ -430,13 +524,12 @@ vbdev_crypto_init_crypto_drivers(void)
 			       SOCKET_ID_ANY);
 	if (g_session_mp == NULL) {
 		SPDK_ERRLOG("Cannot create session pool max size 0x%x\n", max_sess_size);
+		rc = -ENOMEM;
 		goto error_create_session_mp;
-		return -ENOMEM;
 	}
 
-	g_mbuf_mp = spdk_mempool_create("mbuf_mp", NUM_MBUFS, sizeof(struct rte_mbuf),
-					SPDK_MEMPOOL_DEFAULT_CACHE_SIZE,
-					SPDK_ENV_SOCKET_ID_ANY);
+	g_mbuf_mp = rte_pktmbuf_pool_create("mbuf_mp", NUM_MBUFS, POOL_CACHE_SIZE,
+					    0, 0, SPDK_ENV_SOCKET_ID_ANY);
 	if (g_mbuf_mp == NULL) {
 		SPDK_ERRLOG("Cannot create mbuf pool\n");
 		rc = -ENOMEM;
@@ -475,6 +568,7 @@ vbdev_crypto_init_crypto_drivers(void)
 		dev_qp->index = i++;
 	}
 
+	g_shinfo.free_cb = shinfo_free_cb;
 	return 0;
 
 	/* Error cleanup paths. */
@@ -486,7 +580,7 @@ err:
 	rte_mempool_free(g_crypto_op_mp);
 	g_crypto_op_mp = NULL;
 error_create_op:
-	spdk_mempool_free(g_mbuf_mp);
+	rte_mempool_free(g_mbuf_mp);
 	g_mbuf_mp = NULL;
 error_create_mbuf:
 	rte_mempool_free(g_session_mp);
@@ -512,7 +606,11 @@ _crypto_operation_complete(struct spdk_bdev_io *bdev_io)
 	struct spdk_bdev_io *free_me = io_ctx->read_io;
 	int rc = 0;
 
-	TAILQ_REMOVE(&crypto_ch->pending_cry_ios, bdev_io, module_link);
+	/* Can also be called from the crypto_dev_poller() to fail the stuck re-enqueue ops IO. */
+	if (io_ctx->on_pending_list) {
+		TAILQ_REMOVE(&crypto_ch->pending_cry_ios, bdev_io, module_link);
+		io_ctx->on_pending_list = false;
+	}
 
 	if (bdev_io->type == SPDK_BDEV_IO_TYPE_READ) {
 
@@ -551,6 +649,43 @@ _crypto_operation_complete(struct spdk_bdev_io *bdev_io)
 	}
 }
 
+static void
+cancel_queued_crypto_ops(struct crypto_io_channel *crypto_ch, struct spdk_bdev_io *bdev_io)
+{
+	struct rte_mbuf *mbufs_to_free[2 * MAX_DEQUEUE_BURST_SIZE];
+	struct rte_crypto_op *dequeued_ops[MAX_DEQUEUE_BURST_SIZE];
+	struct vbdev_crypto_op *op_to_cancel, *tmp_op;
+	struct rte_crypto_op *crypto_op;
+	int num_mbufs, num_dequeued_ops;
+
+	/* Remove all ops from the failed IO. Since we don't know the
+	 * order we have to check them all. */
+	num_mbufs = 0;
+	num_dequeued_ops = 0;
+	TAILQ_FOREACH_SAFE(op_to_cancel, &crypto_ch->queued_cry_ops, link, tmp_op) {
+		/* Checking if this is our op. One IO contains multiple ops. */
+		if (bdev_io == op_to_cancel->bdev_io) {
+			crypto_op = op_to_cancel->crypto_op;
+			TAILQ_REMOVE(&crypto_ch->queued_cry_ops, op_to_cancel, link);
+
+			/* Populating lists for freeing mbufs and ops. */
+			mbufs_to_free[num_mbufs++] = (void *)crypto_op->sym->m_src;
+			if (crypto_op->sym->m_dst) {
+				mbufs_to_free[num_mbufs++] = (void *)crypto_op->sym->m_dst;
+			}
+			dequeued_ops[num_dequeued_ops++] = crypto_op;
+		}
+	}
+
+	/* Now bulk free both mbufs and crypto operations. */
+	if (num_dequeued_ops > 0) {
+		rte_mempool_put_bulk(g_crypto_op_mp, (void **)dequeued_ops,
+				     num_dequeued_ops);
+		assert(num_mbufs > 0);
+		rte_pktmbuf_free_bulk(mbufs_to_free, num_mbufs);
+	}
+}
+
 static int _crypto_operation(struct spdk_bdev_io *bdev_io,
 			     enum rte_crypto_cipher_operation crypto_op,
 			     void *aux_buf);
@@ -569,7 +704,7 @@ crypto_dev_poller(void *args)
 	struct spdk_bdev_io *bdev_io = NULL;
 	struct crypto_bdev_io *io_ctx = NULL;
 	struct rte_crypto_op *dequeued_ops[MAX_DEQUEUE_BURST_SIZE];
-	struct rte_crypto_op *mbufs_to_free[2 * MAX_DEQUEUE_BURST_SIZE];
+	struct rte_mbuf *mbufs_to_free[2 * MAX_DEQUEUE_BURST_SIZE];
 	int num_mbufs = 0;
 	struct vbdev_crypto_op *op_to_resubmit;
 
@@ -634,15 +769,14 @@ crypto_dev_poller(void *args)
 				     (void **)dequeued_ops,
 				     num_dequeued_ops);
 		assert(num_mbufs > 0);
-		spdk_mempool_put_bulk(g_mbuf_mp,
-				      (void **)mbufs_to_free,
-				      num_mbufs);
+		rte_pktmbuf_free_bulk(mbufs_to_free, num_mbufs);
 	}
 
 	/* Check if there are any pending crypto ops to process */
 	while (!TAILQ_EMPTY(&crypto_ch->queued_cry_ops)) {
 		op_to_resubmit = TAILQ_FIRST(&crypto_ch->queued_cry_ops);
-		io_ctx = (struct crypto_bdev_io *)op_to_resubmit->bdev_io->driver_ctx;
+		bdev_io = op_to_resubmit->bdev_io;
+		io_ctx = (struct crypto_bdev_io *)bdev_io->driver_ctx;
 		num_enqueued_ops = rte_cryptodev_enqueue_burst(op_to_resubmit->cdev_id,
 				   op_to_resubmit->qp,
 				   &op_to_resubmit->crypto_op,
@@ -652,13 +786,28 @@ crypto_dev_poller(void *args)
 			 * of many crypto ops.
 			 */
 			if (io_ctx->on_pending_list == false) {
-				TAILQ_INSERT_TAIL(&crypto_ch->pending_cry_ios, op_to_resubmit->bdev_io, module_link);
+				TAILQ_INSERT_TAIL(&crypto_ch->pending_cry_ios, bdev_io, module_link);
 				io_ctx->on_pending_list = true;
 			}
 			TAILQ_REMOVE(&crypto_ch->queued_cry_ops, op_to_resubmit, link);
 		} else {
-			/* if we couldn't get one, just break and try again later. */
-			break;
+			if (op_to_resubmit->crypto_op->status == RTE_CRYPTO_OP_STATUS_NOT_PROCESSED) {
+				/* If we couldn't get one, just break and try again later. */
+				break;
+			} else {
+				/* Something is really wrong with the op. Most probably the
+				 * mbuf is broken or the HW is not able to process the request.
+				 * Fail the IO and remove its ops from the queued ops list. */
+				io_ctx->bdev_io_status = SPDK_BDEV_IO_STATUS_FAILED;
+
+				cancel_queued_crypto_ops(crypto_ch, bdev_io);
+
+				/* Fail the IO if there is nothing left on device. */
+				if (--io_ctx->cryop_cnt_remaining == 0) {
+					_crypto_operation_complete(bdev_io);
+				}
+			}
+
 		}
 	}
 
@@ -692,7 +841,7 @@ _crypto_operation(struct spdk_bdev_io *bdev_io, enum rte_crypto_cipher_operation
 	uint32_t allocated = 0;
 	uint8_t *current_iov = NULL;
 	uint64_t total_remaining = 0;
-	uint64_t updated_length, current_iov_remaining = 0;
+	uint64_t current_iov_remaining = 0;
 	uint32_t crypto_index = 0;
 	uint32_t en_offset = 0;
 	struct rte_crypto_op *crypto_ops[MAX_ENQUEUE_ARRAY_SIZE];
@@ -709,7 +858,7 @@ _crypto_operation(struct spdk_bdev_io *bdev_io, enum rte_crypto_cipher_operation
 	 * LBA as IV, there can be no case where we'd need >1 mbuf per crypto op or the
 	 * op would be > 1 LBA.
 	 */
-	rc = spdk_mempool_get_bulk(g_mbuf_mp, (void **)&src_mbufs[0], cryop_cnt);
+	rc = rte_pktmbuf_alloc_bulk(g_mbuf_mp, src_mbufs, cryop_cnt);
 	if (rc) {
 		SPDK_ERRLOG("ERROR trying to get src_mbufs!\n");
 		return -ENOMEM;
@@ -717,7 +866,7 @@ _crypto_operation(struct spdk_bdev_io *bdev_io, enum rte_crypto_cipher_operation
 
 	/* Get the same amount but these buffers to describe the encrypted data location (dst). */
 	if (crypto_op == RTE_CRYPTO_CIPHER_OP_ENCRYPT) {
-		rc = spdk_mempool_get_bulk(g_mbuf_mp, (void **)&dst_mbufs[0], cryop_cnt);
+		rc = rte_pktmbuf_alloc_bulk(g_mbuf_mp, dst_mbufs, cryop_cnt);
 		if (rc) {
 			SPDK_ERRLOG("ERROR trying to get dst_mbufs!\n");
 			rc = -ENOMEM;
@@ -769,16 +918,25 @@ _crypto_operation(struct spdk_bdev_io *bdev_io, enum rte_crypto_cipher_operation
 	current_iov_remaining = bdev_io->u.bdev.iovs[iov_index].iov_len;
 	do {
 		uint8_t *iv_ptr;
+		uint8_t *buf_addr;
+		uint64_t phys_addr;
 		uint64_t op_block_offset;
+		uint64_t phys_len;
 
-		/* Set the mbuf elements address and length. Null out the next pointer. */
-		src_mbufs[crypto_index]->buf_addr = current_iov;
-		src_mbufs[crypto_index]->data_len = updated_length = crypto_len;
-		/* TODO: Make this assignment conditional on QAT usage and add an assert. */
-		src_mbufs[crypto_index]->buf_iova = spdk_vtophys((void *)current_iov, &updated_length);
-		src_mbufs[crypto_index]->next = NULL;
 		/* Store context in every mbuf as we don't know anything about completion order */
 		*RTE_MBUF_DYNFIELD(src_mbufs[crypto_index], g_mbuf_offset, uint64_t *) = (uint64_t)bdev_io;
+
+		phys_len = crypto_len;
+		phys_addr = spdk_vtophys((void *)current_iov, &phys_len);
+		if (phys_addr == SPDK_VTOPHYS_ERROR) {
+			rc = -EFAULT;
+			goto error_attach_session;
+		}
+
+		/* Set the mbuf elements address and length. */
+		rte_pktmbuf_attach_extbuf(src_mbufs[crypto_index], current_iov,
+					  phys_addr, crypto_len, &g_shinfo);
+		rte_pktmbuf_append(src_mbufs[crypto_index], crypto_len);
 
 		/* Set the IV - we use the LBA of the crypto_op */
 		iv_ptr = rte_crypto_op_ctod_offset(crypto_ops[crypto_index], uint8_t *,
@@ -793,27 +951,24 @@ _crypto_operation(struct spdk_bdev_io *bdev_io, enum rte_crypto_cipher_operation
 
 		/* link the mbuf to the crypto op. */
 		crypto_ops[crypto_index]->sym->m_src = src_mbufs[crypto_index];
-		if (crypto_op == RTE_CRYPTO_CIPHER_OP_ENCRYPT) {
-			crypto_ops[crypto_index]->sym->m_dst = src_mbufs[crypto_index];
-		} else {
-			crypto_ops[crypto_index]->sym->m_dst = NULL;
-		}
 
 		/* For encrypt, point the destination to a buffer we allocate and redirect the bdev_io
 		 * that will be used to process the write on completion to the same buffer. Setting
 		 * up the en_buffer is a little simpler as we know the destination buffer is single IOV.
 		 */
 		if (crypto_op == RTE_CRYPTO_CIPHER_OP_ENCRYPT) {
+			buf_addr = io_ctx->aux_buf_iov.iov_base + en_offset;
+			phys_addr = spdk_vtophys((void *)buf_addr, NULL);
+			if (phys_addr == SPDK_VTOPHYS_ERROR) {
+				rc = -EFAULT;
+				goto error_attach_session;
+			}
+			rte_pktmbuf_attach_extbuf(dst_mbufs[crypto_index], buf_addr,
+						  phys_addr, crypto_len, &g_shinfo);
+			rte_pktmbuf_append(dst_mbufs[crypto_index], crypto_len);
 
-			/* Set the relevant destination en_mbuf elements. */
-			dst_mbufs[crypto_index]->buf_addr = io_ctx->aux_buf_iov.iov_base + en_offset;
-			dst_mbufs[crypto_index]->data_len = updated_length = crypto_len;
-			/* TODO: Make this assignment conditional on QAT usage and add an assert. */
-			dst_mbufs[crypto_index]->buf_iova = spdk_vtophys(dst_mbufs[crypto_index]->buf_addr,
-							    &updated_length);
 			crypto_ops[crypto_index]->sym->m_dst = dst_mbufs[crypto_index];
 			en_offset += crypto_len;
-			dst_mbufs[crypto_index]->next = NULL;
 
 			/* Attach the crypto session to the operation */
 			rc = rte_crypto_op_attach_sym_session(crypto_ops[crypto_index],
@@ -824,6 +979,8 @@ _crypto_operation(struct spdk_bdev_io *bdev_io, enum rte_crypto_cipher_operation
 			}
 
 		} else {
+			crypto_ops[crypto_index]->sym->m_dst = NULL;
+
 			/* Attach the crypto session to the operation */
 			rc = rte_crypto_op_attach_sym_session(crypto_ops[crypto_index],
 							      io_ctx->crypto_bdev->session_decrypt);
@@ -894,7 +1051,6 @@ _crypto_operation(struct spdk_bdev_io *bdev_io, enum rte_crypto_cipher_operation
 				/* If nothing was enqueued, but the last one wasn't because of
 				 * busy, fail it now as the poller won't know anything about it.
 				 */
-				_crypto_operation_complete(bdev_io);
 				rc = -EINVAL;
 				goto error_attach_session;
 			}
@@ -908,16 +1064,14 @@ _crypto_operation(struct spdk_bdev_io *bdev_io, enum rte_crypto_cipher_operation
 error_attach_session:
 error_get_ops:
 	if (crypto_op == RTE_CRYPTO_CIPHER_OP_ENCRYPT) {
-		spdk_mempool_put_bulk(g_mbuf_mp, (void **)&dst_mbufs[0],
-				      cryop_cnt);
+		rte_pktmbuf_free_bulk(dst_mbufs, cryop_cnt);
 	}
 	if (allocated > 0) {
 		rte_mempool_put_bulk(g_crypto_op_mp, (void **)crypto_ops,
 				     allocated);
 	}
 error_get_dst:
-	spdk_mempool_put_bulk(g_mbuf_mp, (void **)&src_mbufs[0],
-			      cryop_cnt);
+	rte_pktmbuf_free_bulk(src_mbufs, cryop_cnt);
 	return rc;
 }
 
@@ -1355,6 +1509,14 @@ _assign_device_qp(struct vbdev_crypto *crypto_bdev, struct device_qp *device_qp,
 				break;
 			}
 		}
+	} else if (strcmp(crypto_bdev->drv_name, OPENSSL) == 0) {
+		TAILQ_FOREACH(device_qp, &g_device_qp_openssl, link) {
+			if (device_qp->in_use == false) {
+				crypto_ch->device_qp = device_qp;
+				device_qp->in_use = true;
+				break;
+			}
+		}
 	}
 	pthread_mutex_unlock(&g_device_qp_lock);
 }
@@ -1494,6 +1656,8 @@ vbdev_crypto_insert_name(const char *bdev_name, const char *vbdev_name,
 		}
 	} else if (strncmp(cipher, AES_CBC, sizeof(AES_CBC)) == 0) {
 		name->cipher = AES_CBC;
+	} else if (strncmp(cipher, AES_CTR, sizeof(AES_CTR)) == 0) {
+		name->cipher = AES_CTR;
 	} else {
 		SPDK_ERRLOG("Invalid cipher: %s\n", cipher);
 		rc = -EINVAL;
@@ -1571,6 +1735,7 @@ vbdev_crypto_finish(void)
 	struct device_qp *dev_qp;
 	unsigned i;
 	int rc;
+	const char *driver_name = g_driver_names[g_bdev_crypto_driver];
 
 	while ((name = TAILQ_FIRST(&g_bdev_names))) {
 		TAILQ_REMOVE(&g_bdev_names, name, link);
@@ -1598,7 +1763,7 @@ vbdev_crypto_finish(void)
 		}
 		free(device);
 	}
-	rc = rte_vdev_uninit(AESNI_MB);
+	rc = rte_vdev_uninit(driver_name);
 	if (rc) {
 		SPDK_ERRLOG("%d from rte_vdev_uninit\n", rc);
 	}
@@ -1613,8 +1778,13 @@ vbdev_crypto_finish(void)
 		free(dev_qp);
 	}
 
+    while ((dev_qp = TAILQ_FIRST(&g_device_qp_openssl))) {
+		TAILQ_REMOVE(&g_device_qp_openssl, dev_qp, link);
+		free(dev_qp);
+	}
+
 	rte_mempool_free(g_crypto_op_mp);
-	spdk_mempool_free(g_mbuf_mp);
+	rte_mempool_free(g_mbuf_mp);
 	rte_mempool_free(g_session_mp);
 	if (g_session_mp_priv != NULL) {
 		rte_mempool_free(g_session_mp_priv);
@@ -1697,8 +1867,7 @@ vbdev_crypto_claim(const char *bdev_name)
 
 	if (g_number_of_claimed_volumes >= MAX_CRYPTO_VOLUMES) {
 		SPDK_DEBUGLOG(vbdev_crypto, "Reached max number of claimed volumes\n");
-		rc = -EINVAL;
-		goto error_vbdev_alloc;
+		return -EINVAL;
 	}
 	g_number_of_claimed_volumes++;
 
@@ -1785,7 +1954,15 @@ vbdev_crypto_claim(const char *bdev_name)
 				assert(name->key2);
 				memcpy(vbdev->xts_key + AES_XTS_KEY_LENGTH, name->key2, AES_XTS_KEY_LENGTH + 1);
 			}
-		} else {
+		} if (strcmp(vbdev->drv_name, OPENSSL) == 0) {
+            if (strcmp(name->cipher, AES_CBC) == 0) {
+				SPDK_NOTICELOG("OPENSSL using cipher: AES_CBC\n");
+			} else {
+				SPDK_NOTICELOG("OPENSSL using cipher: AES_CTR\n");
+				vbdev->cipher = AES_CTR;
+            }
+            vbdev->crypto_bdev.required_alignment = bdev->required_alignment;
+        } else {
 			vbdev->crypto_bdev.required_alignment = bdev->required_alignment;
 		}
 		/* Note: CRYPTO_MAX_IO is in units of bytes, optimal_io_boundary is
@@ -1856,6 +2033,10 @@ vbdev_crypto_claim(const char *bdev_name)
 			vbdev->cipher_xform.cipher.key.data = vbdev->key;
 			vbdev->cipher_xform.cipher.algo = RTE_CRYPTO_CIPHER_AES_CBC;
 			vbdev->cipher_xform.cipher.key.length = AES_CBC_KEY_LENGTH;
+		} else if (strcmp(name->cipher, AES_CTR) == 0) {
+			vbdev->cipher_xform.cipher.key.data = vbdev->key;
+			vbdev->cipher_xform.cipher.algo = RTE_CRYPTO_CIPHER_AES_CTR;
+			vbdev->cipher_xform.cipher.key.length = AES_CTR_KEY_LENGTH;
 		} else {
 			vbdev->cipher_xform.cipher.key.data = vbdev->xts_key;
 			vbdev->cipher_xform.cipher.algo = RTE_CRYPTO_CIPHER_AES_XTS;
@@ -1904,18 +2085,28 @@ error_session_de_create:
 	rte_cryptodev_sym_session_free(vbdev->session_encrypt);
 error_session_en_create:
 error_cant_find_devid:
+	spdk_bdev_module_release_bdev(vbdev->base_bdev);
 error_claim:
-	spdk_bdev_close(vbdev->base_desc);
 	TAILQ_REMOVE(&g_vbdev_crypto, vbdev, link);
 	spdk_io_device_unregister(vbdev, NULL);
-	free(vbdev->xts_key);
+	if (vbdev->xts_key) {
+		memset(vbdev->xts_key, 0, AES_XTS_KEY_LENGTH * 2);
+		free(vbdev->xts_key);
+	}
 error_xts_key:
+	spdk_bdev_close(vbdev->base_desc);
 error_open:
 	free(vbdev->drv_name);
 error_drv_name:
-	free(vbdev->key2);
+	if (vbdev->key2) {
+		memset(vbdev->key2, 0, strlen(vbdev->key2));
+		free(vbdev->key2);
+	}
 error_alloc_key2:
-	free(vbdev->key);
+	if (vbdev->key) {
+		memset(vbdev->key, 0, strlen(vbdev->key));
+		free(vbdev->key);
+	}
 error_alloc_key:
 	free(vbdev->crypto_bdev.name);
 error_bdev_name:

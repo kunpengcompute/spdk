@@ -53,6 +53,8 @@ function usage()
 	echo "                           Disabled while experimental. Only built for x86 when enabled."
 	echo " crypto                    Build vbdev crypto module."
 	echo "                           No path required."
+	echo " crypto_openssl            Build vbdev crypto openssl driver."
+	echo "                           No path required."
 	echo " fio                       Build fio_plugin."
 	echo "                           default: /usr/src/fio"
 	echo " vhost                     Build vhost target. Enabled by default."
@@ -326,6 +328,12 @@ for i in "$@"; do
 			;;
 		--without-crypto)
 			CONFIG[CRYPTO]=n
+			;;
+        --with-crypto_openssl)
+			CONFIG[CRYPTO_OPENSSL]=y
+			;;
+        --without-crypto_openssl)
+			CONFIG[CRYPTO_OPENSSL]=n
 			;;
 		--with-vhost)
 			CONFIG[VHOST]=y
@@ -639,7 +647,7 @@ if [[ "${CONFIG[ISAL]}" = "y" ]] || [[ "${CONFIG[CRYPTO]}" = "y" ]]; then
 		echo "Please install or upgrade them re-run this script."
 		exit 1
 	else
-		if [[ "${CONFIG[CRYPTO]}" = "y" ]]; then
+		if [[ "${CONFIG[CRYPTO]}" = "y" && "$arch" == "x86_64*" ]]; then
 			CONFIG[IPSEC_MB]=y
 		fi
 	fi

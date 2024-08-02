@@ -43,12 +43,22 @@
 
 #define AESNI_MB "crypto_aesni_mb"
 #define QAT "crypto_qat"
+#define OPENSSL "crypto_openssl"
 
 /* Supported ciphers */
-#define AES_CBC "AES_CBC" /* QAT and AESNI_MB */
+#define AES_CBC "AES_CBC" /* QAT, AESNI_MB and OPENSSL*/
 #define AES_XTS "AES_XTS" /* QAT only */
+#define AES_CTR "AES_CTR" /* OPENSSL only */
 
 typedef void (*spdk_delete_crypto_complete)(void *cb_arg, int bdeverrno);
+
+/**
+ * set crypto driver.
+ *
+ * \param driver_name Driver name that need to be initialized.
+ * \return 0 on success, other on failure.
+ */
+int bdev_crypto_set_driver(const char *driver_name);
 
 /**
  * Create new crypto bdev.
@@ -64,6 +74,8 @@ typedef void (*spdk_delete_crypto_complete)(void *cb_arg, int bdeverrno);
 int create_crypto_disk(const char *bdev_name, const char *vbdev_name,
 		       const char *crypto_pmd, const char *key,
 		       const char *cipher, const char *key2);
+
+int vbdev_cryptodev_set_engine(const char *engine_name);
 
 /**
  * Delete crypto bdev.

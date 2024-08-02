@@ -93,14 +93,26 @@ rpc_bdev_crypto_create(struct spdk_jsonrpc_request *request,
 		}
 	}
 
-	if (strcmp(req.cipher, AES_XTS) != 0 && strcmp(req.cipher, AES_CBC) != 0) {
+	if (strcmp(req.cipher, AES_XTS) != 0 && strcmp(req.cipher, AES_CBC) != 0 && strcmp(req.cipher, AES_CTR) != 0) {
 		spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						     "Invalid cipher: %s",
 						     req.cipher);
 		goto cleanup;
 	}
 
-	if (strcmp(req.crypto_pmd, AESNI_MB) == 0 && strcmp(req.cipher, AES_XTS) == 0) {
+	if (strcmp(req.crypto_pmd, AESNI_MB) == 0 && (strcmp(req.cipher, AES_XTS) == 0 || strcmp(req.cipher, AES_CTR) == 0)) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "Invalid cipher. AES_XTS is only available on QAT. AES_CTR is only available on OPENSSL.");
+		goto cleanup;
+	}
+
+    if (strcmp(req.crypto_pmd, QAT) == 0 && strcmp(req.cipher, AES_CTR) == 0) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "Invalid cipher. AES_CTR is only available on OPENSSL.");
+		goto cleanup;
+	}
+
+    if (strcmp(req.crypto_pmd, OPENSSL) == 0 && strcmp(req.cipher, AES_XTS) == 0) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 "Invalid cipher. AES_XTS is only available on QAT.");
 		goto cleanup;
@@ -112,7 +124,7 @@ rpc_bdev_crypto_create(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
-	if (strcmp(req.cipher, AES_CBC) == 0 && req.key2 != NULL) {
+	if ((strcmp(req.cipher, AES_CBC) == 0 || strcmp(req.cipher, AES_CTR) == 0) && req.key2 != NULL) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 "Invalid key. A 2nd key is needed only for AES_XTS.");
 		goto cleanup;
@@ -136,6 +148,40 @@ cleanup:
 }
 SPDK_RPC_REGISTER("bdev_crypto_create", rpc_bdev_crypto_create, SPDK_RPC_RUNTIME)
 SPDK_RPC_REGISTER_ALIAS_DEPRECATED(bdev_crypto_create, construct_crypto_bdev)
+
+
+struct rpc_set_engine {
+    char *engine_name;
+};
+
+static const struct spdk_json_object_decoder rpc_set_engine_decoders[] = {
+    {"engine_name", offsetof(struct rpc_set_engine, engine_name), spdk_json_decode_string},
+};
+
+static void
+rpc_bdev_cryptodev_set_engine(struct spdk_jsonrpc_request *request,
+			      const struct spdk_json_val *params)
+{
+	struct rpc_set_engine req = {};
+	int rc;
+
+	if (spdk_json_decode_object(params, rpc_set_engine_decoders,
+				    SPDK_COUNTOF(rpc_set_engine_decoders), &req)) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_PARSE_ERROR,
+						 "spdk_json_decode_object failed");
+		return;
+	}
+
+	rc = vbdev_cryptodev_set_engine(req.engine_name);
+	free(req.engine_name);
+	if (rc) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "incorrect engine name");
+	} else {
+		spdk_jsonrpc_send_bool_response(request, true);
+	}
+}
+SPDK_RPC_REGISTER("bdev_cryptodev_set_engine", rpc_bdev_cryptodev_set_engine, SPDK_RPC_RUNTIME)
 
 struct rpc_delete_crypto {
 	char *name;
@@ -190,4 +236,37 @@ cleanup:
 	free_rpc_delete_crypto(&req);
 }
 SPDK_RPC_REGISTER("bdev_crypto_delete", rpc_bdev_crypto_delete, SPDK_RPC_RUNTIME)
+
+struct rpc_set_driver {
+	char *driver_name;
+};
+
+static const struct spdk_json_object_decoder rpc_set_driver_decoders[] = {
+	{"driver_name", offsetof(struct rpc_set_driver, driver_name), spdk_json_decode_string},
+};
+
+static void
+rpc_bdev_crypto_set_driver(struct spdk_jsonrpc_request *request,
+			      const struct spdk_json_val *params)
+{
+	struct rpc_set_driver req = {};
+	int rc;
+
+	if (spdk_json_decode_object(params, rpc_set_driver_decoders,
+				    SPDK_COUNTOF(rpc_set_driver_decoders), &req)) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_PARSE_ERROR,
+						 "spdk_json_decode_object failed");
+		return;
+	}
+
+	rc = bdev_crypto_set_driver(req.driver_name);
+	free(req.driver_name);
+	if (rc) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "incorrect driver name");
+	} else {
+		spdk_jsonrpc_send_bool_response(request, true);
+	}
+}
+SPDK_RPC_REGISTER("bdev_crypto_set_driver", rpc_bdev_crypto_set_driver, SPDK_RPC_STARTUP)
 SPDK_RPC_REGISTER_ALIAS_DEPRECATED(bdev_crypto_delete, delete_crypto_bdev)

@@ -64,6 +64,17 @@ def bdev_compress_create(client, base_bdev_name, pm_path, lb_size):
     return client.call('bdev_compress_create', params)
 
 
+def bdev_cryptodev_set_engine(client, engine_name):
+    """Set the BDEV cryptodev engine.
+
+    Args:
+        engine_name: The engine, can be set crypto_engine_kae
+    """
+    params = {'engine_name': engine_name}
+
+    return client.call('bdev_cryptodev_set_engine', params)
+
+
 @deprecated_alias('delete_compress_bdev')
 def bdev_compress_delete(client, name):
     """Delete compress virtual block device.
@@ -101,6 +112,16 @@ def bdev_compress_get_orphans(client, name=None):
     if name:
         params['name'] = name
     return client.call('bdev_compress_get_orphans', params)
+
+def bdev_crypto_set_driver(client, driver_name):
+    """Set driver options for the bdev crypto.
+
+    Args:
+        driver: crypto_qat, crypto_aesni_mb or crypto_openssl
+    """
+    params = {'driver_name': driver_name}
+
+    return client.call('bdev_crypto_set_driver', params)
 
 
 @deprecated_alias('construct_crypto_bdev')

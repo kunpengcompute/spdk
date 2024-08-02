@@ -66,11 +66,21 @@ DPDK_FRAMEWORK=n
 ifeq ($(CONFIG_CRYPTO),y)
 DPDK_FRAMEWORK=y
 DPDK_LIB_LIST += rte_reorder
+ifeq ($(CONFIG_IPSEC_MB),y)
 ifneq (, $(wildcard $(DPDK_ABS_DIR)/lib/librte_crypto_aesni_mb.*))
 DPDK_LIB_LIST += rte_crypto_aesni_mb
 else
 # PMD name for DPDK 20.08 and earlier
 DPDK_LIB_LIST += rte_pmd_aesni_mb
+endif
+endif
+ifeq ($(CONFIG_CRYPTO_OPENSSL),y)
+ifneq (, $(wildcard $(DPDK_ABS_DIR)/lib/librte_crypto_openssl.*))
+DPDK_LIB_LIST += rte_crypto_openssl
+else
+# PMD name for DPDK 20.08 and earlier
+DPDK_LIB_LIST += rte_pmd_openssl
+endif
 endif
 endif
 
