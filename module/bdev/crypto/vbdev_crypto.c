@@ -149,6 +149,9 @@ uint8_t g_number_of_claimed_volumes = 0;
 /* Specific to AES_CBC. */
 #define AES_CBC_IV_LENGTH	16
 #define AES_CBC_KEY_LENGTH	16
+/* Specific to AES_CTR. */
+#define AES_CTR_IV_LENGTH	16
+#define AES_CTR_KEY_LENGTH	16
 #define AES_XTS_KEY_LENGTH	16	/* XTS uses 2 keys, each of this size. */
 #define DRIVER_NUM_QP		64
 /* Common for suported devices. */
@@ -173,7 +176,7 @@ struct bdev_names {
 	 */
 	uint8_t			*key;		/* key per bdev */
 	char			*drv_name;	/* name of the crypto device driver */
-	char			*cipher;	/* AES_CBC or AES_XTS */
+	char			*cipher;	/* AES_CBC , AES_CTR or AES_XTS */
 	uint8_t			*key2;		/* key #2 for AES_XTS, per bdev */
 	TAILQ_ENTRY(bdev_names)	link;
 };
@@ -1605,6 +1608,8 @@ vbdev_crypto_insert_name(const char *bdev_name, const char *vbdev_name,
 		}
 	} else if (strncmp(cipher, AES_CBC, sizeof(AES_CBC)) == 0) {
 		name->cipher = AES_CBC;
+	} else if (strncmp(cipher, AES_CTR, sizeof(AES_CTR)) == 0) {
+		name->cipher = AES_CTR;
 	} else {
 		SPDK_ERRLOG("Invalid cipher: %s\n", cipher);
 		rc = -EINVAL;
@@ -1901,7 +1906,15 @@ vbdev_crypto_claim(const char *bdev_name)
 				assert(name->key2);
 				memcpy(vbdev->xts_key + AES_XTS_KEY_LENGTH, name->key2, AES_XTS_KEY_LENGTH + 1);
 			}
-		} else {
+		} if (strcmp(vbdev->drv_name, OPENSSL) == 0) {
+            if (strcmp(name->cipher, AES_CBC) == 0) {
+				SPDK_NOTICELOG("OPENSSL using cipher: AES_CBC\n");
+			} else {
+				SPDK_NOTICELOG("OPENSSL using cipher: AES_CTR\n");
+				vbdev->cipher = AES_CTR;
+            }
+            vbdev->crypto_bdev.required_alignment = bdev->required_alignment;
+        } else {
 			vbdev->crypto_bdev.required_alignment = bdev->required_alignment;
 		}
 		/* Note: CRYPTO_MAX_IO is in units of bytes, optimal_io_boundary is
@@ -1972,6 +1985,10 @@ vbdev_crypto_claim(const char *bdev_name)
 			vbdev->cipher_xform.cipher.key.data = vbdev->key;
 			vbdev->cipher_xform.cipher.algo = RTE_CRYPTO_CIPHER_AES_CBC;
 			vbdev->cipher_xform.cipher.key.length = AES_CBC_KEY_LENGTH;
+		} else if (strcmp(name->cipher, AES_CTR) == 0) {
+			vbdev->cipher_xform.cipher.key.data = vbdev->key;
+			vbdev->cipher_xform.cipher.algo = RTE_CRYPTO_CIPHER_AES_CTR;
+			vbdev->cipher_xform.cipher.key.length = AES_CTR_KEY_LENGTH;
 		} else {
 			vbdev->cipher_xform.cipher.key.data = vbdev->xts_key;
 			vbdev->cipher_xform.cipher.algo = RTE_CRYPTO_CIPHER_AES_XTS;
