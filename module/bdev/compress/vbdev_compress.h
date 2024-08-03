@@ -35,6 +35,7 @@
 #define SPDK_VBDEV_COMPRESS_H
 
 #include "spdk/stdinc.h"
+#include "rte_comp.h"
 
 #include "spdk/bdev.h"
 
@@ -76,10 +77,12 @@ enum compress_pmd {
 	COMPRESS_PMD_AUTO = 0,
 	COMPRESS_PMD_QAT_ONLY,
 	COMPRESS_PMD_ISAL_ONLY,
+	COMPRESS_PMD_ZLIB_ONLY,
 	COMPRESS_PMD_MAX
 };
 
 int compress_set_pmd(enum compress_pmd *opts);
+int accel_compressdev_set_window_size_and_algo(int32_t wbits, uint8_t algo);
 
 typedef void (*spdk_delete_compress_complete)(void *cb_arg, int bdeverrno);
 

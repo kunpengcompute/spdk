@@ -92,6 +92,7 @@ else
 # PMD name for DPDK 20.08 and earlier
 DPDK_LIB_LIST += rte_pmd_isal
 endif
+DPDK_LIB_LIST += rte_compress_zlib
 endif
 
 ifeq ($(DPDK_FRAMEWORK),y)
@@ -144,7 +145,7 @@ DPDK_PRIVATE_LINKER_ARGS += -lIPSec_MB -L$(IPSEC_MB_DIR)
 endif
 
 ifeq ($(CONFIG_REDUCE),y)
-DPDK_PRIVATE_LINKER_ARGS += -lisal -L$(ISAL_DIR)/.libs
+DPDK_PRIVATE_LINKER_ARGS += -lisal -L$(ISAL_DIR)/.libs -lz
 endif
 
 ifneq (,$(wildcard $(DPDK_INC_DIR)/rte_config.h))

@@ -41,12 +41,16 @@
 
 static struct spdk_reduce_vol *g_vol;
 static int g_reduce_errno;
+static char *g_backing_dev_buf;
+
+#ifndef ZLIB_MEM_SIMU_PMEM
 static char *g_volatile_pm_buf;
 static size_t g_volatile_pm_buf_len;
 static char *g_persistent_pm_buf;
 static size_t g_persistent_pm_buf_len;
-static char *g_backing_dev_buf;
 static char g_path[REDUCE_PATH_MAX];
+#endif
+
 static char *g_decomp_buf;
 
 #define TEST_MD_PATH "/tmp"
@@ -73,6 +77,7 @@ static TAILQ_HEAD(, ut_reduce_bdev_io) g_pending_bdev_io =
 	TAILQ_HEAD_INITIALIZER(g_pending_bdev_io);
 static uint32_t g_pending_bdev_io_count = 0;
 
+#ifndef ZLIB_MEM_SIMU_PMEM
 static void
 sync_pm_buf(const void *addr, size_t length)
 {
@@ -93,6 +98,7 @@ pmem_persist(const void *addr, size_t len)
 {
 	sync_pm_buf(addr, len);
 }
+#endif
 
 static void
 get_pm_file_size(void)
@@ -132,6 +138,7 @@ get_vol_size(void)
 	CU_ASSERT(_get_vol_size(chunk_size, backing_dev_size) < backing_dev_size);
 }
 
+#ifndef ZLIB_MEM_SIMU_PMEM
 void *
 pmem_map_file(const char *path, size_t len, int flags, mode_t mode,
 	      size_t *mapped_lenp, int *is_pmemp)
@@ -166,6 +173,7 @@ pmem_unmap(void *addr, size_t len)
 
 	return 0;
 }
+#endif
 
 static void
 persistent_pm_buf_destroy(void)

@@ -99,6 +99,17 @@ def bdev_compress_set_pmd(client, pmd):
     return client.call('bdev_compress_set_pmd', params)
 
 
+def compressdev_zlib_module_set_wbits(client, wbits):
+    """set deflate algo window size (offload to kae).
+
+    Args:
+        wbits: 8~15 zlib, 25~31 gzip
+    """
+    params = {'wbits': wbits}
+
+    return client.call('compressdev_zlib_module_set_wbits', params)
+
+
 def bdev_compress_get_orphans(client, name=None):
     """Get a list of comp bdevs that do not have a pmem file (aka orphaned).
 

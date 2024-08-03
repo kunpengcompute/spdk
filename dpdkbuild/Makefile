@@ -67,7 +67,7 @@ endif
 endif
 
 ifeq ($(CONFIG_REDUCE),y)
-DPDK_DRIVERS += compress compress/isal
+DPDK_DRIVERS += compress compress/isal compress/zlib
 DPDK_CFLAGS += -I$(ISAL_DIR)
 DPDK_LDFLAGS += -L$(ISAL_DIR)/.libs -lisal
 endif
