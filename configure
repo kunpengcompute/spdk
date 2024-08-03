@@ -514,9 +514,11 @@ if [[ "${CONFIG[ISAL]}" = "y" ]]; then
 	fi
 fi
 
-if [[ "${CONFIG[ISAL]}" = "n" ]] && [[ "${CONFIG[REDUCE]}" = "y" ]]; then
-		echo "ERROR Conflicting options: --with-reduce is not compatible with --without-isal."
-		exit 1
+if [[ $arch == x86_64* ]]; then
+	if [[ "${CONFIG[ISAL]}" = "n" ]] && [[ "${CONFIG[REDUCE]}" = "y" ]]; then
+			echo "ERROR Conflicting options: --with-reduce is not compatible with --without-isal."
+			exit 1
+	fi
 fi
 
 if [ -z "${CONFIG[ENV]}" ]; then
