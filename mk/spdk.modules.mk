@@ -56,7 +56,9 @@ endif
 
 ifeq ($(CONFIG_REDUCE),y)
 BLOCKDEV_MODULES_LIST += bdev_compress reduce
+ifeq ($(CONFIG_ZLIB_MEM_SIMU_PMEM),n)
 BLOCKDEV_MODULES_PRIVATE_LIBS += -lpmem
+endif
 endif
 
 ifeq ($(CONFIG_RDMA),y)

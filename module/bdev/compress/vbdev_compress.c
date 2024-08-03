@@ -74,7 +74,7 @@ static int g_mbuf_offset;
 
 #define ISAL_PMD "compress_isal"
 #define QAT_PMD "compress_qat"
-#define ZLIB_PMD                "compress_zlib"
+#define ZLIB_PMD "compress_zlib"
 #define NUM_MBUFS		8192
 #define POOL_CACHE_SIZE		256
 
@@ -175,10 +175,10 @@ static bool g_isal_available = false;
 static bool g_zlib_available = false;
 
 static const char *g_driver_names[] = {
-       [COMPRESS_PMD_AUTO]     = "",
-       [COMPRESS_PMD_QAT_ONLY] = QAT_PMD,
-       [COMPRESS_PMD_ISAL_ONLY]  = ISAL_PMD,
-       [COMPRESS_PMD_ZLIB_ONLY]  = ZLIB_PMD
+    [COMPRESS_PMD_AUTO]       = "",
+    [COMPRESS_PMD_QAT_ONLY]   = QAT_PMD,
+    [COMPRESS_PMD_ISAL_ONLY]  = ISAL_PMD,
+    [COMPRESS_PMD_ZLIB_ONLY]  = ZLIB_PMD
 };
 
 /* Create shared (between all ops per PMD) compress xforms. */
@@ -335,9 +335,9 @@ create_compress_dev(uint8_t index)
 	if (strcmp(device->cdev_info.driver_name, ISAL_PMD) == 0) {
 		g_isal_available = true;
 	}
-       if (strcmp(device->cdev_info.driver_name, ZLIB_PMD) == 0) {
-               g_zlib_available = true;
-       }
+    if (strcmp(device->cdev_info.driver_name, ZLIB_PMD) == 0) {
+        g_zlib_available = true;
+    }
 
 
 	return 0;
@@ -363,7 +363,13 @@ vbdev_init_compress_drivers(void)
     if (g_opts == COMPRESS_PMD_ZLIB_ONLY) {
         const char *driver_name = g_driver_names[g_opts];
         char zlib_args[64];
-        snprintf(zlib_args, sizeof(zlib_args), "%s=%s,%s=%d", RTE_COMPRESSDEV_PMD_NAME_ARG, driver_name, RTE_COMPRESSDEV_PMD_SOCKET_ID_ARG, rte_socket_id());
+
+        int ret = snprintf(zlib_args, sizeof(zlib_args), "%s=%s,%s=%d", RTE_COMPRESSDEV_PMD_NAME_ARG, 
+            driver_name, RTE_COMPRESSDEV_PMD_SOCKET_ID_ARG, rte_socket_id());
+        if ((ret < 0) || (ret > (int)sizeof(zlib_args))) {
+            SPDK_ERRLOG("zlib_args size is smaller than the generated str\n");
+            return -EINVAL;
+        }
         rc = rte_vdev_init(driver_name, zlib_args);
     } else {
         rc = rte_vdev_init(ISAL_PMD, NULL);
@@ -1388,8 +1394,8 @@ _set_pmd(struct vbdev_compress *comp_dev)
 		comp_dev->drv_name = QAT_PMD;
 	} else if (g_opts == COMPRESS_PMD_ISAL_ONLY && g_isal_available) {
 		comp_dev->drv_name = ISAL_PMD;
-        } else if (g_opts == COMPRESS_PMD_ZLIB_ONLY && g_zlib_available) {
-                comp_dev->drv_name = ZLIB_PMD;
+    } else if (g_opts == COMPRESS_PMD_ZLIB_ONLY && g_zlib_available) {
+        comp_dev->drv_name = ZLIB_PMD;
 	} else {
 		SPDK_ERRLOG("Requested PMD is not available.\n");
 		return false;
@@ -1902,7 +1908,7 @@ compress_set_pmd(enum compress_pmd *opts)
 }
 
 int
-accel_compressdev_set_window_size(int32_t wbits, uint8_t algo)
+accel_compressdev_set_window_size_and_algo(int32_t wbits, uint8_t algo)
 {
     if (algo == RTE_COMP_ALGO_DEFLATE) {
         wbits = -wbits;

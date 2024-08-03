@@ -40,7 +40,7 @@
 #include "spdk/util.h"
 #include "spdk/log.h"
 
-#ifndef ZLIB_PMDK_TEST
+#ifndef ZLIB_MEM_SIMU_PMEM
 #include "libpmem.h"
 #endif
 
@@ -170,7 +170,7 @@ static void _start_writev_request(struct spdk_reduce_vol_request *req);
 static uint8_t *g_zero_buf;
 static int g_vol_count = 0;
 
-#ifdef ZLIB_PMDK_TEST
+#ifdef ZLIB_MEM_SIMU_PMEM
 
 static char *g_volatile_pm_buf;
 static size_t g_volatile_pm_buf_len;
@@ -181,22 +181,21 @@ static char g_path[REDUCE_PATH_MAX];
 static void
 sync_pm_buf(const void *addr, size_t length)
 {
-       uint64_t offset = (char *)addr - g_volatile_pm_buf;
-
-       memcpy(&g_persistent_pm_buf[offset], addr, length);
+    uint64_t offset = (char *)addr - g_volatile_pm_buf;
+    memcpy(&g_persistent_pm_buf[offset], addr, length);
 }
 
 static void
 pmem_persist(const void *addr, size_t len)
 {
-       sync_pm_buf(addr, len);
+    sync_pm_buf(addr, len);
 }
 
 static int
 pmem_msync(const void *addr, size_t length)
 {
-       sync_pm_buf(addr, length);
-       return 0;
+    sync_pm_buf(addr, length);
+    return 0;
 }
 
 #endif
@@ -413,16 +412,19 @@ _allocate_vol_requests(struct spdk_reduce_vol *vol)
 	return 0;
 }
 
-#ifdef ZLIB_PMDK_TEST
+#ifdef ZLIB_MEM_SIMU_PMEM
 
 static int
 pmem_unmap(void *addr, size_t len)
 {
-       free(g_volatile_pm_buf);
-       g_volatile_pm_buf = NULL;
-       g_volatile_pm_buf_len = 0;
+    free(addr);
+    g_volatile_pm_buf = NULL;
+    g_volatile_pm_buf_len = 0;
+    free(g_persistent_pm_buf);
+    g_persistent_pm_buf = NULL;
+    g_persistent_pm_buf_len = 0;
 
-       return 0;
+    return 0;
 }
 
 #endif
@@ -537,37 +539,37 @@ _allocate_bit_arrays(struct spdk_reduce_vol *vol)
 	return 0;
 }
 
-#ifdef ZLIB_PMDK_TEST
+#ifdef ZLIB_MEM_SIMU_PMEM
 
 static void *
 pmem_map_file(const char *path, size_t len, int flags, mode_t mode,
              size_t *mapped_lenp, int *is_pmemp)
 {
-       printf("get in specific map file, len: %ld \n", len);
+    int ret = snprintf(g_path, sizeof(g_path), "%s", path);\
+    if ((ret < 0) || (ret > (int)sizeof(g_path))) {
+        SPDK_ERRLOG("snprintf path to g_path failed\n");
+        return NULL;
+    }
+    *is_pmemp = 1;
 
-       snprintf(g_path, sizeof(g_path), "%s", path);
-       *is_pmemp = 1;
+    if (g_persistent_pm_buf == NULL) {
+        g_persistent_pm_buf = calloc(1, len);
+        g_persistent_pm_buf_len = len;
+        if (g_persistent_pm_buf == NULL) {
+            SPDK_ERRLOG("calloc g_persistent_pm_buf failed\n");
+            return NULL;
+        }
+    }
+    *mapped_lenp = g_persistent_pm_buf_len;
+    g_volatile_pm_buf = calloc(1, g_persistent_pm_buf_len);
+    if (g_volatile_pm_buf == NULL) {
+        SPDK_ERRLOG("calloc g_volatile_pm_buf failed\n");
+        return NULL;
+    }
+    memcpy(g_volatile_pm_buf, g_persistent_pm_buf, g_persistent_pm_buf_len);
+    g_volatile_pm_buf_len = g_persistent_pm_buf_len;
 
-       if (g_persistent_pm_buf == NULL) {
-               g_persistent_pm_buf = calloc(1, len);
-               g_persistent_pm_buf_len = len;
-               if(g_persistent_pm_buf == NULL) {
-                  printf("calloc g_persistent_pm_buf failed \n");
-               } else {
-                  printf("g_persistent_pm_buf: %p \n", g_persistent_pm_buf);
-               }
-       }
-       *mapped_lenp = g_persistent_pm_buf_len;
-       g_volatile_pm_buf = calloc(1, g_persistent_pm_buf_len);
-       if(g_volatile_pm_buf == NULL) {
-            printf("calloc g_volatile_pm_buf failed \n");
-       }else {
-            printf("g_volatile_pm_buf: %p \n", g_volatile_pm_buf);
-       }
-       memcpy(g_volatile_pm_buf, g_persistent_pm_buf, g_persistent_pm_buf_len);
-       g_volatile_pm_buf_len = g_persistent_pm_buf_len;
-
-       return g_volatile_pm_buf;
+    return g_volatile_pm_buf;
 }
 
 #endif
@@ -665,14 +667,15 @@ spdk_reduce_vol_init(struct spdk_reduce_vol_params *params,
 	spdk_uuid_fmt_lower(&vol->pm_file.path[dir_len + 1], SPDK_UUID_STRING_LEN,
 			    &params->uuid);
 	vol->pm_file.size = _get_pm_file_size(params);
-	vol->pm_file.pm_buf = pmem_map_file(vol->pm_file.path, vol->pm_file.size,
-#ifdef ZLIB_PMDK_TEST
-					    0,
+
+#ifdef ZLIB_MEM_SIMU_PMEM
+    vol->pm_file.pm_buf = pmem_map_file(vol->pm_file.path, vol->pm_file.size,
+        0, 0600, &mapped_len, &vol->pm_file.pm_is_pmem);
 #else
-					    PMEM_FILE_CREATE | PMEM_FILE_EXCL,
-#endif 
-						0600,
-					    &mapped_len, &vol->pm_file.pm_is_pmem);
+    vol->pm_file.pm_buf = pmem_map_file(vol->pm_file.path, vol->pm_file.size,
+        PMEM_FILE_CREATE | PMEM_FILE_EXCL, 0600, &mapped_len, &vol->pm_file.pm_is_pmem);
+#endif
+
 	if (vol->pm_file.pm_buf == NULL) {
 		SPDK_ERRLOG("could not pmem_map_file(%s): %s\n",
 			    vol->pm_file.path, strerror(errno));
