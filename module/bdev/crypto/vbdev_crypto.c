@@ -266,7 +266,7 @@ struct crypto_bdev_io {
 };
 
 static enum bdev_crypto_driver_type g_bdev_crypto_driver =
-	BDEV_CRYPTO_DRIVER_AESNI_MB;
+	BDEV_CRYPTO_DRIVER_OPENSSL;
 
 int
 bdev_crypto_set_driver(const char *driver_name)
