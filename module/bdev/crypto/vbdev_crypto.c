@@ -436,7 +436,7 @@ vbdev_cryptodev_set_engine(const char *engine_name)
         ENGINE *engine = ENGINE_by_id("kae");
         if (engine == NULL) {
 		   SPDK_ERRLOG("engine is NULL!\n");
-           return -EINVAL;
+           return -EAGAIN;
         }
         ENGINE_init(engine);
         // set engine
@@ -444,7 +444,7 @@ vbdev_cryptodev_set_engine(const char *engine_name)
 		   SPDK_NOTICELOG("engine set success!\n");
         } else {
 		   SPDK_ERRLOG("engine set fail!\n");
-		   return -EINVAL;
+		   return -EPERM;
         }
     }
 	SPDK_NOTICELOG("Using engine %s\n", engine_name);
