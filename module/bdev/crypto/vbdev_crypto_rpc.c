@@ -175,8 +175,16 @@ rpc_bdev_cryptodev_set_engine(struct spdk_jsonrpc_request *request,
 	rc = vbdev_cryptodev_set_engine(req.engine_name);
 	free(req.engine_name);
 	if (rc) {
-		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+		 if(rc == -EPERM){
+            spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "failed to set up the acceleration engine for the encryption algorithm");
+        } else if(rc == -EAGAIN){
+            spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "the engine is empty,which may be indicate an incorrect installation of kae");
+        } else{
+            spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 "incorrect engine name");
+        }
 	} else {
 		spdk_jsonrpc_send_bool_response(request, true);
 	}
