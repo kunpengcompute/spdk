@@ -275,11 +275,17 @@ DEFINE_STUB(rte_cryptodev_start, int, (uint8_t dev_id), 0);
 DEFINE_STUB_V(rte_cryptodev_stop, (uint8_t dev_id));
 DEFINE_STUB(rte_cryptodev_sym_session_create, struct rte_cryptodev_sym_session *,
 	    (struct rte_mempool *mempool), (struct rte_cryptodev_sym_session *)1);
+DEFINE_STUB(rte_cryptodev_asym_session_create, struct rte_cryptodev_asym_session *,
+		(struct rte_mempool *mempool), (struct rte_cryptodev_asym_session *)1);
 DEFINE_STUB(rte_cryptodev_sym_session_init, int, (uint8_t dev_id,
 		struct rte_cryptodev_sym_session *sess,
 		struct rte_crypto_sym_xform *xforms, struct rte_mempool *mempool), 0);
+DEFINE_STUB(rte_cryptodev_asym_session_init, int, (uint8_t dev_id,
+		struct rte_cryptodev_asym_session *sess,
+		struct rte_crypto_asym_xform *xforms, struct rte_mempool *mempool), 0);
 DEFINE_STUB(rte_vdev_init, int, (const char *name, const char *args), 0);
 DEFINE_STUB(rte_cryptodev_sym_session_free, int, (struct rte_cryptodev_sym_session *sess), 0);
+DEFINE_STUB(rte_cryptodev_asym_session_free, int, (struct rte_cryptodev_asym_session *sess), 0);
 DEFINE_STUB(rte_vdev_uninit, int, (const char *name), 0);
 
 struct rte_cryptodev *rte_cryptodevs;

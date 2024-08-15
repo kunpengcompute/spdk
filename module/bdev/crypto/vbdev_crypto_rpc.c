@@ -93,6 +93,7 @@ rpc_bdev_crypto_create(struct spdk_jsonrpc_request *request,
 		}
 	}
 
+if (strcmp(req.cipher, CRYPTO_RSA) != 0) {
 	if (strcmp(req.cipher, AES_XTS) != 0 && strcmp(req.cipher, AES_CBC) != 0 && strcmp(req.cipher, AES_CTR) != 0) {
 		spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						     "Invalid cipher: %s",
@@ -129,7 +130,28 @@ rpc_bdev_crypto_create(struct spdk_jsonrpc_request *request,
 						 "Invalid key. A 2nd key is needed only for AES_XTS.");
 		goto cleanup;
 	}
+} else {
+    if (strcmp(req.crypto_pmd, OPENSSL) != 0) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "Invalid cipher. RSA is only available on OPENSSL.");
+		goto cleanup;
+	}
 
+    if (req.key2 == NULL) {
+		req.key2 = strdup(RSA_CRT);
+        if (req.key2 == NULL) {
+			spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+							 "Unable to allocate memory for req.key2");
+			goto cleanup;
+		}
+	}
+
+    if (strcmp(req.key2, RSA_CRT) != 0 && strcmp(req.key2, RSA_NED) != 0) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "Invalid key2. RSA key2 only available on CRT or NED.");
+		goto cleanup;
+    }
+}
 	rc = create_crypto_disk(req.base_bdev_name, req.name,
 				req.crypto_pmd, req.key, req.cipher, req.key2);
 	if (rc) {
