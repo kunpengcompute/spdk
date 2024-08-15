@@ -189,7 +189,7 @@ rpc_bdev_cryptodev_set_engine(struct spdk_jsonrpc_request *request,
 		spdk_jsonrpc_send_bool_response(request, true);
 	}
 }
-SPDK_RPC_REGISTER("bdev_cryptodev_set_engine", rpc_bdev_cryptodev_set_engine, SPDK_RPC_RUNTIME)
+SPDK_RPC_REGISTER("bdev_cryptodev_set_engine", rpc_bdev_cryptodev_set_engine, SPDK_RPC_STARTUP)
 
 struct rpc_delete_crypto {
 	char *name;
