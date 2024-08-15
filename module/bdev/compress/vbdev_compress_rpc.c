@@ -197,6 +197,27 @@ rpc_compressdev_zlib_module_set_wbits(struct spdk_jsonrpc_request *request,
     spdk_jsonrpc_send_bool_response(request, true);
 }
 
+static void
+rpc_compressdev_zlib_module_get_wbits(struct spdk_jsonrpc_request *request,
+    const struct spdk_json_val *params)
+{
+    struct spdk_json_write_ctx *w;
+
+    if (params != NULL) {
+        spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+                            "zlib_module_get_wbits method requires no parameters");
+        return;
+    }
+
+    w = spdk_jsonrpc_begin_result(request);
+    spdk_json_write_object_begin(w);
+
+    spdk_json_write_named_int32(w, "wbits", rpc_zlib_module_get_wbits());
+
+    spdk_json_write_object_end(w);
+    spdk_jsonrpc_end_result(request, w);
+
+}
 
 SPDK_RPC_REGISTER("bdev_compress_set_pmd", rpc_bdev_compress_set_pmd,
 		  SPDK_RPC_STARTUP | SPDK_RPC_RUNTIME)
@@ -204,6 +225,7 @@ SPDK_RPC_REGISTER_ALIAS_DEPRECATED(bdev_compress_set_pmd, set_compress_pmd)
 SPDK_RPC_REGISTER_ALIAS_DEPRECATED(bdev_compress_set_pmd, compress_set_pmd)
 
 SPDK_RPC_REGISTER("compressdev_zlib_module_set_wbits", rpc_compressdev_zlib_module_set_wbits, SPDK_RPC_STARTUP)
+SPDK_RPC_REGISTER("compressdev_zlib_module_get_wbits", rpc_compressdev_zlib_module_get_wbits, SPDK_RPC_STARTUP | SPDK_RPC_RUNTIME)
 
 /* Structure to hold the parameters for this RPC method. */
 struct rpc_construct_compress {
