@@ -157,6 +157,9 @@ CONFIG_CUSTOMOCF=n
 # Build ISA-L library
 CONFIG_ISAL=y
 
+# Build KSAL library
+CONFIG_KSAL=y
+
 # Build with IO_URING support
 CONFIG_URING=n
 

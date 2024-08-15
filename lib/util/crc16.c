@@ -54,6 +54,22 @@ spdk_crc16_t10dif_copy(uint16_t init_crc, uint8_t *dst, uint8_t *src,
 	return (crc16_t10dif_copy(init_crc, dst, src, len));
 }
 
+#elif defined(SPDK_CONFIG_KSAL)
+#include <ksal/ksal_crc.h>
+
+uint16_t spdk_crc16_t10dif(uint16_t init_crc, const void *buf, size_t len)
+{
+    return KsalCrc16T10Dif(init_crc, buf, len);
+}
+
+uint16_t
+spdk_crc16_t10dif_copy(uint16_t init_crc, uint8_t *buf, uint8_t *src,
+                     size_t len)
+{
+    memcpy(buf, src, len);
+	return (spdk_crc16_t10dif(init_crc, src, len));
+}
+
 #else
 /*
  * Use table-driven (somewhat faster) CRC

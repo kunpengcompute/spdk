@@ -409,6 +409,12 @@ for i in "$@"; do
 		--without-isal)
 			CONFIG[ISAL]=n
 			;;
+        --with-ksal)
+			CONFIG[KSAL]=y
+			;;
+		--without-ksal)
+			CONFIG[KSAL]=n
+			;;
 		--with-uring=*)
 			CONFIG[URING]=y
 			CONFIG[URING_PATH]=$(readlink -f ${i#*=})
