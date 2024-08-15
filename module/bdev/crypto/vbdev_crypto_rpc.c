@@ -127,7 +127,7 @@ if (strcmp(req.cipher, CRYPTO_RSA) != 0) {
 
 	if ((strcmp(req.cipher, AES_CBC) == 0 || strcmp(req.cipher, AES_CTR) == 0 || strcmp(req.cipher, CRYPTO_SM4) == 0) && req.key2 != NULL) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
-						 "Invalid key. A 2nd key is needed only for AES_XTS.");
+						 "Invalid key. A 2nd key is needed only for AES_XTS and RSA.");
 		goto cleanup;
 	}
 } else {

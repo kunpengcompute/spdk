@@ -284,8 +284,8 @@ if __name__ == "__main__":
     p.add_argument('name', help="Name of the crypto vbdev")
     p.add_argument('crypto_pmd', help="Name of the crypto device driver")
     p.add_argument('key', help="Key")
-    p.add_argument('-c', '--cipher', help="cipher to use, AES_CBC or AES_XTS (QAT only)", default="AES_CBC")
-    p.add_argument('-k2', '--key2', help="2nd key for cipher AET_XTS", default=None)
+    p.add_argument('-c', '--cipher', help="cipher to use, AES_CBC, AES_CTR, RSA or SM4", default="AES_CBC")
+    p.add_argument('-k2', '--key2', help="2nd key for cipher RSA", default=None)
     p.set_defaults(func=bdev_crypto_create)
 
     def bdev_cryptodev_set_engine(args):
