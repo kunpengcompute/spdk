@@ -153,7 +153,11 @@ uint8_t g_number_of_claimed_volumes = 0;
 /* Specific to AES_CTR. */
 #define AES_CTR_IV_LENGTH	16
 #define AES_CTR_KEY_LENGTH	16
+/* Specific to SM4. */
+#define SM4_IV_LENGTH	16
+#define SM4_KEY_LENGTH	16
 #define AES_XTS_KEY_LENGTH	16	/* XTS uses 2 keys, each of this size. */
+#define RSA_KEY_LENGTH	1024	/* RSA uses 2 keys, each of this size. */
 #define DRIVER_NUM_QP		64
 /* Common for suported devices. */
 #define IV_OFFSET            (sizeof(struct rte_crypto_op) + \
@@ -186,7 +190,7 @@ struct bdev_names {
 	 */
 	uint8_t			*key;		/* key per bdev */
 	char			*drv_name;	/* name of the crypto device driver */
-	char			*cipher;	/* AES_CBC , AES_CTR or AES_XTS */
+	char			*cipher;	/* AES_CBC , AES_CTR , AES_XTS or SM4*/
 	uint8_t			*key2;		/* key #2 for AES_XTS, per bdev */
 	TAILQ_ENTRY(bdev_names)	link;
 };
@@ -207,6 +211,9 @@ struct vbdev_crypto {
 	struct rte_cryptodev_sym_session *session_encrypt;	/* encryption session for this bdev */
 	struct rte_cryptodev_sym_session *session_decrypt;	/* decryption session for this bdev */
 	struct rte_crypto_sym_xform	cipher_xform;		/* crypto control struct for this bdev */
+    struct rte_cryptodev_asym_session *asym_session_encrypt;	/* encryption session for this bdev */
+	struct rte_cryptodev_asym_session *asym_session_decrypt;	/* decryption session for this bdev */
+	struct rte_crypto_asym_xform	asym_cipher_xform;		/* crypto control struct for this bdev */
 	TAILQ_ENTRY(vbdev_crypto)	link;
 	struct spdk_thread		*thread;		/* thread where base device is opened */
 };
@@ -285,6 +292,32 @@ bdev_crypto_set_driver(const char *driver_name)
 	SPDK_NOTICELOG("Using driver %s\n", driver_name);
 
 	return 0;
+}
+
+enum rte_crypto_op_type bdev_crypto_get_op_type(const char *cipher)
+{
+    if (strcmp(cipher, AES_XTS) == 0) {
+        return RTE_CRYPTO_OP_TYPE_SYMMETRIC;
+    } else if (strcmp(cipher, AES_CBC) == 0) {
+        return RTE_CRYPTO_OP_TYPE_SYMMETRIC;
+    } else if (strcmp(cipher, AES_CTR) == 0) {
+        return RTE_CRYPTO_OP_TYPE_SYMMETRIC;
+    } else if (strcmp(cipher, CRYPTO_SM4) == 0) {
+        return RTE_CRYPTO_OP_TYPE_SYMMETRIC;
+    } else if (strcmp(cipher, CRYPTO_RSA) == 0) {
+        return RTE_CRYPTO_OP_TYPE_ASYMMETRIC;
+    } else {
+        return RTE_CRYPTO_OP_TYPE_UNDEFINED;
+    }
+}
+
+enum rte_crypto_rsa_priv_key_type bdev_crypto_get_rsa_key_type(const char *mode)
+{
+    if (strcmp(mode, RSA_NED) == 0) {
+        return RTE_RSA_KEY_TYPE_EXP;
+    } else {
+        return RTE_RSA_KET_TYPE_QT;
+    }
 }
 
 /* Called by vbdev_crypto_init_crypto_drivers() to init each discovered crypto device */
@@ -540,7 +573,7 @@ vbdev_crypto_init_crypto_drivers(void)
 	 * for queueing ops.
 	 */
 	g_crypto_op_mp = rte_crypto_op_pool_create("op_mp",
-			 RTE_CRYPTO_OP_TYPE_SYMMETRIC,
+			 RTE_CRYPTO_OP_TYPE_UNDEFINED,
 			 NUM_MBUFS,
 			 POOL_CACHE_SIZE,
 			 AES_CBC_IV_LENGTH + QUEUED_OP_LENGTH,
@@ -722,31 +755,66 @@ crypto_dev_poller(void *args)
 		 * partiular bdev_io so need to look at each and determine if it's
 		 * the last one for it's bdev_io or not.
 		 */
-		bdev_io = (struct spdk_bdev_io *)*RTE_MBUF_DYNFIELD(dequeued_ops[i]->sym->m_src, g_mbuf_offset,
-				uint64_t *);
-		assert(bdev_io != NULL);
-		io_ctx = (struct crypto_bdev_io *)bdev_io->driver_ctx;
+        if (dequeued_ops[i]->op_type == RTE_CRYPTO_OP_TYPE_SYMMETRIC) {
+            bdev_io = (struct spdk_bdev_io *)*RTE_MBUF_DYNFIELD(dequeued_ops[i]->sym->m_src, g_mbuf_offset, uint64_t *);
+            assert(bdev_io != NULL);
+            io_ctx = (struct crypto_bdev_io *)bdev_io->driver_ctx;
 
-		if (dequeued_ops[i]->status != RTE_CRYPTO_OP_STATUS_SUCCESS) {
-			SPDK_ERRLOG("error with op %d status %u\n", i,
-				    dequeued_ops[i]->status);
-			/* Update the bdev status to error, we'll still process the
-			 * rest of the crypto ops for this bdev_io though so they
-			 * aren't left hanging.
-			 */
-			io_ctx->bdev_io_status = SPDK_BDEV_IO_STATUS_FAILED;
-		}
+            if (dequeued_ops[i]->status != RTE_CRYPTO_OP_STATUS_SUCCESS) {
+                SPDK_ERRLOG("error with op %d status %u\n", i, dequeued_ops[i]->status);
+                /* Update the bdev status to error, we'll still process the
+                 * rest of the crypto ops for this bdev_io though so they
+                 * aren't left hanging.
+                 */
+                io_ctx->bdev_io_status = SPDK_BDEV_IO_STATUS_FAILED;
+            }
 
-		assert(io_ctx->cryop_cnt_remaining > 0);
+            assert(io_ctx->cryop_cnt_remaining > 0);
+            /* Return the associated src and dst mbufs by collecting them into
+             * an array that we can use the bulk API to free after the loop.
+             */
+            *RTE_MBUF_DYNFIELD(dequeued_ops[i]->sym->m_src, g_mbuf_offset, uint64_t *) = 0;
+            mbufs_to_free[num_mbufs++] = (void *)dequeued_ops[i]->sym->m_src;
+            if (dequeued_ops[i]->sym->m_dst) {
+                mbufs_to_free[num_mbufs++] = (void *)dequeued_ops[i]->sym->m_dst;
+            }
+        } else {
+            bdev_io =
+                (struct spdk_bdev_io *)*RTE_MBUF_DYNFIELD(dequeued_ops[i]->asym->m_src, g_mbuf_offset, uint64_t *);
+            assert(bdev_io != NULL);
+            io_ctx = (struct crypto_bdev_io *)bdev_io->driver_ctx;
+            struct rte_crypto_asym_op *op = dequeued_ops[i]->asym;
+            if (dequeued_ops[i]->status != RTE_CRYPTO_OP_STATUS_SUCCESS) {
+                if (dequeued_ops[i]->status == RTE_CRYPTO_OP_STATUS_ERROR) {
+                    /* When the plaintext is greater than the modulus, the plaintext will fail to be encrypted. In the
+                     * current version, the data is directly copied.*/
+                    if (op->rsa.op_type == RTE_CRYPTO_ASYM_OP_ENCRYPT) {
+                        memcpy(op->rsa.cipher.data, op->rsa.message.data, op->rsa.message.length);
+                        op->rsa.cipher.length = op->rsa.message.length;
+                    } else {
+                        memcpy(op->rsa.message.data, op->rsa.cipher.data, op->rsa.cipher.length);
+                        op->rsa.message.length = op->rsa.cipher.length;
+                    }
+                } else {
+                    SPDK_ERRLOG("error with op %d status %u\n", i, dequeued_ops[i]->status);
+                    /* Update the bdev status to error, we'll still process the
+                     * rest of the crypto ops for this bdev_io though so they
+                     * aren't left hanging.
+                     */
+                    io_ctx->bdev_io_status = SPDK_BDEV_IO_STATUS_FAILED;
+                }
+            }
 
-		/* Return the associated src and dst mbufs by collecting them into
-		 * an array that we can use the bulk API to free after the loop.
-		 */
-		*RTE_MBUF_DYNFIELD(dequeued_ops[i]->sym->m_src, g_mbuf_offset, uint64_t *) = 0;
-		mbufs_to_free[num_mbufs++] = (void *)dequeued_ops[i]->sym->m_src;
-		if (dequeued_ops[i]->sym->m_dst) {
-			mbufs_to_free[num_mbufs++] = (void *)dequeued_ops[i]->sym->m_dst;
-		}
+            assert(io_ctx->cryop_cnt_remaining > 0);
+            /* Return the associated src and dst mbufs by collecting them into
+             * an array that we can use the bulk API to free after the loop.
+             */
+            *RTE_MBUF_DYNFIELD(dequeued_ops[i]->asym->m_src, g_mbuf_offset, uint64_t *) = 0;
+            mbufs_to_free[num_mbufs++] = (void *)dequeued_ops[i]->asym->m_src;
+            if (dequeued_ops[i]->asym->m_dst) {
+                mbufs_to_free[num_mbufs++] = (void *)dequeued_ops[i]->asym->m_dst;
+            }
+        }
 
 		/* done encrypting, complete the bdev_io */
 		if (--io_ctx->cryop_cnt_remaining == 0) {
@@ -850,6 +918,7 @@ _crypto_operation(struct spdk_bdev_io *bdev_io, enum rte_crypto_cipher_operation
 	int burst;
 	struct vbdev_crypto_op *op_to_queue;
 	uint64_t alignment = spdk_bdev_get_buf_align(&io_ctx->crypto_bdev->crypto_bdev);
+    enum rte_crypto_op_type crypto_op_type = bdev_crypto_get_op_type(io_ctx->crypto_bdev->cipher);
 
 	assert((bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen) <= CRYPTO_MAX_IO);
 
@@ -880,7 +949,7 @@ _crypto_operation(struct spdk_bdev_io *bdev_io, enum rte_crypto_cipher_operation
 #endif
 	/* Allocate crypto operations. */
 	allocated = rte_crypto_op_bulk_alloc(g_crypto_op_mp,
-					     RTE_CRYPTO_OP_TYPE_SYMMETRIC,
+					     crypto_op_type,
 					     crypto_ops, cryop_cnt);
 	if (allocated < cryop_cnt) {
 		SPDK_ERRLOG("ERROR trying to get crypto ops!\n");
@@ -938,58 +1007,107 @@ _crypto_operation(struct spdk_bdev_io *bdev_io, enum rte_crypto_cipher_operation
 					  phys_addr, crypto_len, &g_shinfo);
 		rte_pktmbuf_append(src_mbufs[crypto_index], crypto_len);
 
-		/* Set the IV - we use the LBA of the crypto_op */
-		iv_ptr = rte_crypto_op_ctod_offset(crypto_ops[crypto_index], uint8_t *,
-						   IV_OFFSET);
-		memset(iv_ptr, 0, AES_CBC_IV_LENGTH);
-		op_block_offset = bdev_io->u.bdev.offset_blocks + crypto_index;
-		rte_memcpy(iv_ptr, &op_block_offset, sizeof(uint64_t));
+        crypto_ops[crypto_index]->op_type = crypto_op_type;
+        if (crypto_op_type == RTE_CRYPTO_OP_TYPE_SYMMETRIC) {
+            /* Set the IV - we use the LBA of the crypto_op */
+            iv_ptr = rte_crypto_op_ctod_offset(crypto_ops[crypto_index], uint8_t *, IV_OFFSET);
+            memset(iv_ptr, 0, AES_CBC_IV_LENGTH);
+            op_block_offset = bdev_io->u.bdev.offset_blocks + crypto_index;
+            rte_memcpy(iv_ptr, &op_block_offset, sizeof(uint64_t));
 
-		/* Set the data to encrypt/decrypt length */
-		crypto_ops[crypto_index]->sym->cipher.data.length = crypto_len;
-		crypto_ops[crypto_index]->sym->cipher.data.offset = 0;
+            /* Set the data to encrypt/decrypt length */
+            crypto_ops[crypto_index]->sym->cipher.data.length = crypto_len;
+            crypto_ops[crypto_index]->sym->cipher.data.offset = 0;
 
-		/* link the mbuf to the crypto op. */
-		crypto_ops[crypto_index]->sym->m_src = src_mbufs[crypto_index];
+            /* link the mbuf to the crypto op. */
+            crypto_ops[crypto_index]->sym->m_src = src_mbufs[crypto_index];
 
-		/* For encrypt, point the destination to a buffer we allocate and redirect the bdev_io
-		 * that will be used to process the write on completion to the same buffer. Setting
-		 * up the en_buffer is a little simpler as we know the destination buffer is single IOV.
-		 */
-		if (crypto_op == RTE_CRYPTO_CIPHER_OP_ENCRYPT) {
-			buf_addr = io_ctx->aux_buf_iov.iov_base + en_offset;
-			phys_addr = spdk_vtophys((void *)buf_addr, NULL);
-			if (phys_addr == SPDK_VTOPHYS_ERROR) {
-				rc = -EFAULT;
-				goto error_attach_session;
-			}
-			rte_pktmbuf_attach_extbuf(dst_mbufs[crypto_index], buf_addr,
-						  phys_addr, crypto_len, &g_shinfo);
-			rte_pktmbuf_append(dst_mbufs[crypto_index], crypto_len);
+            /* For encrypt, point the destination to a buffer we allocate and redirect the bdev_io
+             * that will be used to process the write on completion to the same buffer. Setting
+             * up the en_buffer is a little simpler as we know the destination buffer is single IOV.
+             */
+            if (crypto_op == RTE_CRYPTO_CIPHER_OP_ENCRYPT) {
+                buf_addr = io_ctx->aux_buf_iov.iov_base + en_offset;
+                phys_addr = spdk_vtophys((void *)buf_addr, NULL);
+                if (phys_addr == SPDK_VTOPHYS_ERROR) {
+                    rc = -EFAULT;
+                    goto error_attach_session;
+                }
+                rte_pktmbuf_attach_extbuf(dst_mbufs[crypto_index], buf_addr, phys_addr, crypto_len, &g_shinfo);
+                rte_pktmbuf_append(dst_mbufs[crypto_index], crypto_len);
 
-			crypto_ops[crypto_index]->sym->m_dst = dst_mbufs[crypto_index];
-			en_offset += crypto_len;
+                crypto_ops[crypto_index]->sym->m_dst = dst_mbufs[crypto_index];
+                en_offset += crypto_len;
 
-			/* Attach the crypto session to the operation */
-			rc = rte_crypto_op_attach_sym_session(crypto_ops[crypto_index],
-							      io_ctx->crypto_bdev->session_encrypt);
-			if (rc) {
-				rc = -EINVAL;
-				goto error_attach_session;
-			}
+                /* Attach the crypto session to the operation */
+                rc = rte_crypto_op_attach_sym_session(crypto_ops[crypto_index], io_ctx->crypto_bdev->session_encrypt);
+                if (rc) {
+                    rc = -EINVAL;
+                    goto error_attach_session;
+                }
 
-		} else {
-			crypto_ops[crypto_index]->sym->m_dst = NULL;
+            } else {
+                crypto_ops[crypto_index]->sym->m_dst = NULL;
 
-			/* Attach the crypto session to the operation */
-			rc = rte_crypto_op_attach_sym_session(crypto_ops[crypto_index],
-							      io_ctx->crypto_bdev->session_decrypt);
-			if (rc) {
-				rc = -EINVAL;
-				goto error_attach_session;
-			}
+                /* Attach the crypto session to the operation */
+                rc = rte_crypto_op_attach_sym_session(crypto_ops[crypto_index], io_ctx->crypto_bdev->session_decrypt);
+                if (rc) {
+                    rc = -EINVAL;
+                    goto error_attach_session;
+                }
+            }
+        } else {
+            crypto_ops[crypto_index]->asym->m_src = src_mbufs[crypto_index];
 
+            /* For encrypt, point the destination to a buffer we allocate and redirect the bdev_io
+             * that will be used to process the write on completion to the same buffer. Setting
+             * up the en_buffer is a little simpler as we know the destination buffer is single IOV.
+             */
+            crypto_ops[crypto_index]->asym->rsa.pad = RTE_CRYPTO_RSA_PADDING_NONE;
+            if (crypto_op == RTE_CRYPTO_CIPHER_OP_ENCRYPT) {
+                buf_addr = io_ctx->aux_buf_iov.iov_base + en_offset;
+                phys_addr = spdk_vtophys((void *)buf_addr, NULL);
+                if (phys_addr == SPDK_VTOPHYS_ERROR) {
+                    rc = -EFAULT;
+                    goto error_attach_session;
+                }
+                rte_pktmbuf_attach_extbuf(dst_mbufs[crypto_index], buf_addr, phys_addr, crypto_len, &g_shinfo);
+                rte_pktmbuf_append(dst_mbufs[crypto_index], crypto_len);
 
+                crypto_ops[crypto_index]->asym->m_dst = dst_mbufs[crypto_index];
+                en_offset += crypto_len;
+                crypto_ops[crypto_index]->asym->rsa.op_type = RTE_CRYPTO_ASYM_OP_ENCRYPT;
+                crypto_ops[crypto_index]->asym->rsa.message.data =
+                    rte_pktmbuf_mtod_offset(src_mbufs[crypto_index], uint8_t *, 0);
+                crypto_ops[crypto_index]->asym->rsa.message.length = crypto_len;
+                crypto_ops[crypto_index]->asym->rsa.cipher.data =
+                    rte_pktmbuf_mtod_offset(dst_mbufs[crypto_index], uint8_t *, 0);
+
+                /* Attach the crypto session to the operation */
+                rc = rte_crypto_op_attach_asym_session(
+                    crypto_ops[crypto_index], io_ctx->crypto_bdev->asym_session_encrypt);
+                if (rc) {
+                    rc = -EINVAL;
+                    goto error_attach_session;
+                }
+
+            } else {
+                crypto_ops[crypto_index]->asym->m_dst = NULL;
+                crypto_ops[crypto_index]->asym->rsa.op_type = RTE_CRYPTO_ASYM_OP_DECRYPT;
+                crypto_ops[crypto_index]->asym->rsa.cipher.data =
+                    rte_pktmbuf_mtod_offset(src_mbufs[crypto_index], uint8_t *, 0);
+                crypto_ops[crypto_index]->asym->rsa.cipher.length = crypto_len;
+                crypto_ops[crypto_index]->asym->rsa.message.data =
+                    rte_pktmbuf_mtod_offset(src_mbufs[crypto_index], uint8_t *, 0);
+                crypto_ops[crypto_index]->asym->rsa.message.length = 0;
+                /* Attach the crypto session to the operation */
+                rc = rte_crypto_op_attach_asym_session(
+                    crypto_ops[crypto_index], io_ctx->crypto_bdev->asym_session_decrypt);
+                if (rc) {
+                    rc = -EINVAL;
+                    goto error_attach_session;
+                }
+            }
 		}
 
 		/* Subtract our running totals for the op in progress and the overall bdev io */
@@ -1349,9 +1467,7 @@ vbdev_crypto_io_type_supported(void *ctx, enum spdk_bdev_io_type io_type)
 	}
 }
 
-/* Callback for unregistering the IO device. */
-static void
-_device_unregister_cb(void *io_device)
+static void device_unregister_sym_cb(void *io_device) 
 {
 	struct vbdev_crypto *crypto_bdev = io_device;
 
@@ -1373,6 +1489,81 @@ _device_unregister_cb(void *io_device)
 	}
 	free(crypto_bdev->crypto_bdev.name);
 	free(crypto_bdev);
+}
+
+static void bdev_crypto_free_rsa(struct rte_crypto_rsa_xform rsa)
+{
+    if (rsa.n.data) {
+        memset(rsa.n.data, 0, strlen(rsa.n.data));
+        free(rsa.n.data);
+    }
+    if (rsa.e.data) {
+        memset(rsa.e.data, 0, strlen(rsa.e.data));
+        free(rsa.e.data);
+    }
+    if (rsa.key_type == RTE_RSA_KET_TYPE_QT) {
+        if (rsa.qt.p.data) {
+        memset(rsa.qt.p.data, 0, strlen(rsa.qt.p.data));
+        free(rsa.qt.p.data);
+        }
+        if (rsa.qt.q.data) {
+        memset(rsa.qt.q.data, 0, strlen(rsa.qt.q.data));
+        free(rsa.qt.q.data);
+        }
+        if (rsa.qt.dP.data) {
+        memset(rsa.qt.dP.data, 0, strlen(rsa.qt.dP.data));
+        free(rsa.qt.dP.data);
+        }
+        if (rsa.qt.dQ.data) {
+        memset(rsa.qt.dQ.data, 0, strlen(rsa.qt.dQ.data));
+        free(rsa.qt.dQ.data);
+        }
+        if (rsa.qt.qInv.data) {
+        memset(rsa.qt.qInv.data, 0, strlen(rsa.qt.qInv.data));
+        free(rsa.qt.qInv.data);
+        }
+    } else {
+        if (rsa.d.data) {
+        memset(rsa.d.data, 0, strlen(rsa.d.data));
+        free(rsa.d.data);
+        }
+    }
+}
+
+static void device_unregister_asym_cb(void *io_device) 
+{
+	struct vbdev_crypto *crypto_bdev = io_device;
+
+	/* Done with this crypto_bdev. */
+	rte_cryptodev_asym_session_free(crypto_bdev->asym_session_decrypt);
+	rte_cryptodev_asym_session_free(crypto_bdev->asym_session_encrypt);
+	free(crypto_bdev->drv_name);
+	if (crypto_bdev->key) {
+		memset(crypto_bdev->key, 0, strnlen(crypto_bdev->key, (AES_CBC_KEY_LENGTH + 1)));
+		free(crypto_bdev->key);
+	}
+	if (crypto_bdev->key2) {
+		memset(crypto_bdev->key2, 0, strnlen(crypto_bdev->key2, (AES_XTS_KEY_LENGTH + 1)));
+		free(crypto_bdev->key2);
+	}
+    bdev_crypto_free_rsa(crypto_bdev->asym_cipher_xform.rsa);
+	free(crypto_bdev->crypto_bdev.name);
+	free(crypto_bdev);
+}
+
+
+/* Callback for unregistering the IO device. */
+static void
+_device_unregister_cb(void *io_device)
+{
+    struct vbdev_crypto *crypto_bdev = io_device;
+
+	/* Done with this crypto_bdev. */
+    if (bdev_crypto_get_op_type(crypto_bdev->cipher) == RTE_CRYPTO_OP_TYPE_SYMMETRIC) {
+	    device_unregister_sym_cb(io_device);
+    } else {
+        device_unregister_asym_cb(io_device);
+    }
 }
 
 /* Wrapper for the bdev close operation. */
@@ -1448,6 +1639,9 @@ vbdev_crypto_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 	if (strcmp(crypto_bdev->cipher, AES_XTS) == 0) {
 		spdk_json_write_named_string(w, "key2", crypto_bdev->key);
 	}
+    if (strcmp(crypto_bdev->cipher, CRYPTO_RSA) == 0) {
+		spdk_json_write_named_string(w, "key2", crypto_bdev->key2);
+	}
 	spdk_json_write_named_string(w, "cipher", crypto_bdev->cipher);
 	spdk_json_write_object_end(w);
 	return 0;
@@ -1469,6 +1663,9 @@ vbdev_crypto_config_json(struct spdk_json_write_ctx *w)
 		if (strcmp(crypto_bdev->cipher, AES_XTS) == 0) {
 			spdk_json_write_named_string(w, "key2", crypto_bdev->key);
 		}
+        if (strcmp(crypto_bdev->cipher, CRYPTO_RSA) == 0) {
+		    spdk_json_write_named_string(w, "key2", crypto_bdev->key2);
+	    }
 		spdk_json_write_named_string(w, "cipher", crypto_bdev->cipher);
 		spdk_json_write_object_end(w);
 		spdk_json_write_object_end(w);
@@ -1630,11 +1827,21 @@ vbdev_crypto_insert_name(const char *bdev_name, const char *vbdev_name,
 		rc = -ENOMEM;
 		goto error_alloc_key;
 	}
-	if (strnlen(name->key, (AES_CBC_KEY_LENGTH + 1)) != AES_CBC_KEY_LENGTH) {
-		SPDK_ERRLOG("invalid AES_CBC key length\n");
-		rc = -EINVAL;
-		goto error_invalid_key;
-	}
+
+    if (strncmp(cipher, CRYPTO_RSA, sizeof(CRYPTO_RSA)) == 0) {
+        char path[PATH_MAX] = {0};
+        if (realpath(name->key, path) == NULL) {
+            SPDK_ERRLOG("invalid CRYPTO_RSA key path\n");
+            rc = -EINVAL;
+            goto error_invalid_key;
+        }
+    } else {
+        if (strnlen(name->key, (AES_CBC_KEY_LENGTH + 1)) != AES_CBC_KEY_LENGTH) {
+            SPDK_ERRLOG("invalid AES_CBC key length\n");
+            rc = -EINVAL;
+            goto error_invalid_key;
+        }
+    }
 
 	if (strncmp(cipher, AES_XTS, sizeof(AES_XTS)) == 0) {
 		/* To please scan-build, input validation makes sure we can't
@@ -1658,6 +1865,23 @@ vbdev_crypto_insert_name(const char *bdev_name, const char *vbdev_name,
 		name->cipher = AES_CBC;
 	} else if (strncmp(cipher, AES_CTR, sizeof(AES_CTR)) == 0) {
 		name->cipher = AES_CTR;
+	}  else if (strncmp(cipher, CRYPTO_SM4, sizeof(CRYPTO_SM4)) == 0) {
+		name->cipher = CRYPTO_SM4;
+	} else if (strncmp(cipher, CRYPTO_RSA, sizeof(CRYPTO_RSA)) == 0) {
+		name->cipher = CRYPTO_RSA;
+        assert(key2);
+        if (strncmp(key2, RSA_CRT, sizeof(RSA_CRT)) != 0 && strncmp(key2, RSA_NED, sizeof(RSA_NED)) != 0) {
+			SPDK_ERRLOG("invalid RSA key2\n");
+			rc = -EINVAL;
+			goto error_invalid_key2;
+		}
+
+		name->key2 = strdup(key2);
+		if (!name->key2) {
+			SPDK_ERRLOG("could not allocate name->key2\n");
+			rc = -ENOMEM;
+			goto error_alloc_key2;
+		}
 	} else {
 		SPDK_ERRLOG("Invalid cipher: %s\n", cipher);
 		rc = -EINVAL;
@@ -1687,6 +1911,24 @@ error_alloc_bname:
 	return rc;
 }
 
+static void vbdev_crypto_delete_name(bdev_name)
+{
+    struct bdev_names *name;
+    TAILQ_FOREACH(name, &g_bdev_names, link)
+    {
+        if (strcmp(name->bdev_name, bdev_name) == 0) {
+            TAILQ_REMOVE(&g_bdev_names, name, link);
+            free(name->bdev_name);
+            free(name->vbdev_name);
+            free(name->drv_name);
+            free(name->key);
+            free(name->key2);
+            free(name);
+            break;
+        }
+    }
+}
+
 /* RPC entry point for crypto creation. */
 int
 create_crypto_disk(const char *bdev_name, const char *vbdev_name,
@@ -1704,6 +1946,9 @@ create_crypto_disk(const char *bdev_name, const char *vbdev_name,
 	if (rc == -ENODEV) {
 		SPDK_NOTICELOG("vbdev creation deferred pending base bdev arrival\n");
 		rc = 0;
+    } else if (rc != 0) {
+        SPDK_NOTICELOG("vbdev creation disk delete name %s\n", bdev_name);
+        vbdev_crypto_delete_name(bdev_name);
 	}
 
 	return rc;
@@ -1864,6 +2109,8 @@ vbdev_crypto_claim(const char *bdev_name)
 	struct spdk_bdev *bdev;
 	bool found = false;
 	int rc = 0;
+    RSA *rsa = NULL;
+    FILE *file = NULL;
 
 	if (g_number_of_claimed_volumes >= MAX_CRYPTO_VOLUMES) {
 		SPDK_DEBUGLOG(vbdev_crypto, "Reached max number of claimed volumes\n");
@@ -1957,9 +2204,16 @@ vbdev_crypto_claim(const char *bdev_name)
 		} if (strcmp(vbdev->drv_name, OPENSSL) == 0) {
             if (strcmp(name->cipher, AES_CBC) == 0) {
 				SPDK_NOTICELOG("OPENSSL using cipher: AES_CBC\n");
-			} else {
+				vbdev->cipher = AES_CBC;
+			} else if (strcmp(name->cipher, AES_CTR) == 0) {
 				SPDK_NOTICELOG("OPENSSL using cipher: AES_CTR\n");
 				vbdev->cipher = AES_CTR;
+			} else if (strcmp(name->cipher, CRYPTO_SM4) == 0) {
+				SPDK_NOTICELOG("OPENSSL using cipher: SM4\n");
+				vbdev->cipher = CRYPTO_SM4;
+			} else {
+				SPDK_NOTICELOG("OPENSSL using cipher: RSA\n");
+				vbdev->cipher = CRYPTO_RSA;
             }
             vbdev->crypto_bdev.required_alignment = bdev->required_alignment;
         } else {
@@ -2010,59 +2264,202 @@ vbdev_crypto_claim(const char *bdev_name)
 			rc = -EINVAL;
 			goto error_cant_find_devid;
 		}
+        if (bdev_crypto_get_op_type(vbdev->cipher) == RTE_CRYPTO_OP_TYPE_SYMMETRIC) {
+            /* Get sessions. */
+            vbdev->session_encrypt = rte_cryptodev_sym_session_create(g_session_mp);
+            if (NULL == vbdev->session_encrypt) {
+                SPDK_ERRLOG("ERROR trying to create crypto session!\n");
+                rc = -EINVAL;
+                goto error_session_en_create;
+            }
 
-		/* Get sessions. */
-		vbdev->session_encrypt = rte_cryptodev_sym_session_create(g_session_mp);
-		if (NULL == vbdev->session_encrypt) {
-			SPDK_ERRLOG("ERROR trying to create crypto session!\n");
-			rc = -EINVAL;
-			goto error_session_en_create;
-		}
+            vbdev->session_decrypt = rte_cryptodev_sym_session_create(g_session_mp);
+            if (NULL == vbdev->session_decrypt) {
+                SPDK_ERRLOG("ERROR trying to create crypto session!\n");
+                rc = -EINVAL;
+                goto error_session_de_create;
+            }
 
-		vbdev->session_decrypt = rte_cryptodev_sym_session_create(g_session_mp);
-		if (NULL == vbdev->session_decrypt) {
-			SPDK_ERRLOG("ERROR trying to create crypto session!\n");
-			rc = -EINVAL;
-			goto error_session_de_create;
-		}
+            /* Init our per vbdev xform with the desired cipher options. */
+            vbdev->cipher_xform.type = RTE_CRYPTO_SYM_XFORM_CIPHER;
+            vbdev->cipher_xform.cipher.iv.offset = IV_OFFSET;
+            if (strcmp(name->cipher, AES_CBC) == 0) {
+                vbdev->cipher_xform.cipher.key.data = vbdev->key;
+                vbdev->cipher_xform.cipher.algo = RTE_CRYPTO_CIPHER_AES_CBC;
+                vbdev->cipher_xform.cipher.key.length = AES_CBC_KEY_LENGTH;
+            } else if (strcmp(name->cipher, AES_CTR) == 0) {
+                vbdev->cipher_xform.cipher.key.data = vbdev->key;
+                vbdev->cipher_xform.cipher.algo = RTE_CRYPTO_CIPHER_AES_CTR;
+                vbdev->cipher_xform.cipher.key.length = AES_CTR_KEY_LENGTH;
+            } else if (strcmp(name->cipher, CRYPTO_SM4) == 0) {
+                vbdev->cipher_xform.cipher.key.data = vbdev->key;
+                vbdev->cipher_xform.cipher.algo = RTE_CRYPTO_CIPHER_SM4;
+                vbdev->cipher_xform.cipher.key.length = SM4_KEY_LENGTH;
+            } else {
+                vbdev->cipher_xform.cipher.key.data = vbdev->xts_key;
+                vbdev->cipher_xform.cipher.algo = RTE_CRYPTO_CIPHER_AES_XTS;
+                vbdev->cipher_xform.cipher.key.length = AES_XTS_KEY_LENGTH * 2;
+            }
+            vbdev->cipher_xform.cipher.iv.length = AES_CBC_IV_LENGTH;
 
-		/* Init our per vbdev xform with the desired cipher options. */
-		vbdev->cipher_xform.type = RTE_CRYPTO_SYM_XFORM_CIPHER;
-		vbdev->cipher_xform.cipher.iv.offset = IV_OFFSET;
-		if (strcmp(name->cipher, AES_CBC) == 0) {
-			vbdev->cipher_xform.cipher.key.data = vbdev->key;
-			vbdev->cipher_xform.cipher.algo = RTE_CRYPTO_CIPHER_AES_CBC;
-			vbdev->cipher_xform.cipher.key.length = AES_CBC_KEY_LENGTH;
-		} else if (strcmp(name->cipher, AES_CTR) == 0) {
-			vbdev->cipher_xform.cipher.key.data = vbdev->key;
-			vbdev->cipher_xform.cipher.algo = RTE_CRYPTO_CIPHER_AES_CTR;
-			vbdev->cipher_xform.cipher.key.length = AES_CTR_KEY_LENGTH;
-		} else {
-			vbdev->cipher_xform.cipher.key.data = vbdev->xts_key;
-			vbdev->cipher_xform.cipher.algo = RTE_CRYPTO_CIPHER_AES_XTS;
-			vbdev->cipher_xform.cipher.key.length = AES_XTS_KEY_LENGTH * 2;
-		}
-		vbdev->cipher_xform.cipher.iv.length = AES_CBC_IV_LENGTH;
+            vbdev->cipher_xform.cipher.op = RTE_CRYPTO_CIPHER_OP_ENCRYPT;
+            rc = rte_cryptodev_sym_session_init(device->cdev_id,
+                vbdev->session_encrypt,
+                &vbdev->cipher_xform,
+                g_session_mp_priv ? g_session_mp_priv : g_session_mp);
+            if (rc < 0) {
+                SPDK_ERRLOG("ERROR trying to init encrypt session!\n");
+                rc = -EINVAL;
+                goto error_session_init;
+            }
 
-		vbdev->cipher_xform.cipher.op = RTE_CRYPTO_CIPHER_OP_ENCRYPT;
-		rc = rte_cryptodev_sym_session_init(device->cdev_id, vbdev->session_encrypt,
-						    &vbdev->cipher_xform,
-						    g_session_mp_priv ? g_session_mp_priv : g_session_mp);
-		if (rc < 0) {
-			SPDK_ERRLOG("ERROR trying to init encrypt session!\n");
-			rc = -EINVAL;
-			goto error_session_init;
-		}
+            vbdev->cipher_xform.cipher.op = RTE_CRYPTO_CIPHER_OP_DECRYPT;
+            rc = rte_cryptodev_sym_session_init(device->cdev_id,
+                vbdev->session_decrypt,
+                &vbdev->cipher_xform,
+                g_session_mp_priv ? g_session_mp_priv : g_session_mp);
+            if (rc < 0) {
+                SPDK_ERRLOG("ERROR trying to init decrypt session!\n");
+                rc = -EINVAL;
+                goto error_session_init;
+            }
+        } else if (bdev_crypto_get_op_type(vbdev->cipher) == RTE_CRYPTO_OP_TYPE_ASYMMETRIC) {
+            vbdev->asym_session_encrypt = rte_cryptodev_asym_session_create(g_session_mp);
+            if (NULL == vbdev->asym_session_encrypt) {
+                SPDK_ERRLOG("ERROR trying to create crypto session!\n");
+                rc = -EINVAL;
+                goto error_session_en_create;
+            }
 
-		vbdev->cipher_xform.cipher.op = RTE_CRYPTO_CIPHER_OP_DECRYPT;
-		rc = rte_cryptodev_sym_session_init(device->cdev_id, vbdev->session_decrypt,
-						    &vbdev->cipher_xform,
-						    g_session_mp_priv ? g_session_mp_priv : g_session_mp);
-		if (rc < 0) {
-			SPDK_ERRLOG("ERROR trying to init decrypt session!\n");
-			rc = -EINVAL;
-			goto error_session_init;
-		}
+            vbdev->asym_session_decrypt = rte_cryptodev_asym_session_create(g_session_mp);
+            if (NULL == vbdev->asym_session_decrypt) {
+                SPDK_ERRLOG("ERROR trying to create crypto session!\n");
+                rc = -EINVAL;
+                goto error_session_de_create;
+            }
+
+            vbdev->asym_cipher_xform.xform_type = RTE_CRYPTO_ASYM_XFORM_RSA;
+            vbdev->asym_cipher_xform.rsa.key_type = bdev_crypto_get_rsa_key_type(vbdev->key2);
+
+            file = fopen(vbdev->key, "rb");
+            if (file == NULL) {
+                SPDK_ERRLOG("ERROR trying to fopen %s!\n", vbdev->key);
+                rc = -EINVAL;
+                goto error_fopen_key_file;
+            }
+            rsa = PEM_read_RSAPrivateKey(file, NULL, NULL, NULL);
+            if (rsa == NULL) {
+                SPDK_ERRLOG("ERROR trying to read_RSAPrivateKey!\n");
+                rc = -EINVAL;
+                goto error_read_key;
+            }
+            const BIGNUM *n_in_st = RSA_get0_n(rsa);
+            const BIGNUM *e_in_st = RSA_get0_e(rsa);
+
+            vbdev->asym_cipher_xform.rsa.n.data = malloc(RSA_KEY_LENGTH);
+            if (vbdev->asym_cipher_xform.rsa.n.data == NULL) {
+                SPDK_ERRLOG("ERROR trying to malloc rsa!\n");
+                rc = -EINVAL;
+                goto error_malloc_rsa;
+            }
+            vbdev->asym_cipher_xform.rsa.n.length = BN_bn2bin(n_in_st, vbdev->asym_cipher_xform.rsa.n.data);
+            vbdev->asym_cipher_xform.rsa.e.data = malloc(RSA_KEY_LENGTH);
+            if (vbdev->asym_cipher_xform.rsa.e.data == NULL) {
+                SPDK_ERRLOG("ERROR trying to malloc rsa!\n");
+                rc = -EINVAL;
+                goto error_malloc_rsa;
+            }
+            vbdev->asym_cipher_xform.rsa.e.length = BN_bn2bin(e_in_st, vbdev->asym_cipher_xform.rsa.e.data);
+
+            if (vbdev->asym_cipher_xform.rsa.key_type == RTE_RSA_KET_TYPE_QT) {
+                vbdev->asym_cipher_xform.rsa.qt.p.data = malloc(RSA_KEY_LENGTH);
+                if (vbdev->asym_cipher_xform.rsa.qt.p.data == NULL) {
+                    SPDK_ERRLOG("ERROR trying to malloc rsa!\n");
+                    rc = -EINVAL;
+                    goto error_malloc_rsa;
+                }
+                vbdev->asym_cipher_xform.rsa.qt.q.data = malloc(RSA_KEY_LENGTH);
+                if (vbdev->asym_cipher_xform.rsa.qt.q.data == NULL) {
+                    SPDK_ERRLOG("ERROR trying to malloc rsa!\n");
+                    rc = -EINVAL;
+                    goto error_malloc_rsa;
+                }
+                vbdev->asym_cipher_xform.rsa.qt.dP.data = malloc(RSA_KEY_LENGTH);
+                if (vbdev->asym_cipher_xform.rsa.qt.dP.data == NULL) {
+                    SPDK_ERRLOG("ERROR trying to malloc rsa!\n");
+                    rc = -EINVAL;
+                    goto error_malloc_rsa;
+                }
+                vbdev->asym_cipher_xform.rsa.qt.dQ.data = malloc(RSA_KEY_LENGTH);
+                if (vbdev->asym_cipher_xform.rsa.qt.dQ.data == NULL) {
+                    SPDK_ERRLOG("ERROR trying to malloc rsa!\n");
+                    rc = -EINVAL;
+                    goto error_malloc_rsa;
+                }
+                vbdev->asym_cipher_xform.rsa.qt.qInv.data = malloc(RSA_KEY_LENGTH);
+                if (vbdev->asym_cipher_xform.rsa.qt.qInv.data == NULL) {
+                    SPDK_ERRLOG("ERROR trying to malloc rsa!\n");
+                    rc = -EINVAL;
+                    goto error_malloc_rsa;
+                }
+                const BIGNUM *p_in_st = NULL;
+                const BIGNUM *q_in_st = NULL;
+                const BIGNUM *dmp1_in_st = NULL;
+                const BIGNUM *dmq1_in_st = NULL;
+                const BIGNUM *iqmp_in_st = NULL;
+                RSA_get0_factors(rsa, &p_in_st, &q_in_st);
+                RSA_get0_crt_params(rsa, &dmp1_in_st, &dmq1_in_st, &iqmp_in_st);
+                vbdev->asym_cipher_xform.rsa.qt.p.length = BN_bn2bin(p_in_st, vbdev->asym_cipher_xform.rsa.qt.p.data);
+                vbdev->asym_cipher_xform.rsa.qt.q.length = BN_bn2bin(q_in_st, vbdev->asym_cipher_xform.rsa.qt.q.data);
+                vbdev->asym_cipher_xform.rsa.qt.dP.length =
+                    BN_bn2bin(dmp1_in_st, vbdev->asym_cipher_xform.rsa.qt.dP.data);
+                vbdev->asym_cipher_xform.rsa.qt.dQ.length =
+                    BN_bn2bin(dmq1_in_st, vbdev->asym_cipher_xform.rsa.qt.dQ.data);
+                vbdev->asym_cipher_xform.rsa.qt.qInv.length =
+                    BN_bn2bin(iqmp_in_st, vbdev->asym_cipher_xform.rsa.qt.qInv.data);
+            } else if (vbdev->asym_cipher_xform.rsa.key_type == RTE_RSA_KEY_TYPE_EXP) {
+                const BIGNUM *d_in_st = RSA_get0_d(rsa);
+                vbdev->asym_cipher_xform.rsa.d.data = malloc(RSA_KEY_LENGTH);
+                if (vbdev->asym_cipher_xform.rsa.d.data == NULL) {
+                    SPDK_ERRLOG("ERROR trying to malloc rsa!\n");
+                    rc = -EINVAL;
+                    goto error_malloc_rsa;
+                }
+                vbdev->asym_cipher_xform.rsa.d.length = BN_bn2bin(d_in_st, vbdev->asym_cipher_xform.rsa.d.data);
+            }
+
+            if (file) {
+                fclose(file);
+            }
+
+            if (rsa) {
+                RSA_free(rsa);
+            }
+
+            rc = rte_cryptodev_asym_session_init(device->cdev_id,
+                vbdev->asym_session_encrypt,
+                &vbdev->asym_cipher_xform,
+                g_session_mp_priv ? g_session_mp_priv : g_session_mp);
+            if (rc < 0) {
+                SPDK_ERRLOG("ERROR trying to init encrypt session!\n");
+                rc = -EINVAL;
+                goto error_session_init;
+            }
+
+            rc = rte_cryptodev_asym_session_init(device->cdev_id,
+                vbdev->asym_session_decrypt,
+                &vbdev->asym_cipher_xform,
+                g_session_mp_priv ? g_session_mp_priv : g_session_mp);
+            if (rc < 0) {
+                SPDK_ERRLOG("ERROR trying to init decrypt session!\n");
+                rc = -EINVAL;
+                goto error_session_init;
+            }
+        } else {
+            SPDK_ERRLOG("invalid crypto op type\n");
+            rc = -EINVAL;
+            goto error_invalid_op_type;
+        }
 
 		rc = spdk_bdev_register(&vbdev->crypto_bdev);
 		if (rc < 0) {
@@ -2079,11 +2476,32 @@ vbdev_crypto_claim(const char *bdev_name)
 
 	/* Error cleanup paths. */
 error_bdev_register:
+error_malloc_rsa:
+    if (bdev_crypto_get_op_type(vbdev->cipher) == RTE_CRYPTO_OP_TYPE_ASYMMETRIC) {
+        bdev_crypto_free_rsa(vbdev->asym_cipher_xform.rsa);
+    }
+error_read_key:
+    if (bdev_crypto_get_op_type(vbdev->cipher) == RTE_CRYPTO_OP_TYPE_ASYMMETRIC && rsa) {
+        RSA_free(rsa);
+    }
+error_fopen_key_file:
+    if (bdev_crypto_get_op_type(vbdev->cipher) == RTE_CRYPTO_OP_TYPE_ASYMMETRIC && file) {
+        fclose(file);
+    }
 error_session_init:
-	rte_cryptodev_sym_session_free(vbdev->session_decrypt);
+    if (bdev_crypto_get_op_type(vbdev->cipher) == RTE_CRYPTO_OP_TYPE_ASYMMETRIC) {
+        rte_cryptodev_asym_session_free(vbdev->asym_session_decrypt);
+    } else {
+        rte_cryptodev_sym_session_free(vbdev->session_decrypt);
+    }
 error_session_de_create:
-	rte_cryptodev_sym_session_free(vbdev->session_encrypt);
+    if (bdev_crypto_get_op_type(vbdev->cipher) == RTE_CRYPTO_OP_TYPE_ASYMMETRIC) {
+        rte_cryptodev_asym_session_free(vbdev->asym_session_encrypt);
+    } else {
+        rte_cryptodev_sym_session_free(vbdev->session_encrypt);
+    }
 error_session_en_create:
+error_invalid_op_type:
 error_cant_find_devid:
 	spdk_bdev_module_release_bdev(vbdev->base_bdev);
 error_claim:

@@ -49,6 +49,11 @@
 #define AES_CBC "AES_CBC" /* QAT, AESNI_MB and OPENSSL*/
 #define AES_XTS "AES_XTS" /* QAT only */
 #define AES_CTR "AES_CTR" /* OPENSSL only */
+#define CRYPTO_SM4 "SM4" /* OPENSSL only */
+#define CRYPTO_RSA "RSA" /* OPENSSL only */
+
+#define RSA_NED "NED" /* OPENSSL only */
+#define RSA_CRT "CRT" /* OPENSSL only */
 
 typedef void (*spdk_delete_crypto_complete)(void *cb_arg, int bdeverrno);
 
