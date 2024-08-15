@@ -171,6 +171,10 @@ SYS_LIBS += -L$(ISAL_DIR)/.libs -lisal
 COMMON_CFLAGS += -I$(ISAL_DIR)/..
 endif
 
+ifeq ($(CONFIG_KSAL), y)
+SYS_LIBS += -lksal
+endif
+
 VFIO_USER_DIR=$(SPDK_ROOT_DIR)/libvfio-user
 ifeq ($(CONFIG_VFIO_USER), y)
 ifeq ($(CONFIG_DEBUG), y)
