@@ -246,9 +246,14 @@ if __name__ == "__main__":
         rpc.bdev.compressdev_zlib_module_set_wbits(args.client, wbits=args.wbits)
 
     p = subparsers.add_parser('compressdev_zlib_module_set_wbits', help='compressdev zlib module set window size.')
-    p.add_argument('-w', '--wbits', type=int, help='8~15 zlib, 24~31 gzip')
+    p.add_argument('-w', '--wbits', type=int, help='kae offload 8~15 zlib, 25~31 gzip')
     p.set_defaults(func=compressdev_zlib_module_set_wbits)
 
+    def compressdev_zlib_module_get_wbits(args):
+        print_json(rpc.bdev.compressdev_zlib_module_get_wbits(args.client))
+
+    p = subparsers.add_parser('compressdev_zlib_module_get_wbits', help='compressdev zlib module get window size.')
+    p.set_defaults(func=compressdev_zlib_module_get_wbits)
 
     def bdev_compress_get_orphans(args):
         print_dict(rpc.bdev.bdev_compress_get_orphans(args.client,

@@ -109,6 +109,15 @@ def compressdev_zlib_module_set_wbits(client, wbits):
 
     return client.call('compressdev_zlib_module_set_wbits', params)
 
+def compressdev_zlib_module_get_wbits(client):
+    """get zlib module window size.
+
+    Args:
+        no args
+    """
+    params = {}
+
+    return client.call('compressdev_zlib_module_get_wbits', params)
 
 def bdev_compress_get_orphans(client, name=None):
     """Get a list of comp bdevs that do not have a pmem file (aka orphaned).

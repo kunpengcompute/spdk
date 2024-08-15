@@ -1124,6 +1124,8 @@ vbdev_compress_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 	spdk_json_write_named_string(w, "name", spdk_bdev_get_name(&comp_bdev->comp_bdev));
 	spdk_json_write_named_string(w, "base_bdev_name", spdk_bdev_get_name(comp_bdev->base_bdev));
 	spdk_json_write_named_string(w, "compression_pmd", comp_bdev->drv_name);
+    spdk_json_write_named_int32(w, "algo", g_comp_xform.compress.algo);
+    spdk_json_write_named_int32(w, "window_size", g_comp_xform.compress.window_size);
 	spdk_json_write_object_end(w);
 
 	return 0;
@@ -1921,5 +1923,17 @@ accel_compressdev_set_window_size_and_algo(int32_t wbits, uint8_t algo)
     return 0;
 }
 
+int32_t rpc_zlib_module_get_wbits(void)
+{
+    int32_t wbits;
+
+    if (g_comp_xform.compress.algo == RTE_COMP_ALGO_DEFLATE) {
+        wbits = -g_comp_xform.compress.window_size;
+    } else {
+        wbits = g_comp_xform.compress.window_size;
+    }
+
+    return wbits;
+}
 
 SPDK_LOG_REGISTER_COMPONENT(vbdev_compress)

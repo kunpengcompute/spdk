@@ -83,6 +83,7 @@ enum compress_pmd {
 
 int compress_set_pmd(enum compress_pmd *opts);
 int accel_compressdev_set_window_size_and_algo(int32_t wbits, uint8_t algo);
+int32_t rpc_zlib_module_get_wbits(void);
 
 typedef void (*spdk_delete_compress_complete)(void *cb_arg, int bdeverrno);
 
