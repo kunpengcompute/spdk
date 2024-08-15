@@ -153,6 +153,9 @@ uint8_t g_number_of_claimed_volumes = 0;
 /* Specific to AES_CTR. */
 #define AES_CTR_IV_LENGTH	16
 #define AES_CTR_KEY_LENGTH	16
+/* Specific to SM4. */
+#define SM4_IV_LENGTH	16
+#define SM4_KEY_LENGTH	16
 #define AES_XTS_KEY_LENGTH	16	/* XTS uses 2 keys, each of this size. */
 #define RSA_KEY_LENGTH	1024	/* RSA uses 2 keys, each of this size. */
 #define DRIVER_NUM_QP		64
@@ -187,7 +190,7 @@ struct bdev_names {
 	 */
 	uint8_t			*key;		/* key per bdev */
 	char			*drv_name;	/* name of the crypto device driver */
-	char			*cipher;	/* AES_CBC , AES_CTR or AES_XTS */
+	char			*cipher;	/* AES_CBC , AES_CTR , AES_XTS or SM4*/
 	uint8_t			*key2;		/* key #2 for AES_XTS, per bdev */
 	TAILQ_ENTRY(bdev_names)	link;
 };
@@ -298,6 +301,8 @@ enum rte_crypto_op_type bdev_crypto_get_op_type(const char *cipher)
     } else if (strcmp(cipher, AES_CBC) == 0) {
         return RTE_CRYPTO_OP_TYPE_SYMMETRIC;
     } else if (strcmp(cipher, AES_CTR) == 0) {
+        return RTE_CRYPTO_OP_TYPE_SYMMETRIC;
+    } else if (strcmp(cipher, CRYPTO_SM4) == 0) {
         return RTE_CRYPTO_OP_TYPE_SYMMETRIC;
     } else if (strcmp(cipher, CRYPTO_RSA) == 0) {
         return RTE_CRYPTO_OP_TYPE_ASYMMETRIC;
@@ -1860,6 +1865,8 @@ vbdev_crypto_insert_name(const char *bdev_name, const char *vbdev_name,
 		name->cipher = AES_CBC;
 	} else if (strncmp(cipher, AES_CTR, sizeof(AES_CTR)) == 0) {
 		name->cipher = AES_CTR;
+	}  else if (strncmp(cipher, CRYPTO_SM4, sizeof(CRYPTO_SM4)) == 0) {
+		name->cipher = CRYPTO_SM4;
 	} else if (strncmp(cipher, CRYPTO_RSA, sizeof(CRYPTO_RSA)) == 0) {
 		name->cipher = CRYPTO_RSA;
         assert(key2);
@@ -1940,6 +1947,7 @@ create_crypto_disk(const char *bdev_name, const char *vbdev_name,
 		SPDK_NOTICELOG("vbdev creation deferred pending base bdev arrival\n");
 		rc = 0;
     } else if (rc != 0) {
+        SPDK_NOTICELOG("vbdev creation disk delete name %s\n", bdev_name);
         vbdev_crypto_delete_name(bdev_name);
 	}
 
@@ -2196,8 +2204,13 @@ vbdev_crypto_claim(const char *bdev_name)
 		} if (strcmp(vbdev->drv_name, OPENSSL) == 0) {
             if (strcmp(name->cipher, AES_CBC) == 0) {
 				SPDK_NOTICELOG("OPENSSL using cipher: AES_CBC\n");
+				vbdev->cipher = AES_CBC;
 			} else if (strcmp(name->cipher, AES_CTR) == 0) {
 				SPDK_NOTICELOG("OPENSSL using cipher: AES_CTR\n");
+				vbdev->cipher = AES_CTR;
+			} else if (strcmp(name->cipher, CRYPTO_SM4) == 0) {
+				SPDK_NOTICELOG("OPENSSL using cipher: SM4\n");
+				vbdev->cipher = CRYPTO_SM4;
 			} else {
 				SPDK_NOTICELOG("OPENSSL using cipher: RSA\n");
 				vbdev->cipher = CRYPTO_RSA;
@@ -2278,6 +2291,10 @@ vbdev_crypto_claim(const char *bdev_name)
                 vbdev->cipher_xform.cipher.key.data = vbdev->key;
                 vbdev->cipher_xform.cipher.algo = RTE_CRYPTO_CIPHER_AES_CTR;
                 vbdev->cipher_xform.cipher.key.length = AES_CTR_KEY_LENGTH;
+            } else if (strcmp(name->cipher, CRYPTO_SM4) == 0) {
+                vbdev->cipher_xform.cipher.key.data = vbdev->key;
+                vbdev->cipher_xform.cipher.algo = RTE_CRYPTO_CIPHER_SM4;
+                vbdev->cipher_xform.cipher.key.length = SM4_KEY_LENGTH;
             } else {
                 vbdev->cipher_xform.cipher.key.data = vbdev->xts_key;
                 vbdev->cipher_xform.cipher.algo = RTE_CRYPTO_CIPHER_AES_XTS;
