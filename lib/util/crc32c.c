@@ -34,12 +34,12 @@
 #include "util_internal.h"
 #include "spdk/crc32.h"
 
-#ifdef SPDK_CONFIG_ISAL
-#define SPDK_HAVE_ISAL
-#include <isa-l/include/crc.h>
-#elif defined(SPDK_CONFIG_KSAL)
+#ifdef SPDK_CONFIG_KSAL
 #define SPDK_HAVE_ARMV8_CRC_CRYPTO_INTRINSICS
 #include <ksal/ksal_crc.h>
+#elif defined(SPDK_CONFIG_ISAL)
+#define SPDK_HAVE_ISAL
+#include <isa-l/include/crc.h>
 #elif defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
 #define SPDK_HAVE_ARM_CRC
 #include <arm_acle.h>
@@ -48,20 +48,20 @@
 #include <x86intrin.h>
 #endif
 
-#ifdef SPDK_HAVE_ISAL
-
-uint32_t
-spdk_crc32c_update(const void *buf, size_t len, uint32_t crc)
-{
-	return crc32_iscsi((unsigned char *)buf, len, crc);
-}
-
-#elif defined(SPDK_HAVE_ARMV8_CRC_CRYPTO_INTRINSICS)
+#ifdef SPDK_HAVE_ARMV8_CRC_CRYPTO_INTRINSICS
 
 uint32_t
 spdk_crc32c_update(const void *buf, size_t len, uint32_t crc)
 {
     return KsalCrc32c(crc, buf, len);
+}
+
+#elif defined(SPDK_HAVE_ISAL)
+
+uint32_t
+spdk_crc32c_update(const void *buf, size_t len, uint32_t crc)
+{
+	return crc32_iscsi((unsigned char *)buf, len, crc);
 }
 
 #elif defined(SPDK_HAVE_SSE4_2)
