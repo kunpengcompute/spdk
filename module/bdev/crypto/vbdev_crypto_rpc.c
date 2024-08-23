@@ -94,20 +94,20 @@ rpc_bdev_crypto_create(struct spdk_jsonrpc_request *request,
 	}
 
 if (strcmp(req.cipher, CRYPTO_RSA) != 0) {
-	if (strcmp(req.cipher, AES_XTS) != 0 && strcmp(req.cipher, AES_CBC) != 0 && strcmp(req.cipher, AES_CTR) != 0 && strcmp(req.cipher, CRYPTO_SM4) != 0) {
+	if (strcmp(req.cipher, AES_XTS) != 0 && strcmp(req.cipher, AES_CBC) != 0 && strcmp(req.cipher, AES_CTR) != 0 && strcmp(req.cipher, SM4_CBC) != 0 && strcmp(req.cipher, SM4_CTR) != 0) {
 		spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						     "Invalid cipher: %s",
 						     req.cipher);
 		goto cleanup;
 	}
 
-	if (strcmp(req.crypto_pmd, AESNI_MB) == 0 && (strcmp(req.cipher, AES_XTS) == 0 || strcmp(req.cipher, AES_CTR) == 0 || strcmp(req.cipher, CRYPTO_SM4) == 0)) {
+	if (strcmp(req.crypto_pmd, AESNI_MB) == 0 && (strcmp(req.cipher, AES_XTS) == 0 || strcmp(req.cipher, AES_CTR) == 0 || strcmp(req.cipher, SM4_CBC) == 0 || strcmp(req.cipher, SM4_CTR) == 0)) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 "Invalid cipher. AES_XTS is only available on QAT. AES_CTR and SM4 is only available on OPENSSL.");
 		goto cleanup;
 	}
 
-    if (strcmp(req.crypto_pmd, QAT) == 0 && (strcmp(req.cipher, AES_CTR) == 0 || strcmp(req.cipher, CRYPTO_SM4) == 0)) {
+    if (strcmp(req.crypto_pmd, QAT) == 0 && (strcmp(req.cipher, AES_CTR) == 0 || strcmp(req.cipher, SM4_CBC) == 0 || strcmp(req.cipher, SM4_CTR) == 0)) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 "Invalid cipher. AES_CTR and SM4 is only available on OPENSSL.");
 		goto cleanup;
@@ -125,7 +125,7 @@ if (strcmp(req.cipher, CRYPTO_RSA) != 0) {
 		goto cleanup;
 	}
 
-	if ((strcmp(req.cipher, AES_CBC) == 0 || strcmp(req.cipher, AES_CTR) == 0 || strcmp(req.cipher, CRYPTO_SM4) == 0) && req.key2 != NULL) {
+	if ((strcmp(req.cipher, AES_CBC) == 0 || strcmp(req.cipher, AES_CTR) == 0 || strcmp(req.cipher, SM4_CBC) == 0 || strcmp(req.cipher, SM4_CTR) == 0) && req.key2 != NULL) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 "Invalid key. A 2nd key is needed only for AES_XTS and RSA.");
 		goto cleanup;

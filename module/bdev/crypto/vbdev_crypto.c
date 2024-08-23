@@ -302,7 +302,9 @@ enum rte_crypto_op_type bdev_crypto_get_op_type(const char *cipher)
         return RTE_CRYPTO_OP_TYPE_SYMMETRIC;
     } else if (strcmp(cipher, AES_CTR) == 0) {
         return RTE_CRYPTO_OP_TYPE_SYMMETRIC;
-    } else if (strcmp(cipher, CRYPTO_SM4) == 0) {
+    } else if (strcmp(cipher, SM4_CBC) == 0) {
+        return RTE_CRYPTO_OP_TYPE_SYMMETRIC;
+    } else if (strcmp(cipher, SM4_CTR) == 0) {
         return RTE_CRYPTO_OP_TYPE_SYMMETRIC;
     } else if (strcmp(cipher, CRYPTO_RSA) == 0) {
         return RTE_CRYPTO_OP_TYPE_ASYMMETRIC;
@@ -1865,8 +1867,10 @@ vbdev_crypto_insert_name(const char *bdev_name, const char *vbdev_name,
 		name->cipher = AES_CBC;
 	} else if (strncmp(cipher, AES_CTR, sizeof(AES_CTR)) == 0) {
 		name->cipher = AES_CTR;
-	}  else if (strncmp(cipher, CRYPTO_SM4, sizeof(CRYPTO_SM4)) == 0) {
-		name->cipher = CRYPTO_SM4;
+	}  else if (strncmp(cipher, SM4_CBC, sizeof(SM4_CBC)) == 0) {
+		name->cipher = SM4_CBC;
+	} else if (strncmp(cipher, SM4_CTR, sizeof(SM4_CTR)) == 0) {
+		name->cipher = SM4_CTR;
 	} else if (strncmp(cipher, CRYPTO_RSA, sizeof(CRYPTO_RSA)) == 0) {
 		name->cipher = CRYPTO_RSA;
         assert(key2);
@@ -2208,9 +2212,12 @@ vbdev_crypto_claim(const char *bdev_name)
 			} else if (strcmp(name->cipher, AES_CTR) == 0) {
 				SPDK_NOTICELOG("OPENSSL using cipher: AES_CTR\n");
 				vbdev->cipher = AES_CTR;
-			} else if (strcmp(name->cipher, CRYPTO_SM4) == 0) {
-				SPDK_NOTICELOG("OPENSSL using cipher: SM4\n");
-				vbdev->cipher = CRYPTO_SM4;
+			} else if (strcmp(name->cipher, SM4_CBC) == 0) {
+				SPDK_NOTICELOG("OPENSSL using cipher: SM4_CBC\n");
+				vbdev->cipher = SM4_CBC;
+			} else if (strcmp(name->cipher, SM4_CTR) == 0) {
+				SPDK_NOTICELOG("OPENSSL using cipher: SM4_CTR\n");
+				vbdev->cipher = SM4_CTR;
 			} else {
 				SPDK_NOTICELOG("OPENSSL using cipher: RSA\n");
 				vbdev->cipher = CRYPTO_RSA;
@@ -2291,9 +2298,13 @@ vbdev_crypto_claim(const char *bdev_name)
                 vbdev->cipher_xform.cipher.key.data = vbdev->key;
                 vbdev->cipher_xform.cipher.algo = RTE_CRYPTO_CIPHER_AES_CTR;
                 vbdev->cipher_xform.cipher.key.length = AES_CTR_KEY_LENGTH;
-            } else if (strcmp(name->cipher, CRYPTO_SM4) == 0) {
+            } else if (strcmp(name->cipher, SM4_CBC) == 0) {
                 vbdev->cipher_xform.cipher.key.data = vbdev->key;
-                vbdev->cipher_xform.cipher.algo = RTE_CRYPTO_CIPHER_SM4;
+                vbdev->cipher_xform.cipher.algo = RTE_CRYPTO_CIPHER_SM4_CBC;
+                vbdev->cipher_xform.cipher.key.length = SM4_KEY_LENGTH;
+            } else if (strcmp(name->cipher, SM4_CTR) == 0) {
+                vbdev->cipher_xform.cipher.key.data = vbdev->key;
+                vbdev->cipher_xform.cipher.algo = RTE_CRYPTO_CIPHER_SM4_CTR;
                 vbdev->cipher_xform.cipher.key.length = SM4_KEY_LENGTH;
             } else {
                 vbdev->cipher_xform.cipher.key.data = vbdev->xts_key;

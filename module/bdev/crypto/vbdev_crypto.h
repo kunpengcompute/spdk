@@ -49,7 +49,8 @@
 #define AES_CBC "AES_CBC" /* QAT, AESNI_MB and OPENSSL*/
 #define AES_XTS "AES_XTS" /* QAT only */
 #define AES_CTR "AES_CTR" /* OPENSSL only */
-#define CRYPTO_SM4 "SM4" /* OPENSSL only */
+#define SM4_CBC "SM4_CBC" /* OPENSSL only */
+#define SM4_CTR "SM4_CTR" /* OPENSSL only */
 #define CRYPTO_RSA "RSA" /* OPENSSL only */
 
 #define RSA_NED "NED" /* OPENSSL only */
