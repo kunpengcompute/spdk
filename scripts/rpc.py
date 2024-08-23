@@ -289,7 +289,7 @@ if __name__ == "__main__":
 
     p = subparsers.add_parser('bdev_cryptodev_set_engine',
                                 help='Set crypto vdev engine')
-    p.add_argument('-e', '--engine-name', help='The engine, can be one of crypto_engine_kae', type=str)
+    p.add_argument('-e', '--engine-name', help='The engine should be crypto_engine_kae', type=str)
     p.set_defaults(func=bdev_cryptodev_set_engine)
 
 
