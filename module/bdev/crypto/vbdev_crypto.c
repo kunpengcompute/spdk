@@ -1772,7 +1772,7 @@ crypto_bdev_ch_destroy_cb(void *io_device, void *ctx_buf)
 static int
 vbdev_crypto_insert_name(const char *bdev_name, const char *vbdev_name,
 			 const char *crypto_pmd, const char *key,
-			 const char *cipher, const char *key2)
+			 const char *cipher, const char *key2, struct bdev_names **out)
 {
 	struct bdev_names *name;
 	int rc, j;
@@ -1893,6 +1893,7 @@ vbdev_crypto_insert_name(const char *bdev_name, const char *vbdev_name,
 	}
 
 	TAILQ_INSERT_TAIL(&g_bdev_names, name, link);
+	*out = name;
 
 	return 0;
 
@@ -1915,22 +1916,15 @@ error_alloc_bname:
 	return rc;
 }
 
-static void vbdev_crypto_delete_name(bdev_name)
+static void vbdev_crypto_delete_name(struct bdev_names *name)
 {
-    struct bdev_names *name;
-    TAILQ_FOREACH(name, &g_bdev_names, link)
-    {
-        if (strcmp(name->bdev_name, bdev_name) == 0) {
-            TAILQ_REMOVE(&g_bdev_names, name, link);
-            free(name->bdev_name);
-            free(name->vbdev_name);
-            free(name->drv_name);
-            free(name->key);
-            free(name->key2);
-            free(name);
-            break;
-        }
-    }
+	TAILQ_REMOVE(&g_bdev_names, name, link);
+	free(name->bdev_name);
+	free(name->vbdev_name);
+	free(name->drv_name);
+	free(name->key);
+	free(name->key2);
+	free(name);
 }
 
 /* RPC entry point for crypto creation. */
@@ -1940,8 +1934,9 @@ create_crypto_disk(const char *bdev_name, const char *vbdev_name,
 		   const char *cipher, const char *key2)
 {
 	int rc;
+	struct bdev_names *name;
 
-	rc = vbdev_crypto_insert_name(bdev_name, vbdev_name, crypto_pmd, key, cipher, key2);
+	rc = vbdev_crypto_insert_name(bdev_name, vbdev_name, crypto_pmd, key, cipher, key2, &name);
 	if (rc) {
 		return rc;
 	}
@@ -1952,7 +1947,7 @@ create_crypto_disk(const char *bdev_name, const char *vbdev_name,
 		rc = 0;
     } else if (rc != 0) {
         SPDK_NOTICELOG("vbdev creation disk delete name %s\n", bdev_name);
-        vbdev_crypto_delete_name(bdev_name);
+        vbdev_crypto_delete_name(name);
 	}
 
 	return rc;
