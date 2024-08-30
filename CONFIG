@@ -158,7 +158,7 @@ CONFIG_CUSTOMOCF=n
 CONFIG_ISAL=y
 
 # Build KSAL library
-CONFIG_KSAL=y
+CONFIG_KSAL=n
 
 # Build with IO_URING support
 CONFIG_URING=n
