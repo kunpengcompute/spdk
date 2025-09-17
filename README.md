@@ -1,239 +1,74 @@
-# Storage Performance Development Kit
+# 项目介绍<a name="ZH-CN_TOPIC_0000002442479380"></a>
 
-[![Build Status](https://travis-ci.org/spdk/spdk.svg?branch=master)](https://travis-ci.org/spdk/spdk)
+基于NVMe协议的SSD的出现后，软件路径成为IO瓶颈。SPDK是一个存储加速方案，是利用用户态、异步、轮询方式的NVMe驱动，用于加速NVMe SSD作为后端存储使用的应用软件的加速库。
 
-The Storage Performance Development Kit ([SPDK](http://www.spdk.io)) provides a set of tools
-and libraries for writing high performance, scalable, user-mode storage
-applications. It achieves high performance by moving all of the necessary
-drivers into userspace and operating in a polled mode instead of relying on
-interrupts, which avoids kernel context switches and eliminates interrupt
-handling overhead.
+本文档是对SPDK中加解密、压缩、CRC（Cyclic Redundancy Check）循环冗余校验特性进行说明，其中加解密、压缩特性是将加解密和压缩的计算卸载到鲲鹏处理器的KAE模块获取性能收益，CRC特性则是将SPDK中开源版本的CRC实现替换成自研的KSAL-CRC算法实现，存储加速算法库（简称KSAL）是华为自研的存储加速算法库，通过大数求余算法和配合鲲鹏向量化指令实现编码加速，相比开源版本的CRC算法性能提升20%以上。
 
-The development kit currently includes:
+# 版本说明<a name="ZH-CN_TOPIC_0000002442661242"></a>
 
-* [NVMe driver](http://www.spdk.io/doc/nvme.html)
-* [I/OAT (DMA engine) driver](http://www.spdk.io/doc/ioat.html)
-* [NVMe over Fabrics target](http://www.spdk.io/doc/nvmf.html)
-* [iSCSI target](http://www.spdk.io/doc/iscsi.html)
-* [vhost target](http://www.spdk.io/doc/vhost.html)
-* [Virtio-SCSI driver](http://www.spdk.io/doc/virtio.html)
+**表 1**  版本说明
 
-# In this readme
+<a name="table154016110243"></a>
+<table><thead align="left"><tr id="row74015192418"><th class="cellrowborder" valign="top" width="30.73%" id="mcps1.2.4.1.1"><p id="p12401515246"><a name="p12401515246"></a><a name="p12401515246"></a>鲲鹏SPDK</p>
+</th>
+<th class="cellrowborder" valign="top" width="27.16%" id="mcps1.2.4.1.2"><p id="p1340117112414"><a name="p1340117112414"></a><a name="p1340117112414"></a>开源SPDK</p>
+</th>
+<th class="cellrowborder" valign="top" width="42.11%" id="mcps1.2.4.1.3"><p id="p24012120244"><a name="p24012120244"></a><a name="p24012120244"></a>特性</p>
+</th>
+</tr>
+</thead>
+<tbody><tr id="row7401131102414"><td class="cellrowborder" valign="top" width="30.73%" headers="mcps1.2.4.1.1 "><p id="p184021011249"><a name="p184021011249"></a><a name="p184021011249"></a>spdk21.01.1-for-KAE</p>
+</td>
+<td class="cellrowborder" valign="top" width="27.16%" headers="mcps1.2.4.1.2 "><p id="p1240213132420"><a name="p1240213132420"></a><a name="p1240213132420"></a>spdk21.01.1</p>
+</td>
+<td class="cellrowborder" valign="top" width="42.11%" headers="mcps1.2.4.1.3 "><p id="p1040216111241"><a name="p1040216111241"></a><a name="p1040216111241"></a>加解密、压缩、CRC卸载到KAE</p>
+</td>
+</tr>
+</tbody>
+</table>
 
-* [Documentation](#documentation)
-* [Prerequisites](#prerequisites)
-* [Source Code](#source)
-* [Build](#libraries)
-* [Unit Tests](#tests)
-* [Vagrant](#vagrant)
-* [AWS](#aws)
-* [Advanced Build Options](#advanced)
-* [Shared libraries](#shared)
-* [Hugepages and Device Binding](#huge)
-* [Example Code](#examples)
-* [Contributing](#contributing)
+# 环境部署<a name="ZH-CN_TOPIC_0000002476179357"></a>
 
-<a id="documentation"></a>
-## Documentation
 
-[Doxygen API documentation](http://www.spdk.io/doc/) is available, as
-well as a [Porting Guide](http://www.spdk.io/doc/porting.html) for porting SPDK to different frameworks
-and operating systems.
 
-<a id="source"></a>
-## Source Code
+## 安装KAE<a name="ZH-CN_TOPIC_0000002442763790"></a>
 
-~~~{.sh}
-git clone https://github.com/spdk/spdk
-cd spdk
-git submodule update --init
-~~~
+安装KAE的步骤请参见鲲鹏社区《KAE使能SPDK特性指南》[安装KAE](https://www.hikunpeng.com/document/detail/zh/kunpengsdss/basicAccelFeatures/kaeebspdk/kunpengspdk_16_0011.html)章节。
 
-<a id="prerequisites"></a>
-## Prerequisites
+## 编译SPDK<a name="ZH-CN_TOPIC_0000002476203585"></a>
 
-The dependencies can be installed automatically by `scripts/pkgdep.sh`.
-The `scripts/pkgdep.sh` script will automatically install the bare minimum
-dependencies required to build SPDK.
-Use `--help` to see information on installing dependencies for optional components
+编译SPDK步骤请参见鲲鹏社区《KAE使能SPDK特性指南》[编译SPDK](https://www.hikunpeng.com/document/detail/zh/kunpengsdss/basicAccelFeatures/kaeebspdk/kunpengspdk_16_0012.html)章节。
 
-~~~{.sh}
-./scripts/pkgdep.sh
-~~~
+# 快速上手<a name="ZH-CN_TOPIC_0000002442899470"></a>
 
-<a id="libraries"></a>
-## Build
 
-Linux:
 
-~~~{.sh}
-./configure
-make
-~~~
 
-FreeBSD:
-Note: Make sure you have the matching kernel source in /usr/src/ and
-also note that CONFIG_COVERAGE option is not available right now
-for FreeBSD builds.
+## 上手SPDK加解密特性<a name="ZH-CN_TOPIC_0000002476253209"></a>
 
-~~~{.sh}
-./configure
-gmake
-~~~
+通过使能SPDK，再做相应的加解密设置，具体步骤请参见[使用SPDK加解密特性](https://www.hikunpeng.com/document/detail/zh/kunpengsdss/basicAccelFeatures/kaeebspdk/kunpengspdk_16_0014.html)。
 
-<a id="tests"></a>
-## Unit Tests
+## 上手SPDK压缩特性<a name="ZH-CN_TOPIC_0000002442773242"></a>
 
-~~~{.sh}
-./test/unit/unittest.sh
-~~~
+通过使能SPDK，再做相应的解压缩设置，具体步骤请参见[使用SPDK压缩特性](https://www.hikunpeng.com/document/detail/zh/kunpengsdss/basicAccelFeatures/kaeebspdk/kunpengspdk_16_0015.html)。
 
-You will see several error messages when running the unit tests, but they are
-part of the test suite. The final message at the end of the script indicates
-success or failure.
+## 上手SPDK CRC特性<a name="ZH-CN_TOPIC_0000002476213025"></a>
 
-<a id="vagrant"></a>
-## Vagrant
+通过使能SPDK，再做相应的CRC设置，具体步骤请参见[使用SPDK CRC特性](https://www.hikunpeng.com/document/detail/zh/kunpengsdss/basicAccelFeatures/kaeebspdk/kunpengspdk_16_0016.html)。
 
-A [Vagrant](https://www.vagrantup.com/downloads.html) setup is also provided
-to create a Linux VM with a virtual NVMe controller to get up and running
-quickly.  Currently this has been tested on MacOS, Ubuntu 16.04.2 LTS and
-Ubuntu 18.04.3 LTS with the VirtualBox and Libvirt provider.
-The [VirtualBox Extension Pack](https://www.virtualbox.org/wiki/Downloads)
-or [Vagrant Libvirt] (https://github.com/vagrant-libvirt/vagrant-libvirt) must
-also be installed in order to get the required NVMe support.
+# 贡献指南<a name="ZH-CN_TOPIC_0000002442739574"></a>
 
-Details on the Vagrant setup can be found in the
-[SPDK Vagrant documentation](http://spdk.io/doc/vagrant.html).
+如果使用过程中有任何问题，或者需要反馈特性需求和bug报告，可以提交issues联系我们，具体贡献方法可参考[这里](https://gitcode.com/boostkit/community/blob/master/docs/contributor/contributing.md)。
 
-<a id="aws"></a>
-## AWS
+# 免责声明<a name="ZH-CN_TOPIC_0000002442916578"></a>
 
-The following setup is known to work on AWS:
-Image: Ubuntu 18.04
-Before running  `setup.sh`, run `modprobe vfio-pci`
-then: `DRIVER_OVERRIDE=vfio-pci ./setup.sh`
+此代码仓计划参与SPDK软件开源，仅作SPDK功能扩展/SPDK性能提升，编码风格遵照原生开源软件，继承原生开源软件安全设计，不破坏原生开源软件设计及编码风格和方式，软件的任何漏洞与安全问题，均由相应的上游社区根据其漏洞和安全响应机制解决。请密切关注上游社区发布的通知和版本更新。鲲鹏计算社区对软件的漏洞及安全问题不承担任何责任。
 
-<a id="advanced"></a>
-## Advanced Build Options
+# 许可证书<a name="ZH-CN_TOPIC_0000002476196473"></a>
 
-Optional components and other build-time configuration are controlled by
-settings in the Makefile configuration file in the root of the repository. `CONFIG`
-contains the base settings for the `configure` script. This script generates a new
-file, `mk/config.mk`, that contains final build settings. For advanced configuration,
-there are a number of additional options to `configure` that may be used, or
-`mk/config.mk` can simply be created and edited by hand. A description of all
-possible options is located in `CONFIG`.
+BSD LICENSE
 
-Boolean (on/off) options are configured with a 'y' (yes) or 'n' (no). For
-example, this line of `CONFIG` controls whether the optional RDMA (libibverbs)
-support is enabled:
+# 参考文档<a name="ZH-CN_TOPIC_0000002476236681"></a>
 
-	CONFIG_RDMA?=n
+鲲鹏社区分布式存储：[KAE使能SPDK特性指南](https://www.hikunpeng.com/document/detail/zh/kunpengsdss/basicAccelFeatures/kaeebspdk/kunpengspdk_16_0005.html)。
 
-To enable RDMA, this line may be added to `mk/config.mk` with a 'y' instead of
-'n'. For the majority of options this can be done using the `configure` script.
-For example:
-
-~~~{.sh}
-./configure --with-rdma
-~~~
-
-Additionally, `CONFIG` options may also be overridden on the `make` command
-line:
-
-~~~{.sh}
-make CONFIG_RDMA=y
-~~~
-
-Users may wish to use a version of DPDK different from the submodule included
-in the SPDK repository.  Note, this includes the ability to build not only
-from DPDK sources, but also just with the includes and libraries
-installed via the dpdk and dpdk-devel packages.  To specify an alternate DPDK
-installation, run configure with the --with-dpdk option.  For example:
-
-Linux:
-
-~~~{.sh}
-./configure --with-dpdk=/path/to/dpdk/x86_64-native-linuxapp-gcc
-make
-~~~
-
-FreeBSD:
-
-~~~{.sh}
-./configure --with-dpdk=/path/to/dpdk/x86_64-native-bsdapp-clang
-gmake
-~~~
-
-The options specified on the `make` command line take precedence over the
-values in `mk/config.mk`. This can be useful if you, for example, generate
-a `mk/config.mk` using the `configure` script and then have one or two
-options (i.e. debug builds) that you wish to turn on and off frequently.
-
-<a id="shared"></a>
-## Shared libraries
-
-By default, the build of the SPDK yields static libraries against which
-the SPDK applications and examples are linked.
-Configure option `--with-shared` provides the ability to produce SPDK shared
-libraries, in addition to the default static ones.  Use of this flag also
-results in the SPDK executables linked to the shared versions of libraries.
-SPDK shared libraries by default, are located in `./build/lib`.  This includes
-the single SPDK shared lib encompassing all of the SPDK static libs
-(`libspdk.so`) as well as individual SPDK shared libs corresponding to each
-of the SPDK static ones.
-
-In order to start a SPDK app linked with SPDK shared libraries, make sure
-to do the following steps:
-
-- run ldconfig specifying the directory containing SPDK shared libraries
-- provide proper `LD_LIBRARY_PATH`
-
-If DPDK shared libraries are used, you may also need to add DPDK shared
-libraries to `LD_LIBRARY_PATH`
-
-Linux:
-
-~~~{.sh}
-./configure --with-shared
-make
-ldconfig -v -n ./build/lib
-LD_LIBRARY_PATH=./build/lib/:./dpdk/build/lib/ ./build/bin/spdk_tgt
-~~~
-
-<a id="huge"></a>
-## Hugepages and Device Binding
-
-Before running an SPDK application, some hugepages must be allocated and
-any NVMe and I/OAT devices must be unbound from the native kernel drivers.
-SPDK includes a script to automate this process on both Linux and FreeBSD.
-This script should be run as root.
-
-~~~{.sh}
-sudo scripts/setup.sh
-~~~
-
-Users may wish to configure a specific memory size. Below is an example of
-configuring 8192MB memory.
-
-~~~{.sh}
-sudo HUGEMEM=8192 scripts/setup.sh
-~~~
-
-<a id="examples"></a>
-## Example Code
-
-Example code is located in the examples directory. The examples are compiled
-automatically as part of the build process. Simply call any of the examples
-with no arguments to see the help output. You'll likely need to run the examples
-as a privileged user (root) unless you've done additional configuration
-to grant your user permission to allocate huge pages and map devices through
-vfio.
-
-<a id="contributing"></a>
-## Contributing
-
-For additional details on how to get more involved in the community, including
-[contributing code](http://www.spdk.io/development) and participating in discussions and other activities, please
-refer to [spdk.io](http://www.spdk.io/community)
