@@ -1,0 +1,1247 @@
+diff --git a/include/spdk_internal/l0.h b/include/spdk_internal/l0.h
+new file mode 100644
+index 000000000..7d4b9ef8c
+--- /dev/null
++++ b/include/spdk_internal/l0.h
+@@ -0,0 +1,30 @@
++/*   SPDX-License-Identifier: BSD-3-Clause
++ *   Copyright (C) 2026.
++ *   All rights reserved.
++ */
++
++#ifndef SPDK_INTERNAL_L0_H
++#define SPDK_INTERNAL_L0_H
++
++#include "spdk/stdinc.h"
++#include "spdk/env.h"
++
++struct spdk_l0_region;
++
++bool spdk_l0_data_pool_enabled(void);
++
++struct spdk_l0_region *spdk_l0_region_create(const char *name, size_t len);
++void spdk_l0_region_destroy(struct spdk_l0_region *region);
++
++bool spdk_l0_find_region(const void *addr, struct spdk_l0_region **region, uint64_t *offset);
++uint64_t spdk_l0_vtophys(const void *buf, uint64_t *size);
++
++void *spdk_l0_region_base(struct spdk_l0_region *region);
++size_t spdk_l0_region_len(struct spdk_l0_region *region);
++uint64_t spdk_l0_region_phys(struct spdk_l0_region *region);
++int spdk_l0_region_fd(struct spdk_l0_region *region);
++
++struct spdk_mempool *spdk_l0_mempool_create(const char *name, size_t count,
++		size_t ele_size, spdk_mempool_obj_cb_t *obj_init, void *obj_init_arg);
++
++#endif
+diff --git a/lib/env_dpdk/Makefile b/lib/env_dpdk/Makefile
+index 32d5f0a7e..51035a48c 100644
+--- a/lib/env_dpdk/Makefile
++++ b/lib/env_dpdk/Makefile
+@@ -10,7 +10,7 @@ SO_VER := 11
+ SO_MINOR := 0
+ 
+ CFLAGS += $(ENV_CFLAGS)
+-C_SRCS = env.c memory.c pci.c init.c threads.c
++C_SRCS = env.c memory.c pci.c init.c threads.c l0.c l0_mmap_platform.c
+ C_SRCS += pci_ioat.c pci_virtio.c pci_vmd.c pci_idxd.c
+ C_SRCS += pci_event.c sigbus_handler.c pci_dpdk.c
+ C_SRCS += pci_dpdk_2207.c pci_dpdk_2211.c
+diff --git a/lib/env_dpdk/env.c b/lib/env_dpdk/env.c
+index b6b8135b8..072683d95 100644
+--- a/lib/env_dpdk/env.c
++++ b/lib/env_dpdk/env.c
+@@ -10,6 +10,8 @@
+ #include "spdk/log.h"
+ 
+ #include "env_internal.h"
++#include "spdk_internal/l0.h"
++#include "spdk_internal/assert.h"
+ 
+ #include <rte_config.h>
+ #include <rte_cycles.h>
+@@ -18,6 +20,8 @@
+ #include <rte_memzone.h>
+ #include <rte_version.h>
+ 
++#define SPDK_L0_MEMPOOL_REGION_ALIGN (2ULL * 1024ULL * 1024ULL)
++
+ static uint64_t
+ virt_to_phys(void *vaddr)
+ {
+@@ -31,6 +35,99 @@ virt_to_phys(void *vaddr)
+ 	return spdk_vtophys(vaddr, NULL);
+ }
+ 
++static size_t
++l0_mempool_align_up(size_t value, size_t align)
++{
++	assert(align != 0);
++	return (value + align - 1) & ~(align - 1);
++}
++
++enum spdk_mempool_backend {
++	SPDK_MEMPOOL_BACKEND_DPDK = 0,
++	SPDK_MEMPOOL_BACKEND_L0,
++};
++
++struct spdk_mempool {
++	enum spdk_mempool_backend	backend;
++	char				*name;
++	TAILQ_ENTRY(spdk_mempool)	link;
++};
++
++struct spdk_dpdk_mempool {
++	struct spdk_mempool	base;
++	struct rte_mempool	*mp;
++};
++
++struct spdk_l0_mempool {
++	struct spdk_mempool	base;
++	struct spdk_l0_region	*region;
++	size_t			count;
++	size_t			ele_size;
++	size_t			free_count;
++	void			**free_list;
++	pthread_mutex_t		mutex;
++};
++
++static TAILQ_HEAD(, spdk_mempool) g_spdk_mempools = TAILQ_HEAD_INITIALIZER(g_spdk_mempools);
++static pthread_mutex_t g_spdk_mempools_mutex = PTHREAD_MUTEX_INITIALIZER;
++
++static struct spdk_dpdk_mempool *
++mempool_to_dpdk(struct spdk_mempool *mp)
++{
++	assert(mp->backend == SPDK_MEMPOOL_BACKEND_DPDK);
++	return SPDK_CONTAINEROF(mp, struct spdk_dpdk_mempool, base);
++}
++
++static struct spdk_l0_mempool *
++mempool_to_l0(struct spdk_mempool *mp)
++{
++	assert(mp->backend == SPDK_MEMPOOL_BACKEND_L0);
++	return SPDK_CONTAINEROF(mp, struct spdk_l0_mempool, base);
++}
++
++static struct spdk_mempool *
++mempool_find_locked(const char *name)
++{
++	struct spdk_mempool *mp;
++
++	TAILQ_FOREACH(mp, &g_spdk_mempools, link) {
++		if (strcmp(mp->name, name) == 0) {
++			return mp;
++		}
++	}
++
++	return NULL;
++}
++
++static int
++mempool_register(struct spdk_mempool *mp, const char *name)
++{
++	pthread_mutex_lock(&g_spdk_mempools_mutex);
++	if (mempool_find_locked(name) != NULL) {
++		pthread_mutex_unlock(&g_spdk_mempools_mutex);
++		return -EEXIST;
++	}
++
++	mp->name = strdup(name);
++	if (mp->name == NULL) {
++		pthread_mutex_unlock(&g_spdk_mempools_mutex);
++		return -ENOMEM;
++	}
++
++	TAILQ_INSERT_TAIL(&g_spdk_mempools, mp, link);
++	pthread_mutex_unlock(&g_spdk_mempools_mutex);
++	return 0;
++}
++
++static void
++mempool_unregister(struct spdk_mempool *mp)
++{
++	pthread_mutex_lock(&g_spdk_mempools_mutex);
++	TAILQ_REMOVE(&g_spdk_mempools, mp, link);
++	pthread_mutex_unlock(&g_spdk_mempools_mutex);
++	free(mp->name);
++}
++
+ void *
+ spdk_malloc(size_t size, size_t align, uint64_t *phys_addr, int socket_id, uint32_t flags)
+ {
+@@ -194,8 +291,10 @@ spdk_mempool_create_ctor(const char *name, size_t count,
+ 			 size_t ele_size, size_t cache_size, int socket_id,
+ 			 spdk_mempool_obj_cb_t *obj_init, void *obj_init_arg)
+ {
++	struct spdk_dpdk_mempool *wrapper;
+ 	struct rte_mempool *mp;
+ 	size_t tmp;
++	int rc;
+ 
+ 	if (socket_id == SPDK_ENV_SOCKET_ID_ANY) {
+ 		socket_id = SOCKET_ID_ANY;
+@@ -212,10 +311,34 @@ spdk_mempool_create_ctor(const char *name, size_t count,
+ 	}
+ 
+ 	mp = rte_mempool_create(name, count, ele_size, cache_size,
+-				0, NULL, NULL, (rte_mempool_obj_cb_t *)obj_init, obj_init_arg,
++				0, NULL, NULL, NULL, NULL,
+ 				socket_id, 0);
++	if (mp == NULL) {
++		return NULL;
++	}
++
++	wrapper = calloc(1, sizeof(*wrapper));
++	if (wrapper == NULL) {
++		rte_mempool_free(mp);
++		return NULL;
++	}
++
++	wrapper->base.backend = SPDK_MEMPOOL_BACKEND_DPDK;
++	wrapper->mp = mp;
++
++	rc = mempool_register(&wrapper->base, name);
++	if (rc != 0) {
++		rte_mempool_free(mp);
++		free(wrapper);
++		errno = -rc;
++		return NULL;
++	}
++
++	if (obj_init != NULL) {
++		spdk_mempool_obj_iter(&wrapper->base, obj_init, obj_init_arg);
++	}
+ 
+-	return (struct spdk_mempool *)mp;
++	return &wrapper->base;
+ }
+ 
+ 
+@@ -227,64 +350,260 @@ spdk_mempool_create(const char *name, size_t count,
+ 					NULL, NULL);
+ }
+ 
++struct spdk_mempool *
++spdk_l0_mempool_create(const char *name, size_t count,
++		       size_t ele_size, spdk_mempool_obj_cb_t *obj_init, void *obj_init_arg)
++{
++	struct spdk_l0_mempool *mp;
++	struct spdk_l0_region *region;
++	size_t total_len, aligned_total_len, i;
++	int rc;
++
++	if (count == 0 || ele_size == 0) {
++		errno = EINVAL;
++		return NULL;
++	}
++
++	if (count > SIZE_MAX / ele_size) {
++		errno = EOVERFLOW;
++		return NULL;
++	}
++
++	total_len = count * ele_size;
++	if (total_len > SIZE_MAX - (SPDK_L0_MEMPOOL_REGION_ALIGN - 1)) {
++		errno = EOVERFLOW;
++		return NULL;
++	}
++
++	aligned_total_len = l0_mempool_align_up(total_len, SPDK_L0_MEMPOOL_REGION_ALIGN);
++	region = spdk_l0_region_create(name, aligned_total_len);
++	if (region == NULL) {
++		return NULL;
++	}
++
++	mp = calloc(1, sizeof(*mp));
++	if (mp == NULL) {
++		spdk_l0_region_destroy(region);
++		return NULL;
++	}
++
++	mp->free_list = calloc(count, sizeof(void *));
++	if (mp->free_list == NULL) {
++		free(mp);
++		spdk_l0_region_destroy(region);
++		return NULL;
++	}
++
++	mp->base.backend = SPDK_MEMPOOL_BACKEND_L0;
++	mp->region = region;
++	mp->count = count;
++	mp->ele_size = ele_size;
++	mp->free_count = count;
++	pthread_mutex_init(&mp->mutex, NULL);
++
++	rc = mempool_register(&mp->base, name);
++	if (rc != 0) {
++		pthread_mutex_destroy(&mp->mutex);
++		free(mp->free_list);
++		free(mp);
++		spdk_l0_region_destroy(region);
++		errno = -rc;
++		return NULL;
++	}
++
++	for (i = 0; i < count; i++) {
++		void *obj = (char *)spdk_l0_region_base(region) + (i * ele_size);
++
++		mp->free_list[count - i - 1] = obj;
++		if (obj_init != NULL) {
++			obj_init(&mp->base, obj_init_arg, obj, i);
++		}
++	}
++
++	return &mp->base;
++}
++
+ char *
+ spdk_mempool_get_name(struct spdk_mempool *mp)
+ {
+-	return ((struct rte_mempool *)mp)->name;
++	return mp->name;
+ }
+ 
+ void
+ spdk_mempool_free(struct spdk_mempool *mp)
+ {
+-	rte_mempool_free((struct rte_mempool *)mp);
++	if (mp == NULL) {
++		return;
++	}
++
++	mempool_unregister(mp);
++
++	if (mp->backend == SPDK_MEMPOOL_BACKEND_DPDK) {
++		struct spdk_dpdk_mempool *dpdk_mp = mempool_to_dpdk(mp);
++
++		rte_mempool_free(dpdk_mp->mp);
++		free(dpdk_mp);
++		return;
++	}
++
++	if (mp->backend == SPDK_MEMPOOL_BACKEND_L0) {
++		struct spdk_l0_mempool *l0_mp = mempool_to_l0(mp);
++
++		pthread_mutex_destroy(&l0_mp->mutex);
++		free(l0_mp->free_list);
++		spdk_l0_region_destroy(l0_mp->region);
++		free(l0_mp);
++		return;
++	}
++
++	SPDK_UNREACHABLE();
+ }
+ 
+ void *
+ spdk_mempool_get(struct spdk_mempool *mp)
+ {
++	struct spdk_l0_mempool *l0_mp;
+ 	void *ele = NULL;
+ 	int rc;
+ 
+-	rc = rte_mempool_get((struct rte_mempool *)mp, &ele);
+-	if (rc != 0) {
+-		return NULL;
++	if (mp->backend == SPDK_MEMPOOL_BACKEND_DPDK) {
++		rc = rte_mempool_get(mempool_to_dpdk(mp)->mp, &ele);
++		if (rc != 0) {
++			return NULL;
++		}
++		return ele;
+ 	}
++
++	l0_mp = mempool_to_l0(mp);
++	pthread_mutex_lock(&l0_mp->mutex);
++	if (l0_mp->free_count > 0) {
++		ele = l0_mp->free_list[--l0_mp->free_count];
++	}
++	pthread_mutex_unlock(&l0_mp->mutex);
++
+ 	return ele;
+ }
+ 
+ int
+ spdk_mempool_get_bulk(struct spdk_mempool *mp, void **ele_arr, size_t count)
+ {
+-	return rte_mempool_get_bulk((struct rte_mempool *)mp, ele_arr, count);
++	struct spdk_l0_mempool *l0_mp;
++	size_t i;
++
++	if (mp->backend == SPDK_MEMPOOL_BACKEND_DPDK) {
++		return rte_mempool_get_bulk(mempool_to_dpdk(mp)->mp, ele_arr, count);
++	}
++
++	l0_mp = mempool_to_l0(mp);
++	pthread_mutex_lock(&l0_mp->mutex);
++	if (l0_mp->free_count < count) {
++		pthread_mutex_unlock(&l0_mp->mutex);
++		return -1;
++	}
++
++	for (i = 0; i < count; i++) {
++		ele_arr[i] = l0_mp->free_list[--l0_mp->free_count];
++	}
++	pthread_mutex_unlock(&l0_mp->mutex);
++	return 0;
+ }
+ 
+ void
+ spdk_mempool_put(struct spdk_mempool *mp, void *ele)
+ {
+-	rte_mempool_put((struct rte_mempool *)mp, ele);
++	struct spdk_l0_mempool *l0_mp;
++
++	if (mp->backend == SPDK_MEMPOOL_BACKEND_DPDK) {
++		rte_mempool_put(mempool_to_dpdk(mp)->mp, ele);
++		return;
++	}
++
++	l0_mp = mempool_to_l0(mp);
++	pthread_mutex_lock(&l0_mp->mutex);
++	assert(l0_mp->free_count < l0_mp->count);
++	l0_mp->free_list[l0_mp->free_count++] = ele;
++	pthread_mutex_unlock(&l0_mp->mutex);
+ }
+ 
+ void
+ spdk_mempool_put_bulk(struct spdk_mempool *mp, void **ele_arr, size_t count)
+ {
+-	rte_mempool_put_bulk((struct rte_mempool *)mp, ele_arr, count);
++	struct spdk_l0_mempool *l0_mp;
++	size_t i;
++
++	if (mp->backend == SPDK_MEMPOOL_BACKEND_DPDK) {
++		rte_mempool_put_bulk(mempool_to_dpdk(mp)->mp, ele_arr, count);
++		return;
++	}
++
++	l0_mp = mempool_to_l0(mp);
++	pthread_mutex_lock(&l0_mp->mutex);
++	assert(l0_mp->free_count + count <= l0_mp->count);
++	for (i = 0; i < count; i++) {
++		l0_mp->free_list[l0_mp->free_count++] = ele_arr[i];
++	}
++	pthread_mutex_unlock(&l0_mp->mutex);
+ }
+ 
+ size_t
+ spdk_mempool_count(const struct spdk_mempool *pool)
+ {
+-	return rte_mempool_avail_count((struct rte_mempool *)pool);
++	struct spdk_l0_mempool *l0_mp;
++	size_t count;
++
++	if (pool->backend == SPDK_MEMPOOL_BACKEND_DPDK) {
++		return rte_mempool_avail_count(((const struct spdk_dpdk_mempool *)pool)->mp);
++	}
++
++	l0_mp = SPDK_CONTAINEROF(pool, struct spdk_l0_mempool, base);
++	pthread_mutex_lock(&l0_mp->mutex);
++	count = l0_mp->free_count;
++	pthread_mutex_unlock(&l0_mp->mutex);
++	return count;
++}
++
++struct env_mempool_obj_iter_ctx {
++	struct spdk_mempool *mp;
++	spdk_mempool_obj_cb_t *user_cb;
++	void *user_arg;
++};
++
++static void
++mempool_obj_iter_remap(struct rte_mempool *rte_mp, void *opaque, void *obj,
++		       unsigned obj_idx)
++{
++	struct env_mempool_obj_iter_ctx *ctx = opaque;
++
++	(void)rte_mp;
++	ctx->user_cb(ctx->mp, ctx->user_arg, obj, obj_idx);
+ }
+ 
+ uint32_t
+ spdk_mempool_obj_iter(struct spdk_mempool *mp, spdk_mempool_obj_cb_t obj_cb,
+ 		      void *obj_cb_arg)
+ {
+-	return rte_mempool_obj_iter((struct rte_mempool *)mp, (rte_mempool_obj_cb_t *)obj_cb,
+-				    obj_cb_arg);
++	struct spdk_l0_mempool *l0_mp;
++	struct env_mempool_obj_iter_ctx ctx;
++	uint32_t i;
++
++	if (mp->backend == SPDK_MEMPOOL_BACKEND_DPDK) {
++		ctx.mp = mp;
++		ctx.user_cb = obj_cb;
++		ctx.user_arg = obj_cb_arg;
++		return rte_mempool_obj_iter(mempool_to_dpdk(mp)->mp, mempool_obj_iter_remap, &ctx);
++	}
++
++	l0_mp = mempool_to_l0(mp);
++	for (i = 0; i < l0_mp->count; i++) {
++		void *obj = (char *)spdk_l0_region_base(l0_mp->region) + ((size_t)i * l0_mp->ele_size);
++		obj_cb(mp, obj_cb_arg, obj, i);
++	}
++
++	return (uint32_t)l0_mp->count;
+ }
+ 
+ struct env_mempool_mem_iter_ctx {
++	struct spdk_mempool *mp;
+ 	spdk_mempool_mem_cb_t *user_cb;
+ 	void *user_arg;
+ };
+@@ -295,7 +614,8 @@ mempool_mem_iter_remap(struct rte_mempool *mp, void *opaque, struct rte_mempool_
+ {
+ 	struct env_mempool_mem_iter_ctx *ctx = opaque;
+ 
+-	ctx->user_cb((struct spdk_mempool *)mp, ctx->user_arg, memhdr->addr, memhdr->iova, memhdr->len,
++	(void)mp;
++	ctx->user_cb(ctx->mp, ctx->user_arg, memhdr->addr, memhdr->iova, memhdr->len,
+ 		     mem_idx);
+ }
+ 
+@@ -304,17 +624,31 @@ spdk_mempool_mem_iter(struct spdk_mempool *mp, spdk_mempool_mem_cb_t mem_cb,
+ 		      void *mem_cb_arg)
+ {
+ 	struct env_mempool_mem_iter_ctx ctx = {
++		.mp = mp,
+ 		.user_cb = mem_cb,
+ 		.user_arg = mem_cb_arg
+ 	};
+ 
+-	return rte_mempool_mem_iter((struct rte_mempool *)mp, mempool_mem_iter_remap, &ctx);
++	if (mp->backend == SPDK_MEMPOOL_BACKEND_DPDK) {
++		return rte_mempool_mem_iter(mempool_to_dpdk(mp)->mp, mempool_mem_iter_remap, &ctx);
++	}
++
++	mem_cb(mp, mem_cb_arg, spdk_l0_region_base(mempool_to_l0(mp)->region),
++	       spdk_l0_region_phys(mempool_to_l0(mp)->region),
++	       spdk_l0_region_len(mempool_to_l0(mp)->region), 0);
++	return 1;
+ }
+ 
+ struct spdk_mempool *
+ spdk_mempool_lookup(const char *name)
+ {
+-	return (struct spdk_mempool *)rte_mempool_lookup(name);
++	struct spdk_mempool *mp;
++
++	pthread_mutex_lock(&g_spdk_mempools_mutex);
++	mp = mempool_find_locked(name);
++	pthread_mutex_unlock(&g_spdk_mempools_mutex);
++
++	return mp;
+ }
+ 
+ bool
+diff --git a/lib/env_dpdk/l0.c b/lib/env_dpdk/l0.c
+new file mode 100644
+index 000000000..2fb77c263
+--- /dev/null
++++ b/lib/env_dpdk/l0.c
+@@ -0,0 +1,257 @@
++/*   SPDX-License-Identifier: BSD-3-Clause
++ *   Copyright (C) 2026.
++ *   All rights reserved.
++ */
++
++#include "spdk/stdinc.h"
++#include "spdk/env.h"
++#include "spdk/log.h"
++#include "spdk_internal/l0.h"
++
++#define SPDK_L0_MAX_BYTES (64ULL * 1024ULL * 1024ULL)
++
++struct spdk_l0_region {
++	TAILQ_ENTRY(spdk_l0_region)	link;
++	char				*name;
++	void				*vaddr;
++	size_t				len;
++	uint64_t			phys_addr;
++	int				fd;
++};
++
++static TAILQ_HEAD(, spdk_l0_region) g_l0_regions = TAILQ_HEAD_INITIALIZER(g_l0_regions);
++static pthread_mutex_t g_l0_mutex = PTHREAD_MUTEX_INITIALIZER;
++
++int get_l0_fd(void);
++void *mmap_alloc(unsigned long size, int fd);
++unsigned long long vtop(unsigned long long addr);
++
++static bool
++l0_env_flag_enabled(const char *name)
++{
++	const char *value;
++
++	value = getenv(name);
++	if (value == NULL) {
++		return false;
++	}
++
++	return strcasecmp(value, "1") == 0 ||
++	       strcasecmp(value, "y") == 0 ||
++	       strcasecmp(value, "yes") == 0 ||
++	       strcasecmp(value, "true") == 0 ||
++	       strcasecmp(value, "on") == 0;
++}
++
++bool
++spdk_l0_data_pool_enabled(void)
++{
++	return l0_env_flag_enabled("SPDK_NVMF_L0_ENABLE");
++}
++
++static struct spdk_l0_region *
++l0_find_region_locked(const void *addr, uint64_t *offset)
++{
++	struct spdk_l0_region *region;
++	uintptr_t value = (uintptr_t)addr;
++	uintptr_t start, end;
++
++	TAILQ_FOREACH(region, &g_l0_regions, link) {
++		start = (uintptr_t)region->vaddr;
++		end = start + region->len;
++		if (value >= start && value < end) {
++			if (offset != NULL) {
++				*offset = value - start;
++			}
++			return region;
++		}
++	}
++
++	return NULL;
++}
++
++struct spdk_l0_region *
++spdk_l0_region_create(const char *name, size_t len)
++{
++	struct spdk_l0_region *region;
++	const char *device_path;
++	unsigned long long phys_addr;
++	void *vaddr;
++	int fd;
++
++	if (len == 0) {
++		errno = EINVAL;
++		return NULL;
++	}
++
++	if (len > SPDK_L0_MAX_BYTES) {
++		SPDK_ERRLOG("Requested L0 pool size %zu exceeds 64MiB limit\n", len);
++		errno = ENOMEM;
++		return NULL;
++	}
++
++	pthread_mutex_lock(&g_l0_mutex);
++	if (!TAILQ_EMPTY(&g_l0_regions)) {
++		pthread_mutex_unlock(&g_l0_mutex);
++		SPDK_ERRLOG("Only one L0 region is supported by this patch\n");
++		errno = EBUSY;
++		return NULL;
++	}
++	pthread_mutex_unlock(&g_l0_mutex);
++
++	fd = get_l0_fd();
++	if (fd < 0) {
++		device_path = getenv("SPDK_NVMF_L0_DEVICE");
++		if (device_path == NULL || device_path[0] == '\0') {
++			SPDK_ERRLOG("L0 fd getter is unavailable and SPDK_NVMF_L0_DEVICE is not set\n");
++			errno = EINVAL;
++			return NULL;
++		}
++
++		fd = open(device_path, O_RDWR | O_CLOEXEC);
++		if (fd < 0) {
++			SPDK_ERRLOG("Failed to open L0 device %s: %s\n", device_path, strerror(errno));
++			return NULL;
++		}
++	}
++
++	vaddr = mmap_alloc(len, fd);
++	if (vaddr == NULL || vaddr == MAP_FAILED) {
++		SPDK_ERRLOG("mmap_alloc(%zu) failed: %s\n", len, strerror(errno));
++		close(fd);
++		return NULL;
++	}
++
++	memset(vaddr, 0, len);
++
++	phys_addr = vtop((unsigned long long)(uintptr_t)vaddr);
++	if (phys_addr == SPDK_VTOPHYS_ERROR) {
++		SPDK_ERRLOG("vtop(%p) failed for L0 region\n", vaddr);
++		munmap(vaddr, len);
++		close(fd);
++		errno = EFAULT;
++		return NULL;
++	}
++
++	region = calloc(1, sizeof(*region));
++	if (region == NULL) {
++		munmap(vaddr, len);
++		close(fd);
++		return NULL;
++	}
++
++	region->name = strdup(name);
++	if (region->name == NULL) {
++		free(region);
++		munmap(vaddr, len);
++		close(fd);
++		return NULL;
++	}
++
++	region->vaddr = vaddr;
++	region->len = len;
++	region->phys_addr = phys_addr;
++	region->fd = fd;
++
++	if (spdk_mem_register(region->vaddr, region->len) != 0) {
++		SPDK_ERRLOG("spdk_mem_register(%p, %zu) failed for L0 region\n",
++			    region->vaddr, region->len);
++		free(region->name);
++		free(region);
++		munmap(vaddr, len);
++		close(fd);
++		return NULL;
++	}
++
++	pthread_mutex_lock(&g_l0_mutex);
++	TAILQ_INSERT_TAIL(&g_l0_regions, region, link);
++	pthread_mutex_unlock(&g_l0_mutex);
++
++	SPDK_NOTICELOG("Allocated L0 region %s vaddr=%p phys=0x%" PRIx64 " len=%zu\n",
++		       region->name, region->vaddr, region->phys_addr, region->len);
++	return region;
++}
++
++void
++spdk_l0_region_destroy(struct spdk_l0_region *region)
++{
++	if (region == NULL) {
++		return;
++	}
++
++	pthread_mutex_lock(&g_l0_mutex);
++	TAILQ_REMOVE(&g_l0_regions, region, link);
++	pthread_mutex_unlock(&g_l0_mutex);
++
++	if (spdk_mem_unregister(region->vaddr, region->len) != 0) {
++		SPDK_ERRLOG("spdk_mem_unregister(%p, %zu) failed for L0 region\n",
++			    region->vaddr, region->len);
++	}
++
++	munmap(region->vaddr, region->len);
++	if (region->fd >= 0) {
++		close(region->fd);
++	}
++	free(region->name);
++	free(region);
++}
++
++bool
++spdk_l0_find_region(const void *addr, struct spdk_l0_region **region, uint64_t *offset)
++{
++	struct spdk_l0_region *tmp;
++
++	pthread_mutex_lock(&g_l0_mutex);
++	tmp = l0_find_region_locked(addr, offset);
++	pthread_mutex_unlock(&g_l0_mutex);
++
++	if (region != NULL) {
++		*region = tmp;
++	}
++
++	return tmp != NULL;
++}
++
++uint64_t
++spdk_l0_vtophys(const void *buf, uint64_t *size)
++{
++	struct spdk_l0_region *region;
++	uint64_t offset = 0;
++
++	pthread_mutex_lock(&g_l0_mutex);
++	region = l0_find_region_locked(buf, &offset);
++	if (region != NULL && size != NULL) {
++		*size = region->len - offset;
++	}
++	pthread_mutex_unlock(&g_l0_mutex);
++
++	if (region == NULL) {
++		return SPDK_VTOPHYS_ERROR;
++	}
++
++	return region->phys_addr + offset;
++}
++
++void *
++spdk_l0_region_base(struct spdk_l0_region *region)
++{
++	return region->vaddr;
++}
++
++size_t
++spdk_l0_region_len(struct spdk_l0_region *region)
++{
++	return region->len;
++}
++
++uint64_t
++spdk_l0_region_phys(struct spdk_l0_region *region)
++{
++	return region->phys_addr;
++}
++
++int
++spdk_l0_region_fd(struct spdk_l0_region *region)
++{
++	return region->fd;
++}
+diff --git a/lib/env_dpdk/l0_mmap_platform.c b/lib/env_dpdk/l0_mmap_platform.c
+new file mode 100644
+index 000000000..2069aa918
+--- /dev/null
++++ b/lib/env_dpdk/l0_mmap_platform.c
+@@ -0,0 +1,130 @@
++/*   SPDX-License-Identifier: BSD-3-Clause
++ *   Copyright (C) 2026.
++ *   All rights reserved.
++ */
++
++#include "spdk/stdinc.h"
++
++#include <sys/mman.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <limits.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <errno.h>
++
++#define L0_DEV "/dev/hisi_l0"
++#define L0_ALIGN (2UL * 1024UL * 1024UL)
++#define L0_RETRY_MAX 5
++
++#ifndef MAP_FIXED_NOREPLACE
++#define MAP_FIXED_NOREPLACE MAP_FIXED
++#endif
++
++static inline uintptr_t
++align_up_uintptr(uintptr_t value, uintptr_t align)
++{
++	return (value + align - 1) & ~(align - 1);
++}
++
++int
++get_l0_fd(void)
++{
++	return open(L0_DEV, O_RDWR);
++}
++
++void *
++mmap_alloc(unsigned long size, int fd)
++{
++	void *reserve_addr;
++	void *mapped_addr;
++	uintptr_t aligned_addr;
++	unsigned long reserve_len;
++	int retry = L0_RETRY_MAX;
++
++	if (size == 0 || fd < 0) {
++		errno = EINVAL;
++		return NULL;
++	}
++
++	if (size > ULONG_MAX - L0_ALIGN) {
++		errno = EOVERFLOW;
++		return NULL;
++	}
++
++	reserve_len = size + L0_ALIGN;
++	while (retry-- > 0) {
++		reserve_addr = mmap(NULL, reserve_len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++		if (reserve_addr == MAP_FAILED) {
++			fprintf(stderr, "reserve mmap failed, errno=%d\n", errno);
++			return NULL;
++		}
++
++		aligned_addr = align_up_uintptr((uintptr_t)reserve_addr, L0_ALIGN);
++		if (munmap(reserve_addr, reserve_len) == -1) {
++			return NULL;
++		}
++
++		mapped_addr = mmap((void *)aligned_addr, size, PROT_READ | PROT_WRITE,
++				   MAP_SHARED | MAP_FIXED_NOREPLACE, fd, 0);
++		if (mapped_addr == MAP_FAILED) {
++			if (errno == EEXIST || errno == EINVAL) {
++				continue;
++			}
++			fprintf(stderr, "L0 mmap failed, errno=%d\n", errno);
++			return NULL;
++		}
++
++		if ((uintptr_t)mapped_addr != aligned_addr) {
++			munmap(mapped_addr, size);
++			errno = EFAULT;
++			return NULL;
++		}
++
++		memset(mapped_addr, 0, size);
++		return mapped_addr;
++	}
++
++	errno = EBUSY;
++	return NULL;
++}
++
++unsigned long long
++vtop(unsigned long long addr)
++{
++	unsigned long long pinfo;
++	long pagesize = sysconf(_SC_PAGESIZE);
++	off_t offset;
++	char pagemapname[64];
++	int fd;
++
++	if (pagesize <= 0) {
++		return (unsigned long long)-1;
++	}
++
++	snprintf(pagemapname, sizeof(pagemapname), "/proc/%d/pagemap", getpid());
++	fd = open(pagemapname, O_RDONLY);
++	if (fd == -1) {
++		perror(pagemapname);
++		return (unsigned long long)-1;
++	}
++
++	offset = (off_t)((addr / (unsigned long long)pagesize) * sizeof(pinfo));
++	if (pread(fd, &pinfo, sizeof(pinfo), offset) != sizeof(pinfo)) {
++		perror(pagemapname);
++		close(fd);
++		return (unsigned long long)-1;
++	}
++
++	if (close(fd) != 0) {
++		return (unsigned long long)-1;
++	}
++
++	if ((pinfo & (1ull << 63)) == 0) {
++		fprintf(stderr, "page not present for 0x%llx\n", addr);
++		return (unsigned long long)-1;
++	}
++
++	return ((pinfo & 0x007fffffffffffffull) * (unsigned long long)pagesize) +
++	       (addr & (unsigned long long)(pagesize - 1));
++}
+diff --git a/lib/env_dpdk/memory.c b/lib/env_dpdk/memory.c
+index 4e620a4ab..6c0e57fd3 100644
+--- a/lib/env_dpdk/memory.c
++++ b/lib/env_dpdk/memory.c
+@@ -7,6 +7,7 @@
+ 
+ #include "env_internal.h"
+ #include "pci_dpdk.h"
++#include "spdk_internal/l0.h"
+ 
+ #include <rte_config.h>
+ #include <rte_memory.h>
+@@ -1501,7 +1502,7 @@ vtophys_init(void)
+ uint64_t
+ spdk_vtophys(const void *buf, uint64_t *size)
+ {
+-	uint64_t vaddr, paddr_2mb;
++	uint64_t vaddr, paddr_2mb, l0_size;
+ 
+ 	vaddr = (uint64_t)buf;
+ 	paddr_2mb = spdk_mem_map_translate(g_vtophys_map, vaddr, size);
+@@ -1514,7 +1515,16 @@ spdk_vtophys(const void *buf, uint64_t *size)
+ 	 */
+ 	SPDK_STATIC_ASSERT(SPDK_VTOPHYS_ERROR == UINT64_C(-1), "SPDK_VTOPHYS_ERROR should be all 1s");
+ 	if (paddr_2mb == SPDK_VTOPHYS_ERROR) {
+-		return SPDK_VTOPHYS_ERROR;
++		l0_size = 0;
++		paddr_2mb = spdk_l0_vtophys(buf, &l0_size);
++		if (paddr_2mb == SPDK_VTOPHYS_ERROR) {
++			return SPDK_VTOPHYS_ERROR;
++		}
++
++		if (size != NULL) {
++			*size = l0_size;
++		}
++		return paddr_2mb;
+ 	} else {
+ 		return paddr_2mb + (vaddr & MASK_2MB);
+ 	}
+@@ -1524,12 +1534,19 @@ int
+ spdk_mem_get_fd_and_offset(void *vaddr, uint64_t *offset)
+ {
+ 	struct rte_memseg *seg;
++	struct spdk_l0_region *region;
++	uint64_t region_offset;
+ 	int ret, fd;
+ 
+ 	seg = rte_mem_virt2memseg(vaddr, NULL);
+ 	if (!seg) {
+-		SPDK_ERRLOG("memory %p doesn't exist\n", vaddr);
+-		return -ENOENT;
++		if (!spdk_l0_find_region(vaddr, &region, &region_offset)) {
++			SPDK_ERRLOG("memory %p doesn't exist\n", vaddr);
++			return -ENOENT;
++		}
++
++		*offset = region_offset;
++		return spdk_l0_region_fd(region);
+ 	}
+ 
+ 	fd = rte_memseg_get_fd_thread_unsafe(seg);
+diff --git a/lib/nvmf/transport.c b/lib/nvmf/transport.c
+index bf2f19868..caca0899f 100644
+--- a/lib/nvmf/transport.c
++++ b/lib/nvmf/transport.c
+@@ -14,8 +14,14 @@
+ #include "spdk/nvmf_transport.h"
+ #include "spdk/queue.h"
+ #include "spdk/util.h"
++#include "spdk_internal/l0.h"
+ #include "spdk_internal/usdt.h"
+ 
++bool spdk_l0_data_pool_enabled(void) __attribute__((weak));
++struct spdk_mempool *spdk_l0_mempool_create(const char *name, size_t count,
++		size_t ele_size, spdk_mempool_obj_cb_t *obj_init,
++		void *obj_init_arg) __attribute__((weak));
++
+ #define MAX_MEMPOOL_NAME_LENGTH 40
+ #define NVMF_TRANSPORT_DEFAULT_ASSOCIATION_TIMEOUT_IN_MS 120000
+ 
+@@ -27,6 +33,14 @@ struct nvmf_transport_ops_list_element {
+ TAILQ_HEAD(nvmf_transport_ops_list, nvmf_transport_ops_list_element)
+ g_spdk_nvmf_transport_ops = TAILQ_HEAD_INITIALIZER(g_spdk_nvmf_transport_ops);
+ 
++static inline bool
++nvmf_transport_l0_enabled(void)
++{
++	return spdk_l0_data_pool_enabled != NULL &&
++	       spdk_l0_mempool_create != NULL &&
++	       spdk_l0_data_pool_enabled();
++}
++
+ static inline const struct spdk_nvmf_transport_ops *
+ nvmf_get_transport_ops(const char *transport_name)
+ {
+@@ -226,11 +240,22 @@ spdk_nvmf_transport_create(const char *transport_name, struct spdk_nvmf_transpor
+ 	}
+ 
+ 	if (opts_local.num_shared_buffers) {
+-		transport->data_buf_pool = spdk_mempool_create(spdk_mempool_name,
++		if (strcasecmp(transport_name, "RDMA") == 0 && nvmf_transport_l0_enabled()) {
++			transport->data_buf_pool = spdk_l0_mempool_create(spdk_mempool_name,
++						   opts_local.num_shared_buffers,
++						   opts_local.io_unit_size + NVMF_DATA_BUFFER_ALIGNMENT,
++						   NULL, NULL);
++			if (transport->data_buf_pool == NULL) {
++				SPDK_ERRLOG("Unable to allocate L0-backed buffer pool for transport %s\n",
++					    transport_name);
++			}
++		} else {
++			transport->data_buf_pool = spdk_mempool_create(spdk_mempool_name,
+ 					   opts_local.num_shared_buffers,
+ 					   opts_local.io_unit_size + NVMF_DATA_BUFFER_ALIGNMENT,
+ 					   SPDK_MEMPOOL_DEFAULT_CACHE_SIZE,
+ 					   SPDK_ENV_SOCKET_ID_ANY);
++		}
+ 
+ 		if (!transport->data_buf_pool) {
+ 			if (spdk_mempool_lookup(spdk_mempool_name) != NULL) {
+diff --git a/lib/rdma/common.c b/lib/rdma/common.c
+index 05e885af9..8b77482a2 100644
+--- a/lib/rdma/common.c
++++ b/lib/rdma/common.c
+@@ -8,8 +8,10 @@
+ #include "spdk/log.h"
+ #include "spdk/env.h"
+ #include "spdk/string.h"
++#include "spdk/queue_extras.h"
+ #include "spdk/likely.h"
+ 
++#include "spdk_internal/l0.h"
+ #include "spdk_internal/rdma.h"
+ #include "spdk_internal/assert.h"
+ 
+@@ -27,9 +29,16 @@ struct spdk_rdma_mem_map {
+ 	struct spdk_nvme_rdma_hooks	*hooks;
+ 	uint32_t ref_count;
+ 	enum spdk_rdma_memory_map_role role;
++	LIST_HEAD(, spdk_rdma_external_mr) external_mrs;
+ 	LIST_ENTRY(spdk_rdma_mem_map) link;
+ };
+ 
++struct spdk_rdma_external_mr {
++	struct spdk_l0_region		*region;
++	struct ibv_mr			*mr;
++	LIST_ENTRY(spdk_rdma_external_mr)	link;
++};
++
+ static pthread_mutex_t g_dev_mutex = PTHREAD_MUTEX_INITIALIZER;
+ static struct ibv_context **g_ctx_list = NULL;
+ static TAILQ_HEAD(, spdk_rdma_device) g_dev_list = TAILQ_HEAD_INITIALIZER(g_dev_list);
+@@ -37,6 +46,32 @@ static TAILQ_HEAD(, spdk_rdma_device) g_dev_list = TAILQ_HEAD_INITIALIZER(g_dev_
+ static LIST_HEAD(, spdk_rdma_mem_map) g_rdma_mr_maps = LIST_HEAD_INITIALIZER(&g_rdma_mr_maps);
+ static pthread_mutex_t g_rdma_mr_maps_mutex = PTHREAD_MUTEX_INITIALIZER;
+ 
++static uint32_t
++rdma_get_access_flags(struct spdk_rdma_mem_map *rmap)
++{
++	uint32_t access_flags = 0;
++
++	switch (rmap->role) {
++	case SPDK_RDMA_MEMORY_MAP_ROLE_TARGET:
++		access_flags = IBV_ACCESS_LOCAL_WRITE;
++		if (rmap->pd->context->device->transport_type == IBV_TRANSPORT_IWARP) {
++			/* IWARP requires REMOTE_WRITE permission for RDMA_READ operation */
++			access_flags |= IBV_ACCESS_REMOTE_WRITE;
++		}
++		break;
++	case SPDK_RDMA_MEMORY_MAP_ROLE_INITIATOR:
++		access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
++		break;
++	default:
++		SPDK_UNREACHABLE();
++	}
++#ifdef IBV_ACCESS_OPTIONAL_FIRST
++	access_flags |= IBV_ACCESS_RELAXED_ORDERING;
++#endif
++
++	return access_flags;
++}
++
+ static int
+ rdma_mem_notify(void *cb_ctx, struct spdk_mem_map *map,
+ 		enum spdk_mem_map_notify_action action,
+@@ -45,7 +80,6 @@ rdma_mem_notify(void *cb_ctx, struct spdk_mem_map *map,
+ 	struct spdk_rdma_mem_map *rmap = cb_ctx;
+ 	struct ibv_pd *pd = rmap->pd;
+ 	struct ibv_mr *mr;
+-	uint32_t access_flags = 0;
+ 	int rc;
+ 
+ 	switch (action) {
+@@ -54,24 +88,7 @@ rdma_mem_notify(void *cb_ctx, struct spdk_mem_map *map,
+ 			rc = spdk_mem_map_set_translation(map, (uint64_t)vaddr, size, rmap->hooks->get_rkey(pd, vaddr,
+ 							  size));
+ 		} else {
+-			switch (rmap->role) {
+-			case SPDK_RDMA_MEMORY_MAP_ROLE_TARGET:
+-				access_flags = IBV_ACCESS_LOCAL_WRITE;
+-				if (pd->context->device->transport_type == IBV_TRANSPORT_IWARP) {
+-					/* IWARP requires REMOTE_WRITE permission for RDMA_READ operation */
+-					access_flags |= IBV_ACCESS_REMOTE_WRITE;
+-				}
+-				break;
+-			case SPDK_RDMA_MEMORY_MAP_ROLE_INITIATOR:
+-				access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
+-				break;
+-			default:
+-				SPDK_UNREACHABLE();
+-			}
+-#ifdef IBV_ACCESS_OPTIONAL_FIRST
+-			access_flags |= IBV_ACCESS_RELAXED_ORDERING;
+-#endif
+-			mr = ibv_reg_mr(pd, vaddr, size, access_flags);
++			mr = ibv_reg_mr(pd, vaddr, size, rdma_get_access_flags(rmap));
+ 			if (mr == NULL) {
+ 				SPDK_ERRLOG("ibv_reg_mr() failed\n");
+ 				return -1;
+@@ -120,6 +137,35 @@ _rdma_free_mem_map(struct spdk_rdma_mem_map *map)
+ 	}
+ }
+ 
++static struct ibv_mr *
++rdma_get_external_mr(struct spdk_rdma_mem_map *map, struct spdk_l0_region *region)
++{
++	struct spdk_rdma_external_mr *entry;
++
++	LIST_FOREACH(entry, &map->external_mrs, link) {
++		if (entry->region == region) {
++			return entry->mr;
++		}
++	}
++
++	entry = calloc(1, sizeof(*entry));
++	if (entry == NULL) {
++		return NULL;
++	}
++
++	entry->region = region;
++	entry->mr = ibv_reg_mr(map->pd, spdk_l0_region_base(region),
++			       spdk_l0_region_len(region), rdma_get_access_flags(map));
++	if (entry->mr == NULL) {
++		free(entry);
++		SPDK_ERRLOG("ibv_reg_mr() failed for L0 region\n");
++		return NULL;
++	}
++
++	LIST_INSERT_HEAD(&map->external_mrs, entry, link);
++	return entry->mr;
++}
++
+ struct spdk_rdma_mem_map *
+ spdk_rdma_create_mem_map(struct ibv_pd *pd, struct spdk_nvme_rdma_hooks *hooks,
+ 			 enum spdk_rdma_memory_map_role role)
+@@ -150,6 +196,7 @@ spdk_rdma_create_mem_map(struct ibv_pd *pd, struct spdk_nvme_rdma_hooks *hooks,
+ 	map->ref_count = 1;
+ 	map->hooks = hooks;
+ 	map->role = role;
++	LIST_INIT(&map->external_mrs);
+ 	map->map = spdk_mem_map_alloc(0, &g_rdma_map_ops, map);
+ 	if (!map->map) {
+ 		SPDK_ERRLOG("Unable to create memory map\n");
+@@ -168,6 +215,7 @@ void
+ spdk_rdma_free_mem_map(struct spdk_rdma_mem_map **_map)
+ {
+ 	struct spdk_rdma_mem_map *map;
++	struct spdk_rdma_external_mr *entry, *tmp;
+ 
+ 	if (!_map) {
+ 		return;
+@@ -192,6 +240,11 @@ spdk_rdma_free_mem_map(struct spdk_rdma_mem_map **_map)
+ 	if (map->map) {
+ 		spdk_mem_map_free(&map->map);
+ 	}
++	LIST_FOREACH_SAFE(entry, &map->external_mrs, link, tmp) {
++		LIST_REMOVE(entry, link);
++		ibv_dereg_mr(entry->mr);
++		free(entry);
++	}
+ 	_rdma_free_mem_map(map);
+ }
+ 
+@@ -199,7 +252,10 @@ int
+ spdk_rdma_get_translation(struct spdk_rdma_mem_map *map, void *address,
+ 			  size_t length, struct spdk_rdma_memory_translation *translation)
+ {
++	struct spdk_l0_region *region;
+ 	uint64_t real_length = length;
++	uint64_t offset = 0;
++	struct ibv_mr *mr;
+ 
+ 	assert(map);
+ 	assert(address);
+@@ -213,8 +269,18 @@ spdk_rdma_get_translation(struct spdk_rdma_mem_map *map, void *address,
+ 		translation->mr_or_key.mr = (struct ibv_mr *)spdk_mem_map_translate(map->map, (uint64_t)address,
+ 					    &real_length);
+ 		if (spdk_unlikely(!translation->mr_or_key.mr)) {
+-			SPDK_ERRLOG("No translation for ptr %p, size %zu\n", address, length);
+-			return -EINVAL;
++			if (!spdk_l0_find_region(address, &region, &offset)) {
++				SPDK_ERRLOG("No translation for ptr %p, size %zu\n", address, length);
++				return -EINVAL;
++			}
++
++			mr = rdma_get_external_mr(map, region);
++			if (mr == NULL) {
++				return -ENOMEM;
++			}
++
++			real_length = spdk_l0_region_len(region) - offset;
++			translation->mr_or_key.mr = mr;
+ 		}
+ 	}

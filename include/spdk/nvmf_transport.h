@@ -92,6 +92,8 @@ struct spdk_nvmf_request {
 	struct spdk_nvmf_dif_info	dif;
 
 	struct spdk_bdev_io_wait_entry	bdev_io_wait;
+	uint64_t			bdev_io_tsc;
+	bool				bdev_io_tsc_valid;
 	spdk_nvmf_nvme_passthru_cmd_cb	cmd_cb_fn;
 	struct spdk_nvmf_request	*first_fused_req;
 	struct spdk_nvmf_request	*req_to_abort;
@@ -357,6 +359,16 @@ struct spdk_nvmf_transport_ops {
 	int (*req_complete)(struct spdk_nvmf_request *req);
 
 	/*
+	 * Mark the start of backend bdev I/O latency tracking for this request.
+	 */
+	void (*req_start_bdev_latency)(struct spdk_nvmf_request *req);
+
+	/*
+	 * Complete backend bdev I/O latency tracking for this request.
+	 */
+	void (*req_complete_bdev_latency)(struct spdk_nvmf_request *req);
+
+	/*
 	 * Deinitialize a connection.
 	 */
 	void (*qpair_fini)(struct spdk_nvmf_qpair *qpair,
@@ -395,6 +407,11 @@ struct spdk_nvmf_transport_ops {
 	 */
 	void (*poll_group_dump_stat)(struct spdk_nvmf_transport_poll_group *group,
 				     struct spdk_json_write_ctx *w);
+
+	/*
+	 * Reset transport poll group cumulative statistics.
+	 */
+	void (*poll_group_reset_stat)(struct spdk_nvmf_transport_poll_group *group);
 };
 
 /**

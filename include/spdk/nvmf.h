@@ -1190,6 +1190,13 @@ void spdk_nvmf_poll_group_dump_stat(struct spdk_nvmf_poll_group *group,
 				    struct spdk_json_write_ctx *w);
 
 /**
+ * Reset cumulative poll group statistics.
+ *
+ * \param group The group which statistics should be reset.
+ */
+void spdk_nvmf_poll_group_reset_stat(struct spdk_nvmf_poll_group *group);
+
+/**
  * \brief Set the global hooks for the RDMA transport, if necessary.
  *
  * This call is optional and must be performed prior to probing for

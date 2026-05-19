@@ -7,6 +7,7 @@
 
 #include "env_internal.h"
 #include "pci_dpdk.h"
+#include "spdk_internal/l0.h"
 
 #include <rte_config.h>
 #include <rte_memory.h>
@@ -1501,7 +1502,7 @@ vtophys_init(void)
 uint64_t
 spdk_vtophys(const void *buf, uint64_t *size)
 {
-	uint64_t vaddr, paddr_2mb;
+	uint64_t vaddr, paddr_2mb, l0_size;
 
 	vaddr = (uint64_t)buf;
 	paddr_2mb = spdk_mem_map_translate(g_vtophys_map, vaddr, size);
@@ -1514,7 +1515,16 @@ spdk_vtophys(const void *buf, uint64_t *size)
 	 */
 	SPDK_STATIC_ASSERT(SPDK_VTOPHYS_ERROR == UINT64_C(-1), "SPDK_VTOPHYS_ERROR should be all 1s");
 	if (paddr_2mb == SPDK_VTOPHYS_ERROR) {
-		return SPDK_VTOPHYS_ERROR;
+		l0_size = 0;
+		paddr_2mb = spdk_l0_vtophys(buf, &l0_size);
+		if (paddr_2mb == SPDK_VTOPHYS_ERROR) {
+			return SPDK_VTOPHYS_ERROR;
+		}
+
+		if (size != NULL) {
+			*size = l0_size;
+		}
+		return paddr_2mb;
 	} else {
 		return paddr_2mb + (vaddr & MASK_2MB);
 	}
@@ -1524,12 +1534,19 @@ int
 spdk_mem_get_fd_and_offset(void *vaddr, uint64_t *offset)
 {
 	struct rte_memseg *seg;
+	struct spdk_l0_region *region;
+	uint64_t region_offset;
 	int ret, fd;
 
 	seg = rte_mem_virt2memseg(vaddr, NULL);
 	if (!seg) {
-		SPDK_ERRLOG("memory %p doesn't exist\n", vaddr);
-		return -ENOENT;
+		if (!spdk_l0_find_region(vaddr, &region, &region_offset)) {
+			SPDK_ERRLOG("memory %p doesn't exist\n", vaddr);
+			return -ENOENT;
+		}
+
+		*offset = region_offset;
+		return spdk_l0_region_fd(region);
 	}
 
 	fd = rte_memseg_get_fd_thread_unsafe(seg);

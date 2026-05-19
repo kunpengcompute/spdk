@@ -10,6 +10,8 @@
 #include "spdk/log.h"
 
 #include "env_internal.h"
+#include "spdk_internal/l0.h"
+#include "spdk_internal/assert.h"
 
 #include <rte_config.h>
 #include <rte_cycles.h>
@@ -17,6 +19,8 @@
 #include <rte_mempool.h>
 #include <rte_memzone.h>
 #include <rte_version.h>
+
+#define SPDK_L0_MEMPOOL_REGION_ALIGN (2ULL * 1024ULL * 1024ULL)
 
 static uint64_t
 virt_to_phys(void *vaddr)
@@ -29,6 +33,99 @@ virt_to_phys(void *vaddr)
 	}
 
 	return spdk_vtophys(vaddr, NULL);
+}
+
+static size_t
+l0_mempool_align_up(size_t value, size_t align)
+{
+	assert(align != 0);
+	return (value + align - 1) & ~(align - 1);
+}
+
+enum spdk_mempool_backend {
+	SPDK_MEMPOOL_BACKEND_DPDK = 0,
+	SPDK_MEMPOOL_BACKEND_L0,
+};
+
+struct spdk_mempool {
+	enum spdk_mempool_backend	backend;
+	char				*name;
+	TAILQ_ENTRY(spdk_mempool)	link;
+};
+
+struct spdk_dpdk_mempool {
+	struct spdk_mempool	base;
+	struct rte_mempool	*mp;
+};
+
+struct spdk_l0_mempool {
+	struct spdk_mempool	base;
+	struct spdk_l0_region	*region;
+	size_t			count;
+	size_t			ele_size;
+	size_t			free_count;
+	void			**free_list;
+	pthread_mutex_t		mutex;
+};
+
+static TAILQ_HEAD(, spdk_mempool) g_spdk_mempools = TAILQ_HEAD_INITIALIZER(g_spdk_mempools);
+static pthread_mutex_t g_spdk_mempools_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static struct spdk_dpdk_mempool *
+mempool_to_dpdk(struct spdk_mempool *mp)
+{
+	assert(mp->backend == SPDK_MEMPOOL_BACKEND_DPDK);
+	return SPDK_CONTAINEROF(mp, struct spdk_dpdk_mempool, base);
+}
+
+static struct spdk_l0_mempool *
+mempool_to_l0(struct spdk_mempool *mp)
+{
+	assert(mp->backend == SPDK_MEMPOOL_BACKEND_L0);
+	return SPDK_CONTAINEROF(mp, struct spdk_l0_mempool, base);
+}
+
+static struct spdk_mempool *
+mempool_find_locked(const char *name)
+{
+	struct spdk_mempool *mp;
+
+	TAILQ_FOREACH(mp, &g_spdk_mempools, link) {
+		if (strcmp(mp->name, name) == 0) {
+			return mp;
+		}
+	}
+
+	return NULL;
+}
+
+static int
+mempool_register(struct spdk_mempool *mp, const char *name)
+{
+	pthread_mutex_lock(&g_spdk_mempools_mutex);
+	if (mempool_find_locked(name) != NULL) {
+		pthread_mutex_unlock(&g_spdk_mempools_mutex);
+		return -EEXIST;
+	}
+
+	mp->name = strdup(name);
+	if (mp->name == NULL) {
+		pthread_mutex_unlock(&g_spdk_mempools_mutex);
+		return -ENOMEM;
+	}
+
+	TAILQ_INSERT_TAIL(&g_spdk_mempools, mp, link);
+	pthread_mutex_unlock(&g_spdk_mempools_mutex);
+	return 0;
+}
+
+static void
+mempool_unregister(struct spdk_mempool *mp)
+{
+	pthread_mutex_lock(&g_spdk_mempools_mutex);
+	TAILQ_REMOVE(&g_spdk_mempools, mp, link);
+	pthread_mutex_unlock(&g_spdk_mempools_mutex);
+	free(mp->name);
 }
 
 void *
@@ -194,8 +291,10 @@ spdk_mempool_create_ctor(const char *name, size_t count,
 			 size_t ele_size, size_t cache_size, int socket_id,
 			 spdk_mempool_obj_cb_t *obj_init, void *obj_init_arg)
 {
+	struct spdk_dpdk_mempool *wrapper;
 	struct rte_mempool *mp;
 	size_t tmp;
+	int rc;
 
 	if (socket_id == SPDK_ENV_SOCKET_ID_ANY) {
 		socket_id = SOCKET_ID_ANY;
@@ -212,10 +311,34 @@ spdk_mempool_create_ctor(const char *name, size_t count,
 	}
 
 	mp = rte_mempool_create(name, count, ele_size, cache_size,
-				0, NULL, NULL, (rte_mempool_obj_cb_t *)obj_init, obj_init_arg,
+				0, NULL, NULL, NULL, NULL,
 				socket_id, 0);
+	if (mp == NULL) {
+		return NULL;
+	}
 
-	return (struct spdk_mempool *)mp;
+	wrapper = calloc(1, sizeof(*wrapper));
+	if (wrapper == NULL) {
+		rte_mempool_free(mp);
+		return NULL;
+	}
+
+	wrapper->base.backend = SPDK_MEMPOOL_BACKEND_DPDK;
+	wrapper->mp = mp;
+
+	rc = mempool_register(&wrapper->base, name);
+	if (rc != 0) {
+		rte_mempool_free(mp);
+		free(wrapper);
+		errno = -rc;
+		return NULL;
+	}
+
+	if (obj_init != NULL) {
+		spdk_mempool_obj_iter(&wrapper->base, obj_init, obj_init_arg);
+	}
+
+	return &wrapper->base;
 }
 
 
@@ -227,64 +350,260 @@ spdk_mempool_create(const char *name, size_t count,
 					NULL, NULL);
 }
 
+struct spdk_mempool *
+spdk_l0_mempool_create(const char *name, size_t count,
+		       size_t ele_size, spdk_mempool_obj_cb_t *obj_init, void *obj_init_arg)
+{
+	struct spdk_l0_mempool *mp;
+	struct spdk_l0_region *region;
+	size_t total_len, aligned_total_len, i;
+	int rc;
+
+	if (count == 0 || ele_size == 0) {
+		errno = EINVAL;
+		return NULL;
+	}
+
+	if (count > SIZE_MAX / ele_size) {
+		errno = EOVERFLOW;
+		return NULL;
+	}
+
+	total_len = count * ele_size;
+	if (total_len > SIZE_MAX - (SPDK_L0_MEMPOOL_REGION_ALIGN - 1)) {
+		errno = EOVERFLOW;
+		return NULL;
+	}
+
+	aligned_total_len = l0_mempool_align_up(total_len, SPDK_L0_MEMPOOL_REGION_ALIGN);
+	region = spdk_l0_region_create(name, aligned_total_len);
+	if (region == NULL) {
+		return NULL;
+	}
+
+	mp = calloc(1, sizeof(*mp));
+	if (mp == NULL) {
+		spdk_l0_region_destroy(region);
+		return NULL;
+	}
+
+	mp->free_list = calloc(count, sizeof(void *));
+	if (mp->free_list == NULL) {
+		free(mp);
+		spdk_l0_region_destroy(region);
+		return NULL;
+	}
+
+	mp->base.backend = SPDK_MEMPOOL_BACKEND_L0;
+	mp->region = region;
+	mp->count = count;
+	mp->ele_size = ele_size;
+	mp->free_count = count;
+	pthread_mutex_init(&mp->mutex, NULL);
+
+	rc = mempool_register(&mp->base, name);
+	if (rc != 0) {
+		pthread_mutex_destroy(&mp->mutex);
+		free(mp->free_list);
+		free(mp);
+		spdk_l0_region_destroy(region);
+		errno = -rc;
+		return NULL;
+	}
+
+	for (i = 0; i < count; i++) {
+		void *obj = (char *)spdk_l0_region_base(region) + (i * ele_size);
+
+		mp->free_list[count - i - 1] = obj;
+		if (obj_init != NULL) {
+			obj_init(&mp->base, obj_init_arg, obj, i);
+		}
+	}
+
+	return &mp->base;
+}
+
 char *
 spdk_mempool_get_name(struct spdk_mempool *mp)
 {
-	return ((struct rte_mempool *)mp)->name;
+	return mp->name;
 }
 
 void
 spdk_mempool_free(struct spdk_mempool *mp)
 {
-	rte_mempool_free((struct rte_mempool *)mp);
+	if (mp == NULL) {
+		return;
+	}
+
+	mempool_unregister(mp);
+
+	if (mp->backend == SPDK_MEMPOOL_BACKEND_DPDK) {
+		struct spdk_dpdk_mempool *dpdk_mp = mempool_to_dpdk(mp);
+
+		rte_mempool_free(dpdk_mp->mp);
+		free(dpdk_mp);
+		return;
+	}
+
+	if (mp->backend == SPDK_MEMPOOL_BACKEND_L0) {
+		struct spdk_l0_mempool *l0_mp = mempool_to_l0(mp);
+
+		pthread_mutex_destroy(&l0_mp->mutex);
+		free(l0_mp->free_list);
+		spdk_l0_region_destroy(l0_mp->region);
+		free(l0_mp);
+		return;
+	}
+
+	SPDK_UNREACHABLE();
 }
 
 void *
 spdk_mempool_get(struct spdk_mempool *mp)
 {
+	struct spdk_l0_mempool *l0_mp;
 	void *ele = NULL;
 	int rc;
 
-	rc = rte_mempool_get((struct rte_mempool *)mp, &ele);
-	if (rc != 0) {
-		return NULL;
+	if (mp->backend == SPDK_MEMPOOL_BACKEND_DPDK) {
+		rc = rte_mempool_get(mempool_to_dpdk(mp)->mp, &ele);
+		if (rc != 0) {
+			return NULL;
+		}
+		return ele;
 	}
+
+	l0_mp = mempool_to_l0(mp);
+	pthread_mutex_lock(&l0_mp->mutex);
+	if (l0_mp->free_count > 0) {
+		ele = l0_mp->free_list[--l0_mp->free_count];
+	}
+	pthread_mutex_unlock(&l0_mp->mutex);
+
 	return ele;
 }
 
 int
 spdk_mempool_get_bulk(struct spdk_mempool *mp, void **ele_arr, size_t count)
 {
-	return rte_mempool_get_bulk((struct rte_mempool *)mp, ele_arr, count);
+	struct spdk_l0_mempool *l0_mp;
+	size_t i;
+
+	if (mp->backend == SPDK_MEMPOOL_BACKEND_DPDK) {
+		return rte_mempool_get_bulk(mempool_to_dpdk(mp)->mp, ele_arr, count);
+	}
+
+	l0_mp = mempool_to_l0(mp);
+	pthread_mutex_lock(&l0_mp->mutex);
+	if (l0_mp->free_count < count) {
+		pthread_mutex_unlock(&l0_mp->mutex);
+		return -1;
+	}
+
+	for (i = 0; i < count; i++) {
+		ele_arr[i] = l0_mp->free_list[--l0_mp->free_count];
+	}
+	pthread_mutex_unlock(&l0_mp->mutex);
+	return 0;
 }
 
 void
 spdk_mempool_put(struct spdk_mempool *mp, void *ele)
 {
-	rte_mempool_put((struct rte_mempool *)mp, ele);
+	struct spdk_l0_mempool *l0_mp;
+
+	if (mp->backend == SPDK_MEMPOOL_BACKEND_DPDK) {
+		rte_mempool_put(mempool_to_dpdk(mp)->mp, ele);
+		return;
+	}
+
+	l0_mp = mempool_to_l0(mp);
+	pthread_mutex_lock(&l0_mp->mutex);
+	assert(l0_mp->free_count < l0_mp->count);
+	l0_mp->free_list[l0_mp->free_count++] = ele;
+	pthread_mutex_unlock(&l0_mp->mutex);
 }
 
 void
 spdk_mempool_put_bulk(struct spdk_mempool *mp, void **ele_arr, size_t count)
 {
-	rte_mempool_put_bulk((struct rte_mempool *)mp, ele_arr, count);
+	struct spdk_l0_mempool *l0_mp;
+	size_t i;
+
+	if (mp->backend == SPDK_MEMPOOL_BACKEND_DPDK) {
+		rte_mempool_put_bulk(mempool_to_dpdk(mp)->mp, ele_arr, count);
+		return;
+	}
+
+	l0_mp = mempool_to_l0(mp);
+	pthread_mutex_lock(&l0_mp->mutex);
+	assert(l0_mp->free_count + count <= l0_mp->count);
+	for (i = 0; i < count; i++) {
+		l0_mp->free_list[l0_mp->free_count++] = ele_arr[i];
+	}
+	pthread_mutex_unlock(&l0_mp->mutex);
 }
 
 size_t
 spdk_mempool_count(const struct spdk_mempool *pool)
 {
-	return rte_mempool_avail_count((struct rte_mempool *)pool);
+	struct spdk_l0_mempool *l0_mp;
+	size_t count;
+
+	if (pool->backend == SPDK_MEMPOOL_BACKEND_DPDK) {
+		return rte_mempool_avail_count(((const struct spdk_dpdk_mempool *)pool)->mp);
+	}
+
+	l0_mp = SPDK_CONTAINEROF(pool, struct spdk_l0_mempool, base);
+	pthread_mutex_lock(&l0_mp->mutex);
+	count = l0_mp->free_count;
+	pthread_mutex_unlock(&l0_mp->mutex);
+	return count;
+}
+
+struct env_mempool_obj_iter_ctx {
+	struct spdk_mempool *mp;
+	spdk_mempool_obj_cb_t *user_cb;
+	void *user_arg;
+};
+
+static void
+mempool_obj_iter_remap(struct rte_mempool *rte_mp, void *opaque, void *obj,
+		       unsigned obj_idx)
+{
+	struct env_mempool_obj_iter_ctx *ctx = opaque;
+
+	(void)rte_mp;
+	ctx->user_cb(ctx->mp, ctx->user_arg, obj, obj_idx);
 }
 
 uint32_t
 spdk_mempool_obj_iter(struct spdk_mempool *mp, spdk_mempool_obj_cb_t obj_cb,
 		      void *obj_cb_arg)
 {
-	return rte_mempool_obj_iter((struct rte_mempool *)mp, (rte_mempool_obj_cb_t *)obj_cb,
-				    obj_cb_arg);
+	struct spdk_l0_mempool *l0_mp;
+	struct env_mempool_obj_iter_ctx ctx;
+	uint32_t i;
+
+	if (mp->backend == SPDK_MEMPOOL_BACKEND_DPDK) {
+		ctx.mp = mp;
+		ctx.user_cb = obj_cb;
+		ctx.user_arg = obj_cb_arg;
+		return rte_mempool_obj_iter(mempool_to_dpdk(mp)->mp, mempool_obj_iter_remap, &ctx);
+	}
+
+	l0_mp = mempool_to_l0(mp);
+	for (i = 0; i < l0_mp->count; i++) {
+		void *obj = (char *)spdk_l0_region_base(l0_mp->region) + ((size_t)i * l0_mp->ele_size);
+		obj_cb(mp, obj_cb_arg, obj, i);
+	}
+
+	return (uint32_t)l0_mp->count;
 }
 
 struct env_mempool_mem_iter_ctx {
+	struct spdk_mempool *mp;
 	spdk_mempool_mem_cb_t *user_cb;
 	void *user_arg;
 };
@@ -295,7 +614,8 @@ mempool_mem_iter_remap(struct rte_mempool *mp, void *opaque, struct rte_mempool_
 {
 	struct env_mempool_mem_iter_ctx *ctx = opaque;
 
-	ctx->user_cb((struct spdk_mempool *)mp, ctx->user_arg, memhdr->addr, memhdr->iova, memhdr->len,
+	(void)mp;
+	ctx->user_cb(ctx->mp, ctx->user_arg, memhdr->addr, memhdr->iova, memhdr->len,
 		     mem_idx);
 }
 
@@ -304,17 +624,31 @@ spdk_mempool_mem_iter(struct spdk_mempool *mp, spdk_mempool_mem_cb_t mem_cb,
 		      void *mem_cb_arg)
 {
 	struct env_mempool_mem_iter_ctx ctx = {
+		.mp = mp,
 		.user_cb = mem_cb,
 		.user_arg = mem_cb_arg
 	};
 
-	return rte_mempool_mem_iter((struct rte_mempool *)mp, mempool_mem_iter_remap, &ctx);
+	if (mp->backend == SPDK_MEMPOOL_BACKEND_DPDK) {
+		return rte_mempool_mem_iter(mempool_to_dpdk(mp)->mp, mempool_mem_iter_remap, &ctx);
+	}
+
+	mem_cb(mp, mem_cb_arg, spdk_l0_region_base(mempool_to_l0(mp)->region),
+	       spdk_l0_region_phys(mempool_to_l0(mp)->region),
+	       spdk_l0_region_len(mempool_to_l0(mp)->region), 0);
+	return 1;
 }
 
 struct spdk_mempool *
 spdk_mempool_lookup(const char *name)
 {
-	return (struct spdk_mempool *)rte_mempool_lookup(name);
+	struct spdk_mempool *mp;
+
+	pthread_mutex_lock(&g_spdk_mempools_mutex);
+	mp = mempool_find_locked(name);
+	pthread_mutex_unlock(&g_spdk_mempools_mutex);
+
+	return mp;
 }
 
 bool

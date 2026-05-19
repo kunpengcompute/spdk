@@ -574,6 +574,26 @@ def nvmf_get_stats(client, tgt_name=None):
     return client.call('nvmf_get_stats', params)
 
 
+def nvmf_reset_stats(client, tgt_name=None):
+    """Reset cumulative NVMf statistics.
+
+    Args:
+        tgt_name: name of the parent NVMe-oF target (optional).
+
+    Returns:
+        True or False.
+    """
+
+    params = {}
+
+    if tgt_name:
+        params = {
+            'tgt_name': tgt_name,
+        }
+
+    return client.call('nvmf_reset_stats', params)
+
+
 def nvmf_set_crdt(client, crdt1=None, crdt2=None, crdt3=None):
     """Set the 3 crdt (Command Retry Delay Time) values
 

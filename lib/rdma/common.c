@@ -8,8 +8,10 @@
 #include "spdk/log.h"
 #include "spdk/env.h"
 #include "spdk/string.h"
+#include "spdk/queue_extras.h"
 #include "spdk/likely.h"
 
+#include "spdk_internal/l0.h"
 #include "spdk_internal/rdma.h"
 #include "spdk_internal/assert.h"
 
@@ -27,7 +29,14 @@ struct spdk_rdma_mem_map {
 	struct spdk_nvme_rdma_hooks	*hooks;
 	uint32_t ref_count;
 	enum spdk_rdma_memory_map_role role;
+	LIST_HEAD(, spdk_rdma_external_mr) external_mrs;
 	LIST_ENTRY(spdk_rdma_mem_map) link;
+};
+
+struct spdk_rdma_external_mr {
+	struct spdk_l0_region		*region;
+	struct ibv_mr			*mr;
+	LIST_ENTRY(spdk_rdma_external_mr)	link;
 };
 
 static pthread_mutex_t g_dev_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -37,6 +46,32 @@ static TAILQ_HEAD(, spdk_rdma_device) g_dev_list = TAILQ_HEAD_INITIALIZER(g_dev_
 static LIST_HEAD(, spdk_rdma_mem_map) g_rdma_mr_maps = LIST_HEAD_INITIALIZER(&g_rdma_mr_maps);
 static pthread_mutex_t g_rdma_mr_maps_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+static uint32_t
+rdma_get_access_flags(struct spdk_rdma_mem_map *rmap)
+{
+	uint32_t access_flags = 0;
+
+	switch (rmap->role) {
+	case SPDK_RDMA_MEMORY_MAP_ROLE_TARGET:
+		access_flags = IBV_ACCESS_LOCAL_WRITE;
+		if (rmap->pd->context->device->transport_type == IBV_TRANSPORT_IWARP) {
+			/* IWARP requires REMOTE_WRITE permission for RDMA_READ operation */
+			access_flags |= IBV_ACCESS_REMOTE_WRITE;
+		}
+		break;
+	case SPDK_RDMA_MEMORY_MAP_ROLE_INITIATOR:
+		access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
+		break;
+	default:
+		SPDK_UNREACHABLE();
+	}
+#ifdef IBV_ACCESS_OPTIONAL_FIRST
+	access_flags |= IBV_ACCESS_RELAXED_ORDERING;
+#endif
+
+	return access_flags;
+}
+
 static int
 rdma_mem_notify(void *cb_ctx, struct spdk_mem_map *map,
 		enum spdk_mem_map_notify_action action,
@@ -45,7 +80,6 @@ rdma_mem_notify(void *cb_ctx, struct spdk_mem_map *map,
 	struct spdk_rdma_mem_map *rmap = cb_ctx;
 	struct ibv_pd *pd = rmap->pd;
 	struct ibv_mr *mr;
-	uint32_t access_flags = 0;
 	int rc;
 
 	switch (action) {
@@ -54,24 +88,7 @@ rdma_mem_notify(void *cb_ctx, struct spdk_mem_map *map,
 			rc = spdk_mem_map_set_translation(map, (uint64_t)vaddr, size, rmap->hooks->get_rkey(pd, vaddr,
 							  size));
 		} else {
-			switch (rmap->role) {
-			case SPDK_RDMA_MEMORY_MAP_ROLE_TARGET:
-				access_flags = IBV_ACCESS_LOCAL_WRITE;
-				if (pd->context->device->transport_type == IBV_TRANSPORT_IWARP) {
-					/* IWARP requires REMOTE_WRITE permission for RDMA_READ operation */
-					access_flags |= IBV_ACCESS_REMOTE_WRITE;
-				}
-				break;
-			case SPDK_RDMA_MEMORY_MAP_ROLE_INITIATOR:
-				access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
-				break;
-			default:
-				SPDK_UNREACHABLE();
-			}
-#ifdef IBV_ACCESS_OPTIONAL_FIRST
-			access_flags |= IBV_ACCESS_RELAXED_ORDERING;
-#endif
-			mr = ibv_reg_mr(pd, vaddr, size, access_flags);
+			mr = ibv_reg_mr(pd, vaddr, size, rdma_get_access_flags(rmap));
 			if (mr == NULL) {
 				SPDK_ERRLOG("ibv_reg_mr() failed\n");
 				return -1;
@@ -120,6 +137,35 @@ _rdma_free_mem_map(struct spdk_rdma_mem_map *map)
 	}
 }
 
+static struct ibv_mr *
+rdma_get_external_mr(struct spdk_rdma_mem_map *map, struct spdk_l0_region *region)
+{
+	struct spdk_rdma_external_mr *entry;
+
+	LIST_FOREACH(entry, &map->external_mrs, link) {
+		if (entry->region == region) {
+			return entry->mr;
+		}
+	}
+
+	entry = calloc(1, sizeof(*entry));
+	if (entry == NULL) {
+		return NULL;
+	}
+
+	entry->region = region;
+	entry->mr = ibv_reg_mr(map->pd, spdk_l0_region_base(region),
+			       spdk_l0_region_len(region), rdma_get_access_flags(map));
+	if (entry->mr == NULL) {
+		free(entry);
+		SPDK_ERRLOG("ibv_reg_mr() failed for L0 region\n");
+		return NULL;
+	}
+
+	LIST_INSERT_HEAD(&map->external_mrs, entry, link);
+	return entry->mr;
+}
+
 struct spdk_rdma_mem_map *
 spdk_rdma_create_mem_map(struct ibv_pd *pd, struct spdk_nvme_rdma_hooks *hooks,
 			 enum spdk_rdma_memory_map_role role)
@@ -150,6 +196,7 @@ spdk_rdma_create_mem_map(struct ibv_pd *pd, struct spdk_nvme_rdma_hooks *hooks,
 	map->ref_count = 1;
 	map->hooks = hooks;
 	map->role = role;
+	LIST_INIT(&map->external_mrs);
 	map->map = spdk_mem_map_alloc(0, &g_rdma_map_ops, map);
 	if (!map->map) {
 		SPDK_ERRLOG("Unable to create memory map\n");
@@ -168,6 +215,7 @@ void
 spdk_rdma_free_mem_map(struct spdk_rdma_mem_map **_map)
 {
 	struct spdk_rdma_mem_map *map;
+	struct spdk_rdma_external_mr *entry, *tmp;
 
 	if (!_map) {
 		return;
@@ -192,6 +240,11 @@ spdk_rdma_free_mem_map(struct spdk_rdma_mem_map **_map)
 	if (map->map) {
 		spdk_mem_map_free(&map->map);
 	}
+	LIST_FOREACH_SAFE(entry, &map->external_mrs, link, tmp) {
+		LIST_REMOVE(entry, link);
+		ibv_dereg_mr(entry->mr);
+		free(entry);
+	}
 	_rdma_free_mem_map(map);
 }
 
@@ -199,7 +252,10 @@ int
 spdk_rdma_get_translation(struct spdk_rdma_mem_map *map, void *address,
 			  size_t length, struct spdk_rdma_memory_translation *translation)
 {
+	struct spdk_l0_region *region;
 	uint64_t real_length = length;
+	uint64_t offset = 0;
+	struct ibv_mr *mr;
 
 	assert(map);
 	assert(address);
@@ -213,8 +269,18 @@ spdk_rdma_get_translation(struct spdk_rdma_mem_map *map, void *address,
 		translation->mr_or_key.mr = (struct ibv_mr *)spdk_mem_map_translate(map->map, (uint64_t)address,
 					    &real_length);
 		if (spdk_unlikely(!translation->mr_or_key.mr)) {
-			SPDK_ERRLOG("No translation for ptr %p, size %zu\n", address, length);
-			return -EINVAL;
+			if (!spdk_l0_find_region(address, &region, &offset)) {
+				SPDK_ERRLOG("No translation for ptr %p, size %zu\n", address, length);
+				return -EINVAL;
+			}
+
+			mr = rdma_get_external_mr(map, region);
+			if (mr == NULL) {
+				return -ENOMEM;
+			}
+
+			real_length = spdk_l0_region_len(region) - offset;
+			translation->mr_or_key.mr = mr;
 		}
 	}
 

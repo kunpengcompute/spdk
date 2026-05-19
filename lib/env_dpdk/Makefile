@@ -10,7 +10,7 @@ SO_VER := 11
 SO_MINOR := 0
 
 CFLAGS += $(ENV_CFLAGS)
-C_SRCS = env.c memory.c pci.c init.c threads.c
+C_SRCS = env.c memory.c pci.c init.c threads.c l0.c l0_mmap_platform.c
 C_SRCS += pci_ioat.c pci_virtio.c pci_vmd.c pci_idxd.c
 C_SRCS += pci_event.c sigbus_handler.c pci_dpdk.c
 C_SRCS += pci_dpdk_2207.c pci_dpdk_2211.c
