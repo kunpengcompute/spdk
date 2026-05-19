@@ -1806,3 +1806,20 @@ spdk_nvmf_poll_group_dump_stat(struct spdk_nvmf_poll_group *group, struct spdk_j
 	spdk_json_write_array_end(w);
 	spdk_json_write_object_end(w);
 }
+
+void
+spdk_nvmf_poll_group_reset_stat(struct spdk_nvmf_poll_group *group)
+{
+	struct spdk_nvmf_transport_poll_group *tgroup;
+
+	group->stat.admin_qpairs = 0;
+	group->stat.io_qpairs = 0;
+	group->stat.pending_bdev_io = 0;
+	group->stat.completed_nvme_io = 0;
+
+	TAILQ_FOREACH(tgroup, &group->tgroups, link) {
+		if (tgroup->transport->ops->poll_group_reset_stat) {
+			tgroup->transport->ops->poll_group_reset_stat(tgroup);
+		}
+	}
+}

@@ -2166,6 +2166,96 @@ rpc_nvmf_get_stats(struct spdk_jsonrpc_request *request,
 
 SPDK_RPC_REGISTER("nvmf_get_stats", rpc_nvmf_get_stats, SPDK_RPC_RUNTIME)
 
+struct rpc_nvmf_reset_stats_ctx {
+	char *tgt_name;
+	struct spdk_nvmf_tgt *tgt;
+	struct spdk_jsonrpc_request *request;
+};
+
+static const struct spdk_json_object_decoder rpc_reset_stats_decoders[] = {
+	{"tgt_name", offsetof(struct rpc_nvmf_reset_stats_ctx, tgt_name), spdk_json_decode_string, true},
+};
+
+static void
+free_reset_stats_ctx(struct rpc_nvmf_reset_stats_ctx *ctx)
+{
+	free(ctx->tgt_name);
+	free(ctx);
+}
+
+static void
+rpc_nvmf_reset_stats_done(struct spdk_io_channel_iter *i, int status)
+{
+	struct rpc_nvmf_reset_stats_ctx *ctx = spdk_io_channel_iter_get_ctx(i);
+
+	if (status) {
+		spdk_jsonrpc_send_error_response(ctx->request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 spdk_strerror(-status));
+	} else {
+		spdk_jsonrpc_send_bool_response(ctx->request, true);
+	}
+
+	free_reset_stats_ctx(ctx);
+}
+
+static void
+_rpc_nvmf_reset_stats(struct spdk_io_channel_iter *i)
+{
+	struct rpc_nvmf_reset_stats_ctx *ctx = spdk_io_channel_iter_get_ctx(i);
+	struct spdk_io_channel *ch;
+	struct spdk_nvmf_poll_group *group;
+
+	ch = spdk_get_io_channel(ctx->tgt);
+	group = spdk_io_channel_get_ctx(ch);
+
+	spdk_nvmf_poll_group_reset_stat(group);
+
+	spdk_put_io_channel(ch);
+	spdk_for_each_channel_continue(i, 0);
+}
+
+static void
+rpc_nvmf_reset_stats(struct spdk_jsonrpc_request *request,
+		     const struct spdk_json_val *params)
+{
+	struct rpc_nvmf_reset_stats_ctx *ctx;
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "Memory allocation error");
+		return;
+	}
+	ctx->request = request;
+
+	if (params) {
+		if (spdk_json_decode_object(params, rpc_reset_stats_decoders,
+					    SPDK_COUNTOF(rpc_reset_stats_decoders),
+					    ctx)) {
+			SPDK_ERRLOG("spdk_json_decode_object failed\n");
+			spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+							 "Invalid parameters");
+			free_reset_stats_ctx(ctx);
+			return;
+		}
+	}
+
+	ctx->tgt = spdk_nvmf_get_tgt(ctx->tgt_name);
+	if (!ctx->tgt) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+						 "Unable to find a target.");
+		free_reset_stats_ctx(ctx);
+		return;
+	}
+
+	spdk_for_each_channel(ctx->tgt,
+			      _rpc_nvmf_reset_stats,
+			      ctx,
+			      rpc_nvmf_reset_stats_done);
+}
+
+SPDK_RPC_REGISTER("nvmf_reset_stats", rpc_nvmf_reset_stats, SPDK_RPC_RUNTIME)
+
 static void
 dump_nvmf_ctrlr(struct spdk_json_write_ctx *w, struct spdk_nvmf_ctrlr *ctrlr)
 {

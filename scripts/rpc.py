@@ -2577,6 +2577,14 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('-t', '--tgt-name', help='The name of the parent NVMe-oF target (optional)', type=str)
     p.set_defaults(func=nvmf_get_stats)
 
+    def nvmf_reset_stats(args):
+        print_json(rpc.nvmf.nvmf_reset_stats(args.client, tgt_name=args.tgt_name))
+
+    p = subparsers.add_parser(
+        'nvmf_reset_stats', help='Reset cumulative statistics for NVMf subsystem')
+    p.add_argument('-t', '--tgt-name', help='The name of the parent NVMe-oF target (optional)', type=str)
+    p.set_defaults(func=nvmf_reset_stats)
+
     def nvmf_set_crdt(args):
         print_dict(rpc.nvmf.nvmf_set_crdt(args.client, args.crdt1, args.crdt2, args.crdt3))
 

@@ -14,7 +14,13 @@
 #include "spdk/nvmf_transport.h"
 #include "spdk/queue.h"
 #include "spdk/util.h"
+#include "spdk_internal/l0.h"
 #include "spdk_internal/usdt.h"
+
+bool spdk_l0_data_pool_enabled(void) __attribute__((weak));
+struct spdk_mempool *spdk_l0_mempool_create(const char *name, size_t count,
+		size_t ele_size, spdk_mempool_obj_cb_t *obj_init,
+		void *obj_init_arg) __attribute__((weak));
 
 #define MAX_MEMPOOL_NAME_LENGTH 40
 #define NVMF_TRANSPORT_DEFAULT_ASSOCIATION_TIMEOUT_IN_MS 120000
@@ -26,6 +32,14 @@ struct nvmf_transport_ops_list_element {
 
 TAILQ_HEAD(nvmf_transport_ops_list, nvmf_transport_ops_list_element)
 g_spdk_nvmf_transport_ops = TAILQ_HEAD_INITIALIZER(g_spdk_nvmf_transport_ops);
+
+static inline bool
+nvmf_transport_l0_enabled(void)
+{
+	return spdk_l0_data_pool_enabled != NULL &&
+	       spdk_l0_mempool_create != NULL &&
+	       spdk_l0_data_pool_enabled();
+}
 
 static inline const struct spdk_nvmf_transport_ops *
 nvmf_get_transport_ops(const char *transport_name)
@@ -226,11 +240,22 @@ spdk_nvmf_transport_create(const char *transport_name, struct spdk_nvmf_transpor
 	}
 
 	if (opts_local.num_shared_buffers) {
-		transport->data_buf_pool = spdk_mempool_create(spdk_mempool_name,
+		if (strcasecmp(transport_name, "RDMA") == 0 && nvmf_transport_l0_enabled()) {
+			transport->data_buf_pool = spdk_l0_mempool_create(spdk_mempool_name,
+						   opts_local.num_shared_buffers,
+						   opts_local.io_unit_size + NVMF_DATA_BUFFER_ALIGNMENT,
+						   NULL, NULL);
+			if (transport->data_buf_pool == NULL) {
+				SPDK_ERRLOG("Unable to allocate L0-backed buffer pool for transport %s\n",
+					    transport_name);
+			}
+		} else {
+			transport->data_buf_pool = spdk_mempool_create(spdk_mempool_name,
 					   opts_local.num_shared_buffers,
 					   opts_local.io_unit_size + NVMF_DATA_BUFFER_ALIGNMENT,
 					   SPDK_MEMPOOL_DEFAULT_CACHE_SIZE,
 					   SPDK_ENV_SOCKET_ID_ANY);
+		}
 
 		if (!transport->data_buf_pool) {
 			if (spdk_mempool_lookup(spdk_mempool_name) != NULL) {

@@ -67,6 +67,35 @@ nvmf_ctrlr_copy_supported(struct spdk_nvmf_ctrlr *ctrlr)
 }
 
 static void
+nvmf_bdev_ctrlr_start_bdev_latency(struct spdk_nvmf_request *req)
+{
+	const struct spdk_nvmf_transport_ops *ops = req->qpair->transport->ops;
+
+	if (ops->req_start_bdev_latency) {
+		ops->req_start_bdev_latency(req);
+	}
+}
+
+static void
+nvmf_bdev_ctrlr_clear_bdev_latency(struct spdk_nvmf_request *req)
+{
+	req->bdev_io_tsc = 0;
+	req->bdev_io_tsc_valid = false;
+}
+
+static void
+nvmf_bdev_ctrlr_update_bdev_latency(struct spdk_nvmf_request *req)
+{
+	const struct spdk_nvmf_transport_ops *ops = req->qpair->transport->ops;
+
+	if (ops->req_complete_bdev_latency) {
+		ops->req_complete_bdev_latency(req);
+	}
+
+	nvmf_bdev_ctrlr_clear_bdev_latency(req);
+}
+
+static void
 nvmf_bdev_ctrlr_complete_cmd(struct spdk_bdev_io *bdev_io, bool success,
 			     void *cb_arg)
 {
@@ -96,6 +125,7 @@ nvmf_bdev_ctrlr_complete_cmd(struct spdk_bdev_io *bdev_io, bool success,
 	response->status.sc = sc;
 	response->status.sct = sct;
 
+	nvmf_bdev_ctrlr_update_bdev_latency(req);
 	spdk_nvmf_request_complete(req);
 	spdk_bdev_free_io(bdev_io);
 }
@@ -297,9 +327,11 @@ nvmf_bdev_ctrlr_read_cmd(struct spdk_bdev *bdev, struct spdk_bdev_desc *desc,
 
 	assert(!spdk_nvmf_request_using_zcopy(req));
 
+	nvmf_bdev_ctrlr_start_bdev_latency(req);
 	rc = spdk_bdev_readv_blocks(desc, ch, req->iov, req->iovcnt, start_lba, num_blocks,
 				    nvmf_bdev_ctrlr_complete_cmd, req);
 	if (spdk_unlikely(rc)) {
+		nvmf_bdev_ctrlr_clear_bdev_latency(req);
 		if (rc == -ENOMEM) {
 			nvmf_bdev_ctrl_queue_io(req, bdev, ch, nvmf_ctrlr_process_io_cmd_resubmit, req);
 			return SPDK_NVMF_REQUEST_EXEC_STATUS_ASYNCHRONOUS;
@@ -343,9 +375,11 @@ nvmf_bdev_ctrlr_write_cmd(struct spdk_bdev *bdev, struct spdk_bdev_desc *desc,
 
 	assert(!spdk_nvmf_request_using_zcopy(req));
 
+	nvmf_bdev_ctrlr_start_bdev_latency(req);
 	rc = spdk_bdev_writev_blocks(desc, ch, req->iov, req->iovcnt, start_lba, num_blocks,
 				     nvmf_bdev_ctrlr_complete_cmd, req);
 	if (spdk_unlikely(rc)) {
+		nvmf_bdev_ctrlr_clear_bdev_latency(req);
 		if (rc == -ENOMEM) {
 			nvmf_bdev_ctrl_queue_io(req, bdev, ch, nvmf_ctrlr_process_io_cmd_resubmit, req);
 			return SPDK_NVMF_REQUEST_EXEC_STATUS_ASYNCHRONOUS;
@@ -882,6 +916,7 @@ nvmf_bdev_ctrlr_zcopy_start_complete(struct spdk_bdev_io *bdev_io, bool success,
 
 	req->zcopy_bdev_io = bdev_io; /* Preserve the bdev_io for the end zcopy */
 
+	nvmf_bdev_ctrlr_update_bdev_latency(req);
 	spdk_nvmf_request_complete(req);
 	/* Don't free the bdev_io here as it is needed for the END ZCOPY */
 }
@@ -918,9 +953,15 @@ nvmf_bdev_ctrlr_zcopy_start(struct spdk_bdev *bdev,
 
 	bool populate = (req->cmd->nvme_cmd.opc == SPDK_NVME_OPC_READ) ? true : false;
 
+	if (populate) {
+		nvmf_bdev_ctrlr_start_bdev_latency(req);
+	}
 	rc = spdk_bdev_zcopy_start(desc, ch, req->iov, req->iovcnt, start_lba,
 				   num_blocks, populate, nvmf_bdev_ctrlr_zcopy_start_complete, req);
 	if (spdk_unlikely(rc != 0)) {
+		if (populate) {
+			nvmf_bdev_ctrlr_clear_bdev_latency(req);
+		}
 		if (rc == -ENOMEM) {
 			nvmf_bdev_ctrl_queue_io(req, bdev, ch, nvmf_ctrlr_process_io_cmd_resubmit, req);
 			return SPDK_NVMF_REQUEST_EXEC_STATUS_ASYNCHRONOUS;
@@ -952,6 +993,7 @@ nvmf_bdev_ctrlr_zcopy_end_complete(struct spdk_bdev_io *bdev_io, bool success,
 
 	spdk_bdev_free_io(bdev_io);
 	req->zcopy_bdev_io = NULL;
+	nvmf_bdev_ctrlr_update_bdev_latency(req);
 	spdk_nvmf_request_complete(req);
 }
 
@@ -960,6 +1002,9 @@ nvmf_bdev_ctrlr_zcopy_end(struct spdk_nvmf_request *req, bool commit)
 {
 	int rc __attribute__((unused));
 
+	if (commit && req->cmd->nvme_cmd.opc == SPDK_NVME_OPC_WRITE) {
+		nvmf_bdev_ctrlr_start_bdev_latency(req);
+	}
 	rc = spdk_bdev_zcopy_end(req->zcopy_bdev_io, commit, nvmf_bdev_ctrlr_zcopy_end_complete, req);
 
 	/* The only way spdk_bdev_zcopy_end() can fail is if we pass a bdev_io type that isn't ZCOPY */
