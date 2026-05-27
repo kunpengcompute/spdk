@@ -363,4 +363,3 @@ SPDK中自带isal-crc32c与isal-crc16算法，在spdk21.01.1-for-KAE分支中，
     >
     >此处fio下发的读写数据是通过NVMe-oF协议与NVMe盘进行传输的。在SPDK中，NVMe-oF协议会对传输的每个数据单元\(pdu\)进行校验，采用的就是crc算法，因此每次io操作都会进行一次crc计算。判断ksal-crc是否使能，在执行fio操作的过程中，可通过perf工具抓取SPDK进程的函数热点信息。然后在函数热点信息中查找是否有KsalCrc32c函数，如果存在该函数则说明ksal-crc使能成功。
 
-SPDK中自带isal-crc32c与isal-crc16算法，在spdk21.01.1-for-KAE分支中，引入了华为自研的ksal-crc算法，自研的ksal-crc算法相较于isal2.29版本的crc算法有20%以上的性能提升。本章节主要介绍在SPDK中如何对ksal-crc进行性能测试和系统测试。

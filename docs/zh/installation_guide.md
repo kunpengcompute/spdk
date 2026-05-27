@@ -30,13 +30,13 @@
 
 鲲鹏服务器主板K系列硬件加速引擎已默认开启，无需申请License。
 
-License申请和安装操作请参见《[华为服务器iBMC许可证 使用指导](https://support.huawei.com/enterprise/zh/management-software/ibmc-pid-8060757?category=operation-maintenance)》。
+License申请和安装操作请参见《[华为服务器 iBMC 许可证 使用指导](https://support.huawei.com/enterprise/zh/management-software/ibmc-pid-8060757?category=operation-maintenance)》。
 
 ## 安装KAE<a id="ZH-CN_TOPIC_0000002551566777"></a>
 
 鲲鹏加速引擎KAE是基于鲲鹏920处理器提供的硬件加速解决方案，包含了KAE加解密和KAEzip，KAE加解密模块是基于OpenSSL的，因此在安装和使用KAE加解密模块前请正确安装OpenSSL。
 
-具体的OpenSSL安装步骤请参见[安装OpenSSL](https://www.hikunpeng.com/document/detail/zh/kunpengaccel/kae/usermanual/kunpengaccel_06_0009.html)。
+具体的OpenSSL安装步骤请参见[安装OpenSSL](https://www.hikunpeng.com/document/detail/zh/kunpengaccel/kae/kae/docs/zh/installation_guide.md#%E5%AE%89%E8%A3%85openssltongsuo)。
 
 **操作步骤<a id="section1834411526119"></a>**
 
@@ -57,7 +57,7 @@ License申请和安装操作请参见《[华为服务器iBMC许可证 使用指�
     sh build.sh all
     ```
 
-    代码脚本提供一键式安装命令。进入KAE源码包目录，使用`sh build.sh all`命令安装KAE中所有组件内容，由于加解密和解压缩模块都需要安装，所以此处一键安装所有模块，详细安装流程请参见《[源码安装（KAE2.0）](https://www.hikunpeng.com/document/detail/zh/kunpengaccel/kae/usermanual/kunpengaccel_06_0012.html)》。
+    代码脚本提供一键式安装命令。进入KAE源码包目录，使用`sh build.sh all`命令安装KAE中所有组件内容，由于加解密和解压缩模块都需要安装，所以此处一键安装所有模块，详细安装流程请参见《[源码安装（KAE2.0）](https://www.hikunpeng.com/document/detail/zh/kunpengaccel/kae/kae/docs/zh/installation_guide.md#%E6%96%B9%E5%BC%8F%E4%B8%80%EF%BC%9A%E6%BA%90%E7%A0%81%E5%AE%89%E8%A3%85)》。
 
 **验证KAE是否安装成功<a id="section10160654163615"></a>**
 
@@ -140,7 +140,7 @@ sh env-check.sh
     >     patch -p1 < spdk_v21.01.1_dpdk_compress_kae.patch
     >    ```
     >
-    > 4. `--with-ksal`是加载ksal算法模块，KSAL是华为自研的高性能crc算法，对外闭源，采取动态库的形式集成，因此需要先[安装KSAL算法包](https://www.hikunpeng.com/document/detail/zh/kunpengsdss/basicAccelFeatures/ksal/kunpengksal_16_0007.html)，加载KSAL动态库才能正常配置与编译，执行编译操作,单击[下载rpm包](https://kunpeng-repo.obs.cn-north-4.myhuaweicloud.com/Kunpeng%20BoostKit/Kunpeng%20BoostKit%2024.0.RC5/BoostKit-KSAL_1.8.0.zip)。
+    > 4. `--with-ksal`是加载ksal算法模块，KSAL是华为自研的高性能crc算法，对外闭源，采取动态库的形式集成，因此需要先[安装KSAL算法包](https://www.hikunpeng.com/document/detail/zh/kunpengsdss/basicAccelFeatures/ksal/kunpengksal_16_0007.html)，加载KSAL动态库才能正常配置与编译，执行编译操作，单击[下载rpm包](https://www.hikunpeng.com/boostkit/download?version=24.0.RC5)。
 
 7. <a id="000001"></a>执行编译操作。
 
