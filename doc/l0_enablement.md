@@ -117,9 +117,21 @@ C_SRCS = env.c memory.c pci.c init.c threads.c l0.c l0_mmap_platform.c
 make -j
 ```
 
-## 启动 spdk_tgt 时启用 L0
+## 推荐启用策略
 
-启动 `spdk_tgt` 前设置：
+建议优先只开启 io stash，不设置 `SPDK_NVMF_L0_ENABLE`。此时 NVMf RDMA target 仍使用默认 DPDK mempool，但可以先验证 io stash 对带宽吸收和缓存命中的改善。
+
+如果只开启 io stash 后，内存带宽吸收仍然不够，再在启动 `spdk_tgt` 前开启 L0：
+
+```bash
+export SPDK_NVMF_L0_ENABLE=1
+```
+
+也就是说，L0 是第二阶段增强开关，不建议在没有带宽瓶颈判断前默认打开。
+
+## 启动 spdk_tgt 时按需启用 L0
+
+需要启用 L0 时，在启动 `spdk_tgt` 前设置：
 
 ```bash
 export SPDK_NVMF_L0_ENABLE=1
@@ -152,9 +164,37 @@ scripts/rpc.py nvmf_create_transport -t RDMA
 
 只要 `SPDK_NVMF_L0_ENABLE=1` 已在 `spdk_tgt` 启动前设置，创建 RDMA transport 时，target 的 `data_buf_pool` 会优先使用 L0-backed mempool。
 
-如果创建 transport 时显式调整 `num_shared_buffers`、`io_unit_size` 或 `max_io_size`，需要注意当前 patch 的单个 L0 region 上限为 64MiB。L0 data pool 大小大致等于 `num_shared_buffers * (io_unit_size + NVMF_DATA_BUFFER_ALIGNMENT)`，超过上限会导致 L0 region 创建失败。
+如果创建 transport 时显式调整 `num_shared_buffers`、`io_unit_size` 或 `max_io_size`，需要注意当前 patch 的单个 L0 region 上限为 64MiB。实际使用时建议给对齐和元数据留一些余量，`io_unit_size` 参数 `-u` 与 `num_shared_buffers` 参数 `-n` 的乘积不要超过 60MiB：
+
+```text
+-u * -n <= 60 * 1024 * 1024
+```
+
+例如 `-u 131072 -n 480` 的乘积为 60MiB。
 
 注意：环境变量必须在创建 transport 之前设置。对已经创建好的 transport，再设置环境变量不会 retroactively 替换已有 buffer pool。
+
+### L0 模式参考 RPC 配置
+
+开启 L0 后，`spdk_tgt` 的 RPC 配置可以参考如下命令。第一行 `nvmf_create_transport` 中需要特别注意 `-u` 和 `-n` 的乘积不要超过 60MiB。
+
+```bash
+./scripts/rpc.py nvmf_create_transport -t RDMA -q 128 -m 127 -c 4096 -i 131072 -u 131072 -a 128 -n 480 -b 32
+
+./scripts/rpc.py bdev_nvme_attach_controller -b Nvme0 -t PCIe -a 0000:5d:00.0
+./scripts/rpc.py bdev_nvme_attach_controller -b Nvme1 -t PCIe -a 0000:5e:00.0
+./scripts/rpc.py bdev_nvme_attach_controller -b Nvme2 -t PCIe -a 0000:5f:00.0
+./scripts/rpc.py bdev_nvme_attach_controller -b Nvme3 -t PCIe -a 0000:60:00.0
+
+./scripts/rpc.py nvmf_create_subsystem nqn.2016-06.io.spdk:cnode1 -a -s SPDK00000000000001 -m 8
+./scripts/rpc.py nvmf_subsystem_add_ns nqn.2016-06.io.spdk:cnode1 Nvme0n1
+./scripts/rpc.py nvmf_subsystem_add_ns nqn.2016-06.io.spdk:cnode1 Nvme1n1
+./scripts/rpc.py nvmf_subsystem_add_ns nqn.2016-06.io.spdk:cnode1 Nvme2n1
+./scripts/rpc.py nvmf_subsystem_add_ns nqn.2016-06.io.spdk:cnode1 Nvme3n1
+
+./scripts/rpc.py nvmf_subsystem_add_listener nqn.2016-06.io.spdk:cnode1 -t RDMA -a <ip1> -s <port1>
+./scripts/rpc.py nvmf_subsystem_add_listener nqn.2016-06.io.spdk:cnode1 -t RDMA -a <ip2> -s <port2>
+```
 
 ## patch 生效路径
 
