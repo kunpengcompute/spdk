@@ -135,6 +135,9 @@ io stash-only 模式下，测试方式和原生一致：
 | 4 | 写 | 128k | 16 | 0 | 18.04 | 0.1 | 0.12 | 0.22 |
 | 4 | 写 | 128k | 32 | 0 | 18.04 | 0.57 | 4.11 | 4.68 |
 
+原生即没有内存缩减的情况，后端内存读、写带宽和前端的读写带宽总和差不多是1:1
+使能io stash后，上表测试数据可以观测到，32并发以下，后端内存读写带宽远小于客户端带宽，32并发再往上后端内存写带宽会有比较明显增加
+
 ## L0 使能与测试
 
 如果只开启 io stash 后，内存带宽吸收仍然不够，可以叠加开启 L0。L0 模式需要先准备 L0 内核和驱动，再使用带 L0 patch 的 SPDK v23.01.1 重新编译。
@@ -234,70 +237,100 @@ L0 模式下的 RPC 配置可以复用 io stash 章节中的命令。需要特�
 
 `SPDK_NVMF_L0_ENABLE` 必须在 `spdk_tgt` 启动并创建 RDMA transport 前设置。已经创建好的 transport 不会因为后续再设置环境变量而替换已有 buffer pool。
 
-## patch 生效路径
+## L0 内存申请基本函数说明
 
-### 运行时开关
-
-`lib/env_dpdk/l0.c` 中：
+L0 内存的基本使用方式比较简单：先打开默认 L0 设备 `/dev/hisi_l0`，再通过 `mmap()` 从设备映射一段内存。为了满足 L0 内存对齐要求，代码里通常会先预留一段普通虚拟地址空间，把起始地址对齐到 2MiB 后释放预留区，再在对齐后的地址上重新映射 L0 设备。代码如下：
 
 ```c
-bool
-spdk_l0_data_pool_enabled(void)
+#include "spdk/stdinc.h"
+
+#include <sys/mman.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <limits.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+
+#define L0_DEV "/dev/hisi_l0"
+#define L0_ALIGN (2UL * 1024UL * 1024UL)
+#define L0_RETRY_MAX 5
+
+static inline uintptr_t align_up_uintptr(uintptr_t value, uintptr_t align)
 {
-    return l0_env_flag_enabled("SPDK_NVMF_L0_ENABLE");
+	return (value + align - 1) & ~(align - 1);
+}
+
+int get_l0_fd(void)
+{
+	return open(L0_DEV, O_RDWR);
+}
+
+void * mmap_alloc(unsigned long size, int fd)
+{
+	void *reserve_addr;
+	void *mapped_addr;
+	uintptr_t aligned_addr;
+	unsigned long reserve_len;
+	int retry = L0_RETRY_MAX;
+
+	if (size == 0 || fd < 0) {
+		errno = EINVAL;
+		return NULL;
+	}
+
+	if (size > ULONG_MAX - L0_ALIGN) {
+		errno = EOVERFLOW;
+		return NULL;
+	}
+
+	reserve_len = size + L0_ALIGN;
+	while (retry-- > 0) {
+		reserve_addr = mmap(NULL, reserve_len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (reserve_addr == MAP_FAILED) {
+			fprintf(stderr, "reserve mmap failed, errno=%d\n", errno);
+			return NULL;
+		}
+
+		aligned_addr = align_up_uintptr((uintptr_t)reserve_addr, L0_ALIGN);
+		if (munmap(reserve_addr, reserve_len) == -1) {
+			return NULL;
+		}
+
+		mapped_addr = mmap((void *)aligned_addr, size, PROT_READ | PROT_WRITE,
+				   MAP_SHARED | MAP_FIXED, fd, 0);
+		if (mapped_addr == MAP_FAILED) {
+			if (errno == EEXIST || errno == EINVAL) {
+				continue;
+			}
+			fprintf(stderr, "L0 mmap failed, errno=%d\n", errno);
+			return NULL;
+		}
+
+		if ((uintptr_t)mapped_addr != aligned_addr) {
+			munmap(mapped_addr, size);
+			errno = EFAULT;
+			return NULL;
+		}
+
+		memset(mapped_addr, 0, size);
+		return mapped_addr;
+	}
+
+	errno = EBUSY;
+	return NULL;
+}
+
+int main()
+{
+    int fd = get_l0_fd();
+    void *l0_ptr = mmap_alloc(1 << 24, fd); // 申请16M l0内存
+    return 0;
 }
 ```
 
-这个函数读取 `SPDK_NVMF_L0_ENABLE`，决定 L0 data pool 是否启用。
+申请完成后，`vaddr` 在使用语义上就是一段普通内存地址，CPU 可以正常 load/store，也可以传给需要普通指针的读写逻辑。释放时要使用 `munmap()` 并关闭设备 fd，不能直接 `free()`。
 
-### RDMA transport 使用 L0 mempool
+### 使用注意事项
 
-`lib/nvmf/transport.c` 中，创建 transport data buffer pool 时有如下判断：
-
-```c
-if (strcasecmp(transport_name, "RDMA") == 0 && nvmf_transport_l0_enabled()) {
-    transport->data_buf_pool = spdk_l0_mempool_create(...);
-} else {
-    transport->data_buf_pool = spdk_mempool_create(...);
-}
-```
-
-因此只有 RDMA transport 且 `SPDK_NVMF_L0_ENABLE` 为真时，才会走 L0-backed mempool。普通 RDMA transport 未启用 L0 时仍走原来的 DPDK mempool；TCP、PCIe 等 transport 不会因为该开关自动使用 L0。
-
-### L0 内存映射和注册
-
-`spdk_l0_mempool_create()` 会创建 L0 region，并将该 region 切成 mempool object：
-
-```c
-region = spdk_l0_region_create(name, aligned_total_len);
-```
-
-`spdk_l0_region_create()` 会：
-
-1. 打开 L0 设备，默认 `/dev/hisi_l0`。
-2. 通过 `mmap_alloc()` 映射 L0 内存，地址按 2MB 对齐。
-3. 通过 `vtop()` 获取物理地址。
-4. 调用 `spdk_mem_register(region->vaddr, region->len)` 注册到 SPDK memory map。
-
-### RDMA MR 注册
-
-RDMA 侧在 `lib/rdma/common.c` 中支持 L0 region：
-
-```c
-if (!spdk_l0_find_region(address, &region, &offset)) {
-    SPDK_ERRLOG("No translation for ptr %p, size %zu\n", address, length);
-    return -EINVAL;
-}
-
-mr = rdma_get_external_mr(map, region);
-```
-
-当普通 SPDK mem_map 查不到 translation 时，如果地址属于 L0 region，就为该 L0 region 创建并缓存 RDMA MR。这样 NVMf RDMA target 对 L0 data buffer 进行 RDMA 访问时可以拿到正确的 lkey/rkey。
-
-### 当前 patch 限制
-
-1. 当前实现只为 NVMf RDMA transport 的 shared data buffer pool 切换到 L0。
-2. `spdk_l0_region_create()` 当前限制单个 L0 region 最大为 64MiB，测试命令中建议 `-u * -n` 不超过 60MiB。
-3. 当前 patch 只支持一个 L0 region；重复创建 L0 region 会返回 busy。
-4. `SPDK_NVMF_L0_ENABLE` 是运行时开关，必须在 `spdk_tgt` 启动并创建 RDMA transport 前设置。
-5. 后端 bdev、NVMe 盘、普通 SPDK hugepage 初始化仍按原 SPDK 流程配置；L0 仅替换该 patch 覆盖到的 NVMf RDMA data buffer pool。
+1. mmap_alloc传入size不超过64M
