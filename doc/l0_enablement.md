@@ -1,16 +1,20 @@
-# SPDK NVMf RDMA L0 使能说明
+# SPDK target 使能 io stash/L0
 
-本文说明如何在带 L0 patch 的 SPDK 中启用 L0，并让 `spdk_tgt` 的 NVMf RDMA target data buffer pool 使用 L0 内存。
+本文主要说明在 io stash、L0 两个特性使能场景下，`spdk_tgt` 的测试方式。
 
-当前 patch 的作用范围是 NVMf RDMA target 侧的共享 data buffer pool。普通 RDMA transport 未启用 L0 时仍走原来的 DPDK mempool；TCP、PCIe 等 transport 不会因为该开关自动使用 L0。
+io stash 可以先在系统侧单独开启，SPDK 不需要做源码修改。L0 是在 io stash 效果仍不满足内存带宽吸收需求时再叠加开启的增强方式，需要加载 L0 驱动，并在 SPDK v23.01.1 代码上打入 L0 适配 patch 后重新编译。
 
-## 前置条件
+## 推荐启用策略
 
-以下命令通常需要 root 权限执行。
+建议优先只开启 io stash，不设置 `SPDK_NVMF_L0_ENABLE`。此时测试上层软件时，SPDK 不需要做任何修改，NVMf RDMA target 仍使用默认 DPDK mempool。
 
-### 1. 配置 BIOS Cache Mode
+如果只开启 io stash 后，内存带宽吸收效果不好，再叠加开启 L0。开启 L0 时需要加载 L0 驱动，SPDK 源码需要打入 L0 使能适配 patch 并重新编译，具体使能方式见后续章节。
 
-使用 L0 前需要先进入 BIOS 配置 Cache Mode，否则无法按一个 CPU 的 L3 cache 整体申请 L0 资源。
+测试时建议从低并发、大块 I/O 开始，例如先使用 128K I/O size 和较低并发数验证链路、带宽与稳定性，再逐步增加并发数。
+
+## BIOS 设置
+
+使用前需要先进入 BIOS 配置 Cache Mode，否则无法按一个 CPU 的 L3 cache 整体申请 L0 资源。
 
 BIOS 路径：
 
@@ -24,50 +28,15 @@ Advanced -> Performance Config -> Cache Mode
 in:share out:share
 ```
 
-保存 BIOS 配置后重启系统，再继续执行后续 L0 内核、驱动和 io stash 配置。
+保存 BIOS 配置后重启系统。
 
-### 2. 启用 L0
+## io stash 使能与测试
 
-安装指定内核：
+io stash 可以作为第一阶段测试方式单独开启。此模式下不要设置 `SPDK_NVMF_L0_ENABLE`，SPDK 使用原始代码和默认 DPDK mempool 即可。
 
-```bash
-rpm -ivh kernel-5.10.0_l0_mwp+-80.aarch64.rpm
-```
+以下命令通常需要 root 权限执行。
 
-安装完成后建议重启并确认已经进入该 L0 内核：
-
-```bash
-reboot
-uname -r
-```
-
-加载 L0 驱动：
-
-```bash
-modprobe hisi_l0
-```
-
-默认 L0 设备路径是 `/dev/hisi_l0`。可以用下面命令检查设备是否存在：
-
-```bash
-ls -l /dev/hisi_l0
-```
-
-patch 中 `lib/env_dpdk/l0_mmap_platform.c` 定义了默认设备：
-
-```c
-#define L0_DEV "/dev/hisi_l0"
-```
-
-因此如果系统使用默认路径，SPDK 编译前不需要额外设置 L0 设备环境变量。
-
-如果设备路径不是 `/dev/hisi_l0`，可以在启动 `spdk_tgt` 前设置：
-
-```bash
-export SPDK_NVMF_L0_DEVICE=/path/to/l0_device
-```
-
-### 3. 启用 io stash
+### 1. 编译并加载 io stash
 
 拉取代码仓：
 
@@ -100,83 +69,18 @@ echo 1 > /sys/kernel/cache_stash/llc_enable
 cat /sys/kernel/cache_stash/llc_enable
 ```
 
-## 编译 SPDK
+### 2. 启动 spdk_tgt
 
-L0 patch 已经把 L0 相关源码加入 SPDK env dpdk 编译路径，例如 `lib/env_dpdk/Makefile` 中包含：
-
-```make
-C_SRCS = env.c memory.c pci.c init.c threads.c l0.c l0_mmap_platform.c
-```
-
-所以编译前不需要设置 `SPDK_NVMF_L0_ENABLE`。这个变量是 `spdk_tgt` 启动时读取的运行时开关。
-
-如果要跑 NVMf RDMA target，SPDK 仍然需要按 RDMA 方式编译，例如：
+io stash-only 模式下不要设置 `SPDK_NVMF_L0_ENABLE`：
 
 ```bash
-./configure --with-rdma
-make -j
-```
-
-## 推荐启用策略
-
-建议优先只开启 io stash，不设置 `SPDK_NVMF_L0_ENABLE`。此时 NVMf RDMA target 仍使用默认 DPDK mempool，但可以先验证 io stash 对带宽吸收和缓存命中的改善。
-
-如果只开启 io stash 后，内存带宽吸收仍然不够，再在启动 `spdk_tgt` 前开启 L0：
-
-```bash
-export SPDK_NVMF_L0_ENABLE=1
-```
-
-也就是说，L0 是第二阶段增强开关，不建议在没有带宽瓶颈判断前默认打开。
-
-## 启动 spdk_tgt 时按需启用 L0
-
-需要启用 L0 时，在启动 `spdk_tgt` 前设置：
-
-```bash
-export SPDK_NVMF_L0_ENABLE=1
-```
-
-支持的真值包括 `1`、`y`、`yes`、`true`、`on`。未设置或设置为其他值时，不启用 L0。
-
-示例：
-
-```bash
-export SPDK_NVMF_L0_ENABLE=1
+unset SPDK_NVMF_L0_ENABLE
 ./build/bin/spdk_tgt
 ```
 
-如果 L0 设备不是默认的 `/dev/hisi_l0`：
+### 3. 配置 NVMf RDMA target
 
-```bash
-export SPDK_NVMF_L0_ENABLE=1
-export SPDK_NVMF_L0_DEVICE=/path/to/l0_device
-./build/bin/spdk_tgt
-```
-
-## 创建 NVMf RDMA transport
-
-`spdk_tgt` 启动后，按原有方式创建 RDMA transport、subsystem、namespace 和 listener。例如：
-
-```bash
-scripts/rpc.py nvmf_create_transport -t RDMA
-```
-
-只要 `SPDK_NVMF_L0_ENABLE=1` 已在 `spdk_tgt` 启动前设置，创建 RDMA transport 时，target 的 `data_buf_pool` 会优先使用 L0-backed mempool。
-
-如果创建 transport 时显式调整 `num_shared_buffers`、`io_unit_size` 或 `max_io_size`，需要注意当前 patch 的单个 L0 region 上限为 64MiB。实际使用时建议给对齐和元数据留一些余量，`io_unit_size` 参数 `-u` 与 `num_shared_buffers` 参数 `-n` 的乘积不要超过 60MiB：
-
-```text
--u * -n <= 60 * 1024 * 1024
-```
-
-例如 `-u 131072 -n 480` 的乘积为 60MiB。
-
-注意：环境变量必须在创建 transport 之前设置。对已经创建好的 transport，再设置环境变量不会 retroactively 替换已有 buffer pool。
-
-### L0 模式参考 RPC 配置
-
-开启 L0 后，`spdk_tgt` 的 RPC 配置可以参考如下命令。第一行 `nvmf_create_transport` 中需要特别注意 `-u` 和 `-n` 的乘积不要超过 60MiB。
+`spdk_tgt` 启动后，可以参考如下 RPC 创建 RDMA transport、PCIe NVMe bdev、subsystem、namespace 和 listener：
 
 ```bash
 ./scripts/rpc.py nvmf_create_transport -t RDMA -q 128 -m 127 -c 4096 -i 131072 -u 131072 -a 128 -n 480 -b 32
@@ -195,6 +99,105 @@ scripts/rpc.py nvmf_create_transport -t RDMA
 ./scripts/rpc.py nvmf_subsystem_add_listener nqn.2016-06.io.spdk:cnode1 -t RDMA -a <ip1> -s <port1>
 ./scripts/rpc.py nvmf_subsystem_add_listener nqn.2016-06.io.spdk:cnode1 -t RDMA -a <ip2> -s <port2>
 ```
+
+其中 `<ip1>/<port1>`、`<ip2>/<port2>` 替换为实际 RDMA 网卡 IP 和端口。
+
+## L0 使能与测试
+
+如果只开启 io stash 后，内存带宽吸收仍然不够，可以叠加开启 L0。L0 模式需要先准备 L0 内核和驱动，再使用带 L0 patch 的 SPDK v23.01.1 重新编译。
+
+### 1. 加载 L0 驱动
+
+安装指定内核：
+
+```bash
+rpm -ivh kernel-5.10.0_l0_mwp+-80.aarch64.rpm
+```
+
+安装完成后建议重启，并确认已经进入该 L0 内核：
+
+```bash
+reboot
+uname -r
+```
+
+加载 L0 驱动：
+
+```bash
+modprobe hisi_l0
+```
+
+默认 L0 设备路径是 `/dev/hisi_l0`。使用下面命令检查设备是否存在，存在则表示驱动已生效：
+
+```bash
+ll /dev/hisi_l0
+```
+
+### 2. 获取 SPDK v23.01.1 并打入 L0 patch
+
+拉取 SPDK v23.01.1 代码：
+
+```bash
+git clone https://github.com/spdk/spdk.git spdk-v23.01.1-l0
+cd spdk-v23.01.1-l0
+git checkout v23.01.1
+git submodule update --init
+```
+
+打入 L0 适配 patch。以下命令假设 `spdk_v23.01.1_l0_data_pool_merged.patch` 已放在当前目录的上一级路径，可按实际位置调整：
+
+```bash
+git apply ../spdk_v23.01.1_l0_data_pool_merged.patch
+```
+
+如果 patch 已经放在 SPDK 代码根目录，也可以执行：
+
+```bash
+git apply spdk_v23.01.1_l0_data_pool_merged.patch
+```
+
+### 3. 编译 SPDK
+
+NVMf RDMA target 需要打开 RDMA：
+
+```bash
+./configure --with-rdma
+make -j
+```
+
+### 4. 启动前开启 L0
+
+启动 `spdk_tgt` 前设置 L0 开关：
+
+```bash
+export SPDK_NVMF_L0_ENABLE=1
+```
+
+支持的真值包括 `1`、`y`、`yes`、`true`、`on`。未设置或设置为其他值时，不启用 L0。
+
+默认 L0 设备路径是 `/dev/hisi_l0`。如果设备路径不是默认值，可以在启动 `spdk_tgt` 前设置：
+
+```bash
+export SPDK_NVMF_L0_DEVICE=/path/to/l0_device
+```
+
+启动 `spdk_tgt`：
+
+```bash
+./build/bin/spdk_tgt
+```
+
+### 5. 配置 NVMf RDMA target
+
+L0 模式下的 RPC 配置可以复用 io stash 章节中的命令。需要特别注意第一行 `nvmf_create_transport` 中 `-u` 和 `-n` 的乘积不要超过 60MiB：
+
+```text
+-u * -n <= 60 * 1024 * 1024
+```
+
+例如 `-u 131072 -n 480` 的乘积为 60MiB。
+
+`SPDK_NVMF_L0_ENABLE` 必须在 `spdk_tgt` 启动并创建 RDMA transport 前设置。已经创建好的 transport 不会因为后续再设置环境变量而替换已有 buffer pool。
 
 ## patch 生效路径
 
@@ -224,7 +227,7 @@ if (strcasecmp(transport_name, "RDMA") == 0 && nvmf_transport_l0_enabled()) {
 }
 ```
 
-因此只有 RDMA transport 且 `SPDK_NVMF_L0_ENABLE` 为真时，才会走 L0-backed mempool。
+因此只有 RDMA transport 且 `SPDK_NVMF_L0_ENABLE` 为真时，才会走 L0-backed mempool。普通 RDMA transport 未启用 L0 时仍走原来的 DPDK mempool；TCP、PCIe 等 transport 不会因为该开关自动使用 L0。
 
 ### L0 内存映射和注册
 
@@ -256,56 +259,10 @@ mr = rdma_get_external_mr(map, region);
 
 当普通 SPDK mem_map 查不到 translation 时，如果地址属于 L0 region，就为该 L0 region 创建并缓存 RDMA MR。这样 NVMf RDMA target 对 L0 data buffer 进行 RDMA 访问时可以拿到正确的 lkey/rkey。
 
-## 常见检查点
-
-1. 确认内核版本：
-
-```bash
-uname -r
-```
-
-2. 确认 L0 设备存在：
-
-```bash
-ls -l /dev/hisi_l0
-```
-
-3. 确认 io stash 已启用：
-
-```bash
-cat /sys/kernel/cache_stash/llc_enable
-```
-
-期望输出：
-
-```text
-1
-```
-
-4. 确认 `spdk_tgt` 启动前已经设置 L0 开关：
-
-```bash
-echo $SPDK_NVMF_L0_ENABLE
-```
-
-期望输出：
-
-```text
-1
-```
-
-5. 启动日志中应能看到类似 L0 region 分配日志：
-
-```text
-Allocated L0 region <name> vaddr=<addr> phys=<phys> len=<len>
-```
-
-如果 RDMA transport 创建失败，并出现 `Unable to allocate L0-backed buffer pool for transport RDMA`，优先检查 `/dev/hisi_l0`、`SPDK_NVMF_L0_DEVICE`、L0 region 大小限制以及 io stash/L0 驱动是否已经就绪。
-
-## 当前 patch 限制
+### 当前 patch 限制
 
 1. 当前实现只为 NVMf RDMA transport 的 shared data buffer pool 切换到 L0。
-2. `spdk_l0_region_create()` 当前限制单个 L0 region 最大为 64MiB。
+2. `spdk_l0_region_create()` 当前限制单个 L0 region 最大为 64MiB，测试命令中建议 `-u * -n` 不超过 60MiB。
 3. 当前 patch 只支持一个 L0 region；重复创建 L0 region 会返回 busy。
 4. `SPDK_NVMF_L0_ENABLE` 是运行时开关，必须在 `spdk_tgt` 启动并创建 RDMA transport 前设置。
 5. 后端 bdev、NVMe 盘、普通 SPDK hugepage 初始化仍按原 SPDK 流程配置；L0 仅替换该 patch 覆盖到的 NVMf RDMA data buffer pool。
