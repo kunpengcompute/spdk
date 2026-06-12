@@ -2,7 +2,7 @@
 
 本文主要说明在 io stash、L0 两个特性使能场景下，`spdk_tgt` 的测试方式。
 
-io stash 可以先在系统侧单独开启，SPDK 不需要做源码修改。L0 是在 io stash 效果仍不满足内存带宽吸收需求时再叠加开启的增强方式，需要加载 L0 驱动，并在 SPDK v23.01.1 代码上打入 L0 适配 patch 后重新编译。
+注意点：网卡、盘不要跨P，spdk_tgt启用绑定核和网卡、盘也同P
 
 ## 推荐启用策略
 
@@ -14,7 +14,7 @@ io stash 可以先在系统侧单独开启，SPDK 不需要做源码修改。L0 
 
 ## BIOS 设置
 
-使用前需要先进入 BIOS 配置 Cache Mode，否则无法按一个 CPU 的 L3 cache 整体申请 L0 资源。
+使用前需要先进入 BIOS 配置 Cache Mode
 
 BIOS 路径：
 
@@ -32,7 +32,7 @@ in:share out:share
 
 ## io stash 使能与测试
 
-io stash 可以作为第一阶段测试方式单独开启。此模式下不要设置 `SPDK_NVMF_L0_ENABLE`，SPDK 使用原始代码和默认 DPDK mempool 即可。
+io stash 可以作为第一阶段测试方式单独开启。
 
 以下命令通常需要 root 权限执行。
 
@@ -71,11 +71,11 @@ cat /sys/kernel/cache_stash/llc_enable
 
 ### 2. 启动 spdk_tgt
 
-io stash-only 模式下不要设置 `SPDK_NVMF_L0_ENABLE`：
+io stash-only 模式下，测试方式和原生一致：
 
 ```bash
-unset SPDK_NVMF_L0_ENABLE
-./build/bin/spdk_tgt
+# 这里默认用了cpu0前8个核，若网卡、盘再cpu1，需要调整
+./build/bin/spdk_tgt -m 0xff
 ```
 
 ### 3. 配置 NVMf RDMA target
@@ -100,7 +100,40 @@ unset SPDK_NVMF_L0_ENABLE
 ./scripts/rpc.py nvmf_subsystem_add_listener nqn.2016-06.io.spdk:cnode1 -t RDMA -a <ip2> -s <port2>
 ```
 
-其中 `<ip1>/<port1>`、`<ip2>/<port2>` 替换为实际 RDMA 网卡 IP 和端口。
+其中 `<ip1>/<port1>`、`<ip2>/<port2>` 替换为实际 RDMA 网卡 IP 和端口，可配置多个网口的监听。
+
+### 4. client perf测试命令
+
+服务端spdk_tgt启动配置完成后，进入spdk低吗根目录，压测工具命令如下
+
+```bash
+./build/examples/perf \
+  -r "trtype:RDMA adrfam:IPv4 traddr:<ip1> trsvcid:<port1> subnqn:nqn.2016-06.io.spdk:cnode1 ns:1" \
+  -r "trtype:RDMA adrfam:IPv4 traddr:<ip1> trsvcid:<port1> subnqn:nqn.2016-06.io.spdk:cnode1 ns:2" \
+  -r "trtype:RDMA adrfam:IPv4 traddr:<ip2> trsvcid:<port2> subnqn:nqn.2016-06.io.spdk:cnode1 ns:3" \
+  -r "trtype:RDMA adrfam:IPv4 traddr:<ip2> trsvcid:<port2> subnqn:nqn.2016-06.io.spdk:cnode1 ns:4" \
+  -o 131072 \
+  -q 1 \
+  -w read \
+  -t 60 \
+  -c 0xF
+```
+测试过程通过调整-q，控制并发
+
+### 5. 测试数据参考
+以下测试数据为内部测试工具测试，外部测试使用spdk自带perf应该类似，同并发端到端带宽可能有所差异
+测试使用4块huawei V6盘，一张2 * 100G CX6网卡，spdk_tgt绑8个核
+
+单位：GB
+
+| 盘数 | 读写模式 | 块大小 | 每盘请求并发 | 客户端读带宽 | 客户端写带宽 | 后端读带宽 | 后端写带宽 | 后端总带宽 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 4 | 读 | 128k | 16 | 13.96 | 0 | 0.13 | 0.1 | 0.23 |
+| 4 | 读 | 128k | 32 | 19.96 | 0 | 0.34 | 2.06 | 2.4 |
+| 4 | 读 | 128k | 64 | 21.53 | 0 | 1 | 14.9 | 15.9 |
+| 4 | 写 | 128k | 8 | 0 | 18.04 | 0.08 | 0.1 | 0.18 |
+| 4 | 写 | 128k | 16 | 0 | 18.04 | 0.1 | 0.12 | 0.22 |
+| 4 | 写 | 128k | 32 | 0 | 18.04 | 0.57 | 4.11 | 4.68 |
 
 ## L0 使能与测试
 
@@ -136,7 +169,6 @@ ll /dev/hisi_l0
 ### 2. 获取 SPDK v23.01.1 并打入 L0 patch
 
 拉取 SPDK v23.01.1 代码：
-
 ```bash
 git clone https://github.com/spdk/spdk.git spdk-v23.01.1-l0
 cd spdk-v23.01.1-l0
@@ -144,14 +176,17 @@ git checkout v23.01.1
 git submodule update --init
 ```
 
-打入 L0 适配 patch。以下命令假设 `spdk_v23.01.1_l0_data_pool_merged.patch` 已放在当前目录的上一级路径，可按实际位置调整：
+下载 `spdk_v23.01.1_l0_data_pool_merged.patch`到spdk-v23.01.1-l0同级目录，patch路径下载路径如下
+```bash
+https://gitcode.com/Enigmo-x/spdk/blob/origin_l0_test/spdk_v23.01.1_l0_data_pool_merged.patch
+```
 
+打入 L0 适配 patch：
 ```bash
 git apply ../spdk_v23.01.1_l0_data_pool_merged.patch
 ```
 
 如果 patch 已经放在 SPDK 代码根目录，也可以执行：
-
 ```bash
 git apply spdk_v23.01.1_l0_data_pool_merged.patch
 ```
@@ -184,7 +219,7 @@ export SPDK_NVMF_L0_DEVICE=/path/to/l0_device
 启动 `spdk_tgt`：
 
 ```bash
-./build/bin/spdk_tgt
+./build/bin/spdk_tgt -m 0xff
 ```
 
 ### 5. 配置 NVMf RDMA target
