@@ -615,10 +615,72 @@ bdev_qdlimit_delete_disk(const char *vbdev_name, spdk_bdev_unregister_cb cb_fn, 
 	}
 }
 
-/* Placeholder; real implementation in Task 5. */
+struct qdlimit_set_depth_ctx {
+	uint32_t queue_depth;
+};
+
+static void
+_qdlimit_set_depth_on_channel(struct spdk_io_channel_iter *i)
+{
+	struct spdk_io_channel *ch = spdk_io_channel_iter_get_channel(i);
+	struct qdlimit_io_channel *qd_ch = spdk_io_channel_get_ctx(ch);
+	struct qdlimit_set_depth_ctx *ctx = spdk_io_channel_iter_get_ctx(i);
+
+	/*
+	 * Lowering the cap below current outstanding does not abort in-flight
+	 * IO; the channel simply admits nothing new until it drains under the
+	 * new cap. Queued IO are released by completions as usual.
+	 */
+	qd_ch->max_depth = ctx->queue_depth;
+
+	spdk_for_each_channel_continue(i, 0);
+}
+
+static void
+_qdlimit_set_depth_done(struct spdk_io_channel_iter *i, int status)
+{
+	struct qdlimit_set_depth_ctx *ctx = spdk_io_channel_iter_get_ctx(i);
+
+	free(ctx);
+}
+
 int
 bdev_qdlimit_set_depth(const char *vbdev_name, uint32_t queue_depth)
 {
+	struct vbdev_qdlimit *qd_node = NULL, *tmp;
+	struct qdlimit_set_depth_ctx *ctx;
+	struct bdev_names *name;
+
+	TAILQ_FOREACH(tmp, &g_qd_nodes, link) {
+		if (strcmp(tmp->qd_bdev.name, vbdev_name) == 0) {
+			qd_node = tmp;
+			break;
+		}
+	}
+	if (qd_node == NULL) {
+		return -ENODEV;
+	}
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx == NULL) {
+		return -ENOMEM;
+	}
+	ctx->queue_depth = queue_depth;
+
+	/* Update the node so new channels and config_json see the new value. */
+	qd_node->queue_depth = queue_depth;
+
+	/* Keep the association list in sync so a delete+examine rebuild keeps the value. */
+	TAILQ_FOREACH(name, &g_bdev_names, link) {
+		if (strcmp(name->vbdev_name, vbdev_name) == 0) {
+			name->queue_depth = queue_depth;
+			break;
+		}
+	}
+
+	spdk_for_each_channel(qd_node, _qdlimit_set_depth_on_channel, ctx,
+			      _qdlimit_set_depth_done);
+
 	return 0;
 }
 

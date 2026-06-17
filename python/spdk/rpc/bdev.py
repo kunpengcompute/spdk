@@ -1317,6 +1317,47 @@ def bdev_passthru_delete(client, name):
     return client.call('bdev_passthru_delete', params)
 
 
+def bdev_qdlimit_create(client, base_bdev_name, name, queue_depth=None):
+    """Construct a queue-depth limiting block device on top of a base bdev.
+
+    Args:
+        base_bdev_name: name of the existing bdev
+        name: name of the new qdlimit bdev
+        queue_depth: per-core max in-flight IO (0 = unlimited, default 0)
+
+    Returns:
+        Name of created block device.
+    """
+    params = {
+        'base_bdev_name': base_bdev_name,
+        'name': name,
+    }
+    if queue_depth is not None:
+        params['queue_depth'] = queue_depth
+    return client.call('bdev_qdlimit_create', params)
+
+
+def bdev_qdlimit_delete(client, name):
+    """Remove a qdlimit bdev from the system.
+
+    Args:
+        name: name of the qdlimit bdev to delete
+    """
+    params = {'name': name}
+    return client.call('bdev_qdlimit_delete', params)
+
+
+def bdev_qdlimit_set_depth(client, name, queue_depth):
+    """Update the per-core queue depth of an existing qdlimit bdev.
+
+    Args:
+        name: name of the qdlimit bdev
+        queue_depth: new per-core max in-flight IO (0 = unlimited)
+    """
+    params = {'name': name, 'queue_depth': queue_depth}
+    return client.call('bdev_qdlimit_set_depth', params)
+
+
 def bdev_opal_create(client, nvme_ctrlr_name, nsid, locking_range_id, range_start, range_length, password):
     """Create opal virtual block devices from a base nvme bdev.
 

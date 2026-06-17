@@ -1142,6 +1142,38 @@ if __name__ == "__main__":
     p.add_argument('name', help='pass through bdev name')
     p.set_defaults(func=bdev_passthru_delete)
 
+    def bdev_qdlimit_create(args):
+        print_json(rpc.bdev.bdev_qdlimit_create(args.client,
+                                                base_bdev_name=args.base_bdev_name,
+                                                name=args.name,
+                                                queue_depth=args.queue_depth))
+
+    p = subparsers.add_parser('bdev_qdlimit_create',
+                              help='Add a per-core queue-depth limiting bdev on an existing bdev')
+    p.add_argument('-b', '--base-bdev-name', help="Name of the existing bdev", required=True)
+    p.add_argument('-p', '--name', help="Name of the qdlimit bdev", required=True)
+    p.add_argument('-d', '--queue-depth', type=int, default=0,
+                   help="Per-core max in-flight IO (0 = unlimited)")
+    p.set_defaults(func=bdev_qdlimit_create)
+
+    def bdev_qdlimit_delete(args):
+        rpc.bdev.bdev_qdlimit_delete(args.client, name=args.name)
+
+    p = subparsers.add_parser('bdev_qdlimit_delete', help='Delete a qdlimit bdev')
+    p.add_argument('name', help='qdlimit bdev name')
+    p.set_defaults(func=bdev_qdlimit_delete)
+
+    def bdev_qdlimit_set_depth(args):
+        rpc.bdev.bdev_qdlimit_set_depth(args.client,
+                                        name=args.name,
+                                        queue_depth=args.queue_depth)
+
+    p = subparsers.add_parser('bdev_qdlimit_set_depth',
+                              help='Update per-core queue depth of a qdlimit bdev')
+    p.add_argument('name', help='qdlimit bdev name')
+    p.add_argument('queue_depth', type=int, help='per-core max in-flight IO (0 = unlimited)')
+    p.set_defaults(func=bdev_qdlimit_set_depth)
+
     def bdev_get_bdevs(args):
         print_dict(rpc.bdev.bdev_get_bdevs(args.client,
                                            name=args.name, timeout=args.timeout_ms))
