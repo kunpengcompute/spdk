@@ -78,6 +78,7 @@ struct spdk_nvmf_request {
 	uint8_t				xfer; /* type enum spdk_nvme_data_transfer */
 	bool				data_from_pool;
 	bool				dif_enabled;
+	bool				qdlimit_charged; /* holds a qdlimit slot, released exactly once */
 	void				*data;
 	union nvmf_h2c_msg		*cmd;
 	union nvmf_c2h_msg		*rsp;

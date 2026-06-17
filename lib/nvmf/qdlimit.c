@@ -3,10 +3,13 @@
  */
 
 #include "qdlimit.h"
+#include "spdk/bdev.h"
+#include "spdk/nvme_spec.h"
 #include "spdk/nvmf_transport.h"
 #include "spdk/queue.h"
 #include "spdk/string.h"
 #include "spdk/log.h"
+#include "nvmf_internal.h"
 
 /* Global per-SSD config. Entries are created on first set/use and never freed at runtime
  * (only at config_cleanup), so the per-pg hot path can cache a stable pointer and read
@@ -186,4 +189,80 @@ nvmf_qdlimit_config_cleanup(void)
 		free(e);
 	}
 	pthread_mutex_unlock(&g_qdlimit_config_lock);
+}
+
+static enum nvmf_qdlimit_status
+qdlimit_admit_bdev(struct spdk_nvmf_transport_poll_group *group,
+		   struct spdk_nvmf_request *req, struct spdk_bdev *bdev, const char *bdev_name)
+{
+	struct qdlimit_pg_ctx *ctx = group->qdlimit_ctx;
+	struct qdlimit_pg_ssd *s;
+
+	if (ctx == NULL) {
+		return NVMF_QDLIMIT_ADMIT;	/* module not active on this group */
+	}
+	s = qdlimit_pg_get_ssd(ctx, bdev, bdev_name);
+	if (s == NULL || s->cfg->depth == 0) {
+		return NVMF_QDLIMIT_ADMIT;	/* unconfigured / unlimited */
+	}
+	if (s->inflight >= s->cfg->depth) {
+		/* Over limit: take it off the shared queue so other SSDs are not blocked,
+		 * and park it on this SSD's FIFO wait queue (reuses req->buf_link). */
+		STAILQ_REMOVE(&group->pending_buf_queue, req, spdk_nvmf_request, buf_link);
+		STAILQ_INSERT_TAIL(&s->wait_q, req, buf_link);
+		req->qdlimit_charged = false;
+		return NVMF_QDLIMIT_THROTTLED;
+	}
+	s->inflight++;
+	req->qdlimit_charged = true;
+	return NVMF_QDLIMIT_ADMIT;
+}
+
+/* Resolve nsid -> ns -> bdev using existing helpers, then gate. Bypass anything we cannot
+ * resolve or that carries no data. */
+enum nvmf_qdlimit_status
+nvmf_qdlimit_admit(struct spdk_nvmf_transport_poll_group *group, struct spdk_nvmf_request *req)
+{
+	struct spdk_nvmf_ctrlr *ctrlr;
+	struct spdk_nvmf_ns *ns;
+	struct spdk_bdev *bdev;
+
+	if (req->xfer == SPDK_NVME_DATA_NONE) {
+		return NVMF_QDLIMIT_ADMIT;
+	}
+	if (req->qpair == NULL) {
+		return NVMF_QDLIMIT_ADMIT;
+	}
+	ctrlr = req->qpair->ctrlr;
+	if (ctrlr == NULL || ctrlr->subsys == NULL) {
+		return NVMF_QDLIMIT_ADMIT;
+	}
+	ns = _nvmf_subsystem_get_ns(ctrlr->subsys, req->cmd->nvme_cmd.nsid);
+	if (ns == NULL || ns->bdev == NULL) {
+		return NVMF_QDLIMIT_ADMIT;
+	}
+	bdev = ns->bdev;
+	return qdlimit_admit_bdev(group, req, bdev, spdk_bdev_get_name(bdev));
+}
+
+/* Drain any parked requests (used by teardown and tests) by completing them back onto
+ * pending_buf_queue head; the transport's own teardown then fails/flushes them. */
+void
+nvmf_qdlimit_pg_fini_drain(struct spdk_nvmf_transport_poll_group *group)
+{
+	struct qdlimit_pg_ctx *ctx = group->qdlimit_ctx;
+	struct qdlimit_pg_ssd *s;
+	struct spdk_nvmf_request *req;
+
+	if (ctx == NULL) {
+		return;
+	}
+	TAILQ_FOREACH(s, &ctx->ssds, link) {
+		while (!STAILQ_EMPTY(&s->wait_q)) {
+			req = STAILQ_FIRST(&s->wait_q);
+			STAILQ_REMOVE_HEAD(&s->wait_q, buf_link);
+			STAILQ_INSERT_HEAD(&group->pending_buf_queue, req, buf_link);
+		}
+	}
+	nvmf_qdlimit_pg_fini(group);
 }

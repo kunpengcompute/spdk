@@ -7,6 +7,16 @@
 #include "common/lib/test_env.c"
 #include "nvmf/qdlimit.c"
 
+/* Opaque fake bdevs: we only use their addresses as identity keys and stub get_name. */
+static char g_fake_bdev_a;
+static char g_fake_bdev_b;
+
+DEFINE_STUB(spdk_bdev_get_name, const char *, (const struct spdk_bdev *bdev),
+	    ((void *)bdev == &g_fake_bdev_a) ? "bdevA" : "bdevB");
+
+DEFINE_STUB(_nvmf_subsystem_get_ns, struct spdk_nvmf_ns *,
+	    (struct spdk_nvmf_subsystem *subsystem, uint32_t nsid), NULL);
+
 static void
 test_config_set_get(void)
 {
@@ -60,6 +70,57 @@ test_pg_init_fini(void)
 	CU_ASSERT(group.qdlimit_ctx == NULL);
 }
 
+static void
+test_admit_under_and_over_limit(void)
+{
+	struct spdk_nvmf_transport_poll_group group = {};
+	struct spdk_nvmf_request r1 = {}, r2 = {}, r3 = {};
+
+	STAILQ_INIT(&group.pending_buf_queue);
+	nvmf_qdlimit_pg_init(&group);
+	CU_ASSERT(nvmf_qdlimit_set_depth("bdevA", 2) == 0);
+
+	/* Simulate the transport: each request is the queue head when gated. */
+	STAILQ_INSERT_TAIL(&group.pending_buf_queue, &r1, buf_link);
+	CU_ASSERT(qdlimit_admit_bdev(&group, &r1, (void *)&g_fake_bdev_a, "bdevA") == NVMF_QDLIMIT_ADMIT);
+	CU_ASSERT(r1.qdlimit_charged == true);
+
+	STAILQ_INSERT_TAIL(&group.pending_buf_queue, &r2, buf_link);
+	CU_ASSERT(qdlimit_admit_bdev(&group, &r2, (void *)&g_fake_bdev_a, "bdevA") == NVMF_QDLIMIT_ADMIT);
+
+	/* Third request exceeds depth=2: throttled and removed from pending_buf_queue. */
+	STAILQ_INSERT_TAIL(&group.pending_buf_queue, &r3, buf_link);
+	CU_ASSERT(qdlimit_admit_bdev(&group, &r3, (void *)&g_fake_bdev_a, "bdevA") == NVMF_QDLIMIT_THROTTLED);
+	CU_ASSERT(r3.qdlimit_charged == false);
+	/* r3 left pending_buf_queue; r1 and r2 remain. */
+	CU_ASSERT(STAILQ_FIRST(&group.pending_buf_queue) == &r1);
+
+	nvmf_qdlimit_pg_fini_drain(&group); /* test helper, see step 3 */
+	nvmf_qdlimit_config_cleanup();
+}
+
+static void
+test_admit_bypass(void)
+{
+	struct spdk_nvmf_transport_poll_group group = {};
+	struct spdk_nvmf_request rn = {}, ru = {};
+
+	STAILQ_INIT(&group.pending_buf_queue);
+	nvmf_qdlimit_pg_init(&group);
+
+	/* Unconfigured bdev (bdevB) => unlimited bypass, never charged. */
+	CU_ASSERT(qdlimit_admit_bdev(&group, &ru, (void *)&g_fake_bdev_b, "bdevB") == NVMF_QDLIMIT_ADMIT);
+	CU_ASSERT(ru.qdlimit_charged == false);
+
+	/* depth == 0 explicit => unlimited bypass. */
+	CU_ASSERT(nvmf_qdlimit_set_depth("bdevA", 0) == 0);
+	CU_ASSERT(qdlimit_admit_bdev(&group, &rn, (void *)&g_fake_bdev_a, "bdevA") == NVMF_QDLIMIT_ADMIT);
+	CU_ASSERT(rn.qdlimit_charged == false);
+
+	nvmf_qdlimit_pg_fini(&group);
+	nvmf_qdlimit_config_cleanup();
+}
+
 int
 main(int argc, char **argv)
 {
@@ -72,6 +133,8 @@ main(int argc, char **argv)
 	suite = CU_add_suite("qdlimit", NULL, NULL);
 	CU_ADD_TEST(suite, test_config_set_get);
 	CU_ADD_TEST(suite, test_pg_init_fini);
+	CU_ADD_TEST(suite, test_admit_under_and_over_limit);
+	CU_ADD_TEST(suite, test_admit_bypass);
 
 	CU_basic_set_mode(CU_BRM_VERBOSE);
 	CU_basic_run_tests();

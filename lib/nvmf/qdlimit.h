@@ -20,6 +20,7 @@ enum nvmf_qdlimit_status {
 /* Per-poll-group context lifecycle. Called from the RDMA poll-group create/destroy paths. */
 void nvmf_qdlimit_pg_init(struct spdk_nvmf_transport_poll_group *group);
 void nvmf_qdlimit_pg_fini(struct spdk_nvmf_transport_poll_group *group);
+void nvmf_qdlimit_pg_fini_drain(struct spdk_nvmf_transport_poll_group *group);
 
 /* Admission gate. Call at NEW->NEED_BUFFER, before get_buffers, only for the queue head.
  * On NVMF_QDLIMIT_THROTTLED the module has already removed req from group->pending_buf_queue
