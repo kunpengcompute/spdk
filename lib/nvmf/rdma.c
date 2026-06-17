@@ -3683,13 +3683,15 @@ nvmf_rdma_poll_group_destroy(struct spdk_nvmf_transport_poll_group *group)
 		return;
 	}
 
-	/* All qpairs (and thus all outstanding requests, including any qdlimit-throttled ones
-	 * parked on per-SSD wait queues) must already be drained before the poll group is
-	 * destroyed. The qpair error-teardown paths in nvmf_rdma_request_process and the abort
-	 * handler dequeue parked requests via nvmf_qdlimit_abort_dequeue. nvmf_qdlimit_pg_fini
-	 * asserts the wait queues are empty here as a fail-fast invariant check.
+	/* All qpairs are destroyed before their poll group, and nvmf_rdma_qpair_destroy() sweeps
+	 * every non-FREE request in resources->reqs[] through nvmf_rdma_request_process(). With the
+	 * qpair in error state that hits the teardown branch (see ~"force the request to the
+	 * completed state"), which for a NEED_BUFFER request calls nvmf_qdlimit_abort_dequeue() to
+	 * pull any qdlimit-throttled request off its per-SSD wait queue before completing it. So by
+	 * the time the poll group is destroyed, all wait queues are empty; nvmf_qdlimit_pg_fini
+	 * asserts that as a fail-fast invariant.
 	 * TODO(vm-validation): exercise a connection drop while an SSD is actively throttled to
-	 * confirm parked requests are fully drained on teardown. */
+	 * confirm this end-to-end on real RDMA. */
 	nvmf_qdlimit_pg_fini(&rgroup->group);
 
 	TAILQ_FOREACH_SAFE(poller, &rgroup->pollers, link, tmp) {

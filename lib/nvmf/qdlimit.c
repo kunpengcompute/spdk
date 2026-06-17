@@ -11,11 +11,14 @@
 #include "spdk/log.h"
 #include "nvmf_internal.h"
 
+/* Max bdev-name length stored in a config entry (includes the NUL terminator). */
+#define QDLIMIT_BDEV_NAME_MAX 256
+
 /* Global per-SSD config. Entries are created on first set/use and never freed at runtime
  * (only at config_cleanup), so the per-pg hot path can cache a stable pointer and read
  * ->depth without locking. depth == 0 means unlimited. */
 struct qdlimit_config_entry {
-	char				bdev_name[256];
+	char				bdev_name[QDLIMIT_BDEV_NAME_MAX];
 	uint32_t			depth;
 	TAILQ_ENTRY(qdlimit_config_entry) link;
 };
@@ -170,7 +173,7 @@ nvmf_qdlimit_set_depth(const char *bdev_name, uint32_t depth)
 	if (bdev_name == NULL || bdev_name[0] == '\0') {
 		return -EINVAL;
 	}
-	if (strlen(bdev_name) >= sizeof(e->bdev_name)) {
+	if (strlen(bdev_name) >= QDLIMIT_BDEV_NAME_MAX) {
 		return -ENAMETOOLONG;
 	}
 
