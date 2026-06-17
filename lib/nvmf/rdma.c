@@ -1884,8 +1884,9 @@ _nvmf_rdma_request_free(struct spdk_nvmf_rdma_request *rdma_req,
 	rqpair = SPDK_CONTAINEROF(rdma_req->req.qpair, struct spdk_nvmf_rdma_qpair, qpair);
 	rgroup = rqpair->poller->group;
 
-	/* Release the qdlimit slot when the buffer is returned to the pool. For reads this
-	 * is reached only in COMPLETED state, i.e. after the data-transfer WR is ACKed. */
+	/* Release the qdlimit slot as the request is freed (COMPLETED state). For reads this is
+	 * reached only after the data-transfer WR is ACKed (post-ACK by construction); for writes
+	 * it is reached after the backend write completes. No-op for uncharged requests. */
 	nvmf_qdlimit_release(&rgroup->group, &rdma_req->req);
 
 	if (rdma_req->req.data_from_pool) {
@@ -1998,7 +1999,11 @@ nvmf_rdma_request_process(struct spdk_nvmf_rdma_transport *rtransport,
 	 * to release resources. */
 	if (rqpair->ibv_state == IBV_QPS_ERR || rqpair->qpair.state != SPDK_NVMF_QPAIR_ACTIVE) {
 		if (rdma_req->state == RDMA_REQUEST_STATE_NEED_BUFFER) {
-			STAILQ_REMOVE(&rgroup->group.pending_buf_queue, &rdma_req->req, spdk_nvmf_request, buf_link);
+			/* A qdlimit-throttled request sits on a per-SSD wait queue, not on
+			 * pending_buf_queue; remove it from whichever queue actually holds it. */
+			if (!nvmf_qdlimit_abort_dequeue(&rgroup->group, &rdma_req->req)) {
+				STAILQ_REMOVE(&rgroup->group.pending_buf_queue, &rdma_req->req, spdk_nvmf_request, buf_link);
+			}
 		} else if (rdma_req->state == RDMA_REQUEST_STATE_DATA_TRANSFER_TO_CONTROLLER_PENDING) {
 			STAILQ_REMOVE(&rqpair->pending_rdma_read_queue, rdma_req, spdk_nvmf_rdma_request, state_link);
 		} else if (rdma_req->state == RDMA_REQUEST_STATE_DATA_TRANSFER_TO_HOST_PENDING) {
@@ -3678,6 +3683,13 @@ nvmf_rdma_poll_group_destroy(struct spdk_nvmf_transport_poll_group *group)
 		return;
 	}
 
+	/* All qpairs (and thus all outstanding requests, including any qdlimit-throttled ones
+	 * parked on per-SSD wait queues) must already be drained before the poll group is
+	 * destroyed. The qpair error-teardown paths in nvmf_rdma_request_process and the abort
+	 * handler dequeue parked requests via nvmf_qdlimit_abort_dequeue. nvmf_qdlimit_pg_fini
+	 * asserts the wait queues are empty here as a fail-fast invariant check.
+	 * TODO(vm-validation): exercise a connection drop while an SSD is actively throttled to
+	 * confirm parked requests are fully drained on teardown. */
 	nvmf_qdlimit_pg_fini(&rgroup->group);
 
 	TAILQ_FOREACH_SAFE(poller, &rgroup->pollers, link, tmp) {

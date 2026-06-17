@@ -1007,6 +1007,38 @@ Replace with:
 
 (The throttled request is not charged, so no `inflight` adjustment is needed; an admitted-but-buffer-waiting request stays on `pending_buf_queue` and takes the `STAILQ_REMOVE` branch, then releases its slot normally via `_nvmf_rdma_request_free`.)
 
+- [ ] **Step 3c: Fix the qpair-error teardown path (twin of 3b)**
+
+`nvmf_rdma_request_process` has a second `STAILQ_REMOVE(pending_buf_queue)` for NEED_BUFFER
+requests in its qpair-error-state branch (around line 2000), with the same hazard: a throttled
+request is on a per-SSD `wait_q`, not `pending_buf_queue`. Apply the same guard.
+
+Find it:
+```bash
+grep -n "if (rqpair->ibv_state == IBV_QPS_ERR" lib/nvmf/rdma.c
+```
+The block reads:
+```c
+		if (rdma_req->state == RDMA_REQUEST_STATE_NEED_BUFFER) {
+			STAILQ_REMOVE(&rgroup->group.pending_buf_queue, &rdma_req->req, spdk_nvmf_request, buf_link);
+		} else if (rdma_req->state == RDMA_REQUEST_STATE_DATA_TRANSFER_TO_CONTROLLER_PENDING) {
+```
+Replace the NEED_BUFFER branch with:
+```c
+		if (rdma_req->state == RDMA_REQUEST_STATE_NEED_BUFFER) {
+			/* A qdlimit-throttled request sits on a per-SSD wait queue, not on
+			 * pending_buf_queue; remove it from whichever queue actually holds it. */
+			if (!nvmf_qdlimit_abort_dequeue(&rgroup->group, &rdma_req->req)) {
+				STAILQ_REMOVE(&rgroup->group.pending_buf_queue, &rdma_req->req, spdk_nvmf_request, buf_link);
+			}
+		} else if (rdma_req->state == RDMA_REQUEST_STATE_DATA_TRANSFER_TO_CONTROLLER_PENDING) {
+```
+
+Note: at the `nvmf_qdlimit_pg_fini` call in `nvmf_rdma_poll_group_destroy`, add a comment that
+`pg_fini`'s `assert(wait_q empty)` is a fail-fast invariant (the transport must drain all
+parked requests before poll-group destroy, via the two teardown sites above), and flag a
+VM-validation TODO to exercise a connection drop under active throttling.
+
 - [ ] **Step 4: Insert `pg_init` in poll-group create**
 
 In `nvmf_rdma_poll_group_create` (around line 3524), find where `rgroup` is fully initialized and returned (just before `return &rgroup->group;`). Run:
