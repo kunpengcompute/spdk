@@ -130,6 +130,81 @@ test_admit_bypass(void)
 	nvmf_qdlimit_config_cleanup();
 }
 
+static void
+test_release_rearms_waiter(void)
+{
+	struct spdk_nvmf_transport_poll_group group = {};
+	struct spdk_nvmf_request r1 = {}, r2 = {}, r3 = {};
+
+	STAILQ_INIT(&group.pending_buf_queue);
+	nvmf_qdlimit_pg_init(&group);
+	CU_ASSERT(nvmf_qdlimit_set_depth("bdevA", 2) == 0);
+
+	STAILQ_INSERT_TAIL(&group.pending_buf_queue, &r1, buf_link);
+	qdlimit_admit_bdev(&group, &r1, (void *)&g_fake_bdev_a, "bdevA");	/* charged */
+	STAILQ_INSERT_TAIL(&group.pending_buf_queue, &r2, buf_link);
+	qdlimit_admit_bdev(&group, &r2, (void *)&g_fake_bdev_a, "bdevA");	/* charged */
+	STAILQ_INSERT_TAIL(&group.pending_buf_queue, &r3, buf_link);
+	qdlimit_admit_bdev(&group, &r3, (void *)&g_fake_bdev_a, "bdevA");	/* throttled, parked */
+
+	/* Release r1: inflight 2->1, r3 re-armed onto pending_buf_queue head. */
+	qdlimit_release_bdev(&group, &r1, (void *)&g_fake_bdev_a);
+	CU_ASSERT(r1.qdlimit_charged == false);
+	CU_ASSERT(STAILQ_FIRST(&group.pending_buf_queue) == &r3);
+
+	/* r3 can now be admitted (inflight back under limit). */
+	CU_ASSERT(qdlimit_admit_bdev(&group, &r3, (void *)&g_fake_bdev_a, "bdevA") == NVMF_QDLIMIT_ADMIT);
+	CU_ASSERT(r3.qdlimit_charged == true);
+
+	nvmf_qdlimit_pg_fini_drain(&group);
+	nvmf_qdlimit_config_cleanup();
+}
+
+static void
+test_release_uncharged_is_noop(void)
+{
+	struct spdk_nvmf_transport_poll_group group = {};
+	struct spdk_nvmf_request r = {};
+
+	STAILQ_INIT(&group.pending_buf_queue);
+	nvmf_qdlimit_pg_init(&group);
+
+	/* Never charged: release must not underflow or touch queues. */
+	qdlimit_release_bdev(&group, &r, (void *)&g_fake_bdev_a);
+	CU_ASSERT(r.qdlimit_charged == false);
+	CU_ASSERT(STAILQ_EMPTY(&group.pending_buf_queue));
+
+	nvmf_qdlimit_pg_fini(&group);
+}
+
+static void
+test_abort_dequeue_parked(void)
+{
+	struct spdk_nvmf_transport_poll_group group = {};
+	struct spdk_nvmf_request r1 = {}, r2 = {}, r3 = {};
+
+	STAILQ_INIT(&group.pending_buf_queue);
+	nvmf_qdlimit_pg_init(&group);
+	CU_ASSERT(nvmf_qdlimit_set_depth("bdevA", 2) == 0);
+
+	STAILQ_INSERT_TAIL(&group.pending_buf_queue, &r1, buf_link);
+	qdlimit_admit_bdev(&group, &r1, (void *)&g_fake_bdev_a, "bdevA");	/* charged */
+	STAILQ_INSERT_TAIL(&group.pending_buf_queue, &r2, buf_link);
+	qdlimit_admit_bdev(&group, &r2, (void *)&g_fake_bdev_a, "bdevA");	/* charged */
+	STAILQ_INSERT_TAIL(&group.pending_buf_queue, &r3, buf_link);
+	qdlimit_admit_bdev(&group, &r3, (void *)&g_fake_bdev_a, "bdevA");	/* throttled, parked */
+
+	/* r3 is parked -> dequeue returns true and removes it. */
+	CU_ASSERT(nvmf_qdlimit_abort_dequeue(&group, &r3) == true);
+	CU_ASSERT(nvmf_qdlimit_abort_dequeue(&group, &r3) == false);	/* no longer parked */
+
+	/* r1 is charged/admitted, never parked -> dequeue returns false. */
+	CU_ASSERT(nvmf_qdlimit_abort_dequeue(&group, &r1) == false);
+
+	nvmf_qdlimit_pg_fini_drain(&group);	/* wait_q now empty; safe */
+	nvmf_qdlimit_config_cleanup();
+}
+
 int
 main(int argc, char **argv)
 {
@@ -144,6 +219,9 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_pg_init_fini);
 	CU_ADD_TEST(suite, test_admit_under_and_over_limit);
 	CU_ADD_TEST(suite, test_admit_bypass);
+	CU_ADD_TEST(suite, test_release_rearms_waiter);
+	CU_ADD_TEST(suite, test_release_uncharged_is_noop);
+	CU_ADD_TEST(suite, test_abort_dequeue_parked);
 
 	CU_basic_set_mode(CU_BRM_VERBOSE);
 	CU_basic_run_tests();

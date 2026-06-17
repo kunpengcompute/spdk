@@ -245,6 +245,89 @@ nvmf_qdlimit_admit(struct spdk_nvmf_transport_poll_group *group, struct spdk_nvm
 	return qdlimit_admit_bdev(group, req, bdev, spdk_bdev_get_name(bdev));
 }
 
+static void
+qdlimit_release_bdev(struct spdk_nvmf_transport_poll_group *group,
+		     struct spdk_nvmf_request *req, struct spdk_bdev *bdev)
+{
+	struct qdlimit_pg_ctx *ctx = group->qdlimit_ctx;
+	struct qdlimit_pg_ssd *s;
+	struct spdk_nvmf_request *next;
+
+	if (ctx == NULL || !req->qdlimit_charged) {
+		return;
+	}
+	req->qdlimit_charged = false;
+
+	TAILQ_FOREACH(s, &ctx->ssds, link) {
+		if (s->bdev == bdev) {
+			break;
+		}
+	}
+	if (s == NULL) {
+		return;		/* should not happen for a charged request */
+	}
+
+	assert(s->inflight > 0);
+	s->inflight--;
+
+	/* Re-arm the oldest waiter for this SSD by putting it back at the head of the shared
+	 * queue; the next poll re-runs the gate, which now passes (inflight < depth). */
+	if (!STAILQ_EMPTY(&s->wait_q)) {
+		next = STAILQ_FIRST(&s->wait_q);
+		STAILQ_REMOVE_HEAD(&s->wait_q, buf_link);
+		STAILQ_INSERT_HEAD(&group->pending_buf_queue, next, buf_link);
+	}
+}
+
+void
+nvmf_qdlimit_release(struct spdk_nvmf_transport_poll_group *group, struct spdk_nvmf_request *req)
+{
+	struct spdk_nvmf_ctrlr *ctrlr;
+	struct spdk_nvmf_ns *ns;
+
+	if (!req->qdlimit_charged) {
+		return;
+	}
+	if (req->qpair == NULL || (ctrlr = req->qpair->ctrlr) == NULL || ctrlr->subsys == NULL) {
+		req->qdlimit_charged = false;	/* lost the mapping; just clear to avoid leaks */
+		return;
+	}
+	ns = _nvmf_subsystem_get_ns(ctrlr->subsys, req->cmd->nvme_cmd.nsid);
+	if (ns == NULL || ns->bdev == NULL) {
+		req->qdlimit_charged = false;
+		return;
+	}
+	qdlimit_release_bdev(group, req, ns->bdev);
+}
+
+/* Remove req from a per-SSD wait queue if it is currently parked there. Returns true if it
+ * was parked (and has now been removed), false if it was not on any wait queue. Used by the
+ * transport abort path: a throttled request in NEED_BUFFER state lives on a wait_q, NOT on
+ * pending_buf_queue, so the abort handler must consult this before doing its own
+ * STAILQ_REMOVE(pending_buf_queue). A throttled request is never charged, so no counter
+ * adjustment is needed here. */
+bool
+nvmf_qdlimit_abort_dequeue(struct spdk_nvmf_transport_poll_group *group,
+			   struct spdk_nvmf_request *req)
+{
+	struct qdlimit_pg_ctx *ctx = group->qdlimit_ctx;
+	struct qdlimit_pg_ssd *s;
+	struct spdk_nvmf_request *w;
+
+	if (ctx == NULL) {
+		return false;
+	}
+	TAILQ_FOREACH(s, &ctx->ssds, link) {
+		STAILQ_FOREACH(w, &s->wait_q, buf_link) {
+			if (w == req) {
+				STAILQ_REMOVE(&s->wait_q, req, spdk_nvmf_request, buf_link);
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 /* Drain any parked requests (used by teardown and tests) by completing them back onto
  * pending_buf_queue head; the transport's own teardown then fails/flushes them. */
 void
