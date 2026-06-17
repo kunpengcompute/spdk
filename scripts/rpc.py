@@ -2621,6 +2621,23 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('-t3', '--crdt3', help='Command Retry Delay Time 3, in units of 100 milliseconds', type=int)
     p.set_defaults(func=nvmf_set_crdt)
 
+    def nvmf_qdlimit_set_depth(args):
+        rpc.nvmf.nvmf_qdlimit_set_depth(args.client, bdev_name=args.bdev_name, depth=args.depth)
+
+    p = subparsers.add_parser('nvmf_qdlimit_set_depth',
+                              help='Set per-SSD pre-buffer admission depth (0 = unlimited)')
+    p.add_argument('bdev_name', help='Backing bdev (SSD) name')
+    p.add_argument('depth', help='Max in-flight buffer-holding requests per core', type=int)
+    p.set_defaults(func=nvmf_qdlimit_set_depth)
+
+    def nvmf_qdlimit_get_depth(args):
+        print_dict(rpc.nvmf.nvmf_qdlimit_get_depth(args.client, bdev_name=args.bdev_name))
+
+    p = subparsers.add_parser('nvmf_qdlimit_get_depth',
+                              help='Get configured per-SSD admission depth')
+    p.add_argument('bdev_name', help='Backing bdev (SSD) name')
+    p.set_defaults(func=nvmf_qdlimit_get_depth)
+
     # pmem
     def bdev_pmem_create_pool(args):
         num_blocks = int((args.total_size * 1024 * 1024) / args.block_size)

@@ -46,4 +46,10 @@ int nvmf_qdlimit_get_depth(const char *bdev_name, uint32_t *depth);
 /* Free all global config state. Call at transport/library teardown. */
 void nvmf_qdlimit_config_cleanup(void);
 
+/* TODO: nvmf_qdlimit_get_stats — per-core in-flight counters live in per-poll-group context on
+ * individual reactor threads; gathering them requires an spdk_for_each_channel()-style fan-out
+ * across all poll groups. Deferred: the buffer-occupancy ceiling test (Task 7) derives occupancy
+ * from the transport mempool counter (nvmf_get_stats pending_data_buffer) instead, so get_stats
+ * is not on the critical path for the current feature set. */
+
 #endif /* SPDK_NVMF_QDLIMIT_H */
