@@ -5,7 +5,7 @@
 #include "qdlimit.h"
 #include "spdk/queue.h"
 #include "spdk/string.h"
-#include "spdk/util.h"
+#include "spdk/log.h"
 
 /* Global per-SSD config. Entries are created on first set/use and never freed at runtime
  * (only at config_cleanup), so the per-pg hot path can cache a stable pointer and read
@@ -45,11 +45,10 @@ qdlimit_config_get_or_create(const char *bdev_name)
 	}
 	e = calloc(1, sizeof(*e));
 	if (e == NULL) {
+		SPDK_ERRLOG("Failed to allocate qdlimit config entry for %s\n", bdev_name);
 		return NULL;
 	}
-	spdk_strcpy_pad(e->bdev_name, bdev_name, sizeof(e->bdev_name) - 1, '\0');
-	e->bdev_name[sizeof(e->bdev_name) - 1] = '\0';
-	e->depth = 0;
+	spdk_strcpy_pad(e->bdev_name, bdev_name, sizeof(e->bdev_name), '\0');
 	TAILQ_INSERT_TAIL(&g_qdlimit_config, e, link);
 	return e;
 }

@@ -26,9 +26,19 @@ test_config_set_get(void)
 	CU_ASSERT(nvmf_qdlimit_get_depth("bdevA", &depth) == 0);
 	CU_ASSERT(depth == 0);
 
-	/* Bad args. */
+	/* Bad args: set_depth. */
 	CU_ASSERT(nvmf_qdlimit_set_depth(NULL, 1) == -EINVAL);
 	CU_ASSERT(nvmf_qdlimit_set_depth("", 1) == -EINVAL);
+
+	/* Bad args: get_depth. */
+	CU_ASSERT(nvmf_qdlimit_get_depth(NULL, &depth) == -EINVAL);
+	CU_ASSERT(nvmf_qdlimit_get_depth("bdevA", NULL) == -EINVAL);
+
+	/* Over-long bdev name (>= 256 chars) is rejected. */
+	char long_name[300];
+	memset(long_name, 'x', sizeof(long_name) - 1);
+	long_name[sizeof(long_name) - 1] = '\0';
+	CU_ASSERT(nvmf_qdlimit_set_depth(long_name, 1) == -ENAMETOOLONG);
 
 	nvmf_qdlimit_config_cleanup();
 }
