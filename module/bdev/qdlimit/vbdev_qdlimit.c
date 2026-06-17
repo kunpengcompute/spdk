@@ -104,6 +104,14 @@ _qdlimit_dispatch(struct qdlimit_io_channel *qd_ch, struct spdk_bdev_io *bdev_io
 /*
  * Release the in-flight slot held by io_ctx (if any) and admit one queued IO.
  * Only counted (limited) IO hold a slot, so bypass IO never trigger a drain.
+ *
+ * NOTE: this admits at most one IO per release ("one out, one in"), so for an
+ * asynchronously-completing backend (e.g. real NVMe, whose completions arrive
+ * from a poller) there is no recursion. With a backend that can complete
+ * synchronously inside submit, draining can recurse up to the queue depth; the
+ * intended deployment (NVMe-oF target over an NVMe SSD) is async, so this is
+ * acceptable. Revisit with a deferred (poller/msg) drain if deep queues over a
+ * sync backend become a use case.
  */
 static void
 _qdlimit_release_and_drain(struct qdlimit_io_channel *qd_ch, struct qdlimit_bdev_io *io_ctx)
@@ -310,6 +318,15 @@ static bool
 vbdev_qdlimit_io_type_supported(void *ctx, enum spdk_bdev_io_type io_type)
 {
 	struct vbdev_qdlimit *qd_node = (struct vbdev_qdlimit *)ctx;
+
+	/* qdlimit does not implement zero-copy passthrough. Report it unsupported
+	 * so the bdev layer falls back to buffered IO for this vbdev instead of
+	 * routing ZCOPY here (which we would otherwise fail). All other types
+	 * follow the base bdev's capabilities.
+	 */
+	if (io_type == SPDK_BDEV_IO_TYPE_ZCOPY) {
+		return false;
+	}
 
 	return spdk_bdev_io_type_supported(qd_node->base_bdev, io_type);
 }
@@ -559,7 +576,7 @@ vbdev_qdlimit_register(const char *bdev_name)
 		rc = spdk_bdev_register(&qd_node->qd_bdev);
 		if (rc) {
 			SPDK_ERRLOG("could not register qd_bdev\n");
-			spdk_bdev_module_release_bdev(&qd_node->qd_bdev);
+			spdk_bdev_module_release_bdev(qd_node->base_bdev);
 			spdk_bdev_close(qd_node->base_desc);
 			TAILQ_REMOVE(&g_qd_nodes, qd_node, link);
 			spdk_io_device_unregister(qd_node, NULL);
