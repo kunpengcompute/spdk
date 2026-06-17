@@ -101,14 +101,80 @@ vbdev_qdlimit_destruct(void *ctx)
 static void
 _qdlimit_dispatch(struct qdlimit_io_channel *qd_ch, struct spdk_bdev_io *bdev_io);
 
+/*
+ * Release the in-flight slot held by io_ctx (if any) and admit one queued IO.
+ * Only counted (limited) IO hold a slot, so bypass IO never trigger a drain.
+ */
+static void
+_qdlimit_release_and_drain(struct qdlimit_io_channel *qd_ch, struct qdlimit_bdev_io *io_ctx)
+{
+	struct qdlimit_bdev_io *next_ctx;
+	bool acquired;
+
+	if (!io_ctx->counted) {
+		return;
+	}
+
+	qdlimit_release(qd_ch);
+	io_ctx->counted = false;
+
+	next_ctx = STAILQ_FIRST(&qd_ch->queued_io);
+	if (next_ctx == NULL) {
+		return;
+	}
+	STAILQ_REMOVE_HEAD(&qd_ch->queued_io, link);
+
+	/* We just freed a slot, so this acquire must succeed. */
+	acquired = qdlimit_try_acquire(qd_ch);
+	assert(acquired);
+	(void)acquired;
+	next_ctx->counted = true;
+
+	_qdlimit_dispatch(qd_ch, spdk_bdev_io_from_ctx(next_ctx));
+}
+
 static void
 _qdlimit_complete_io(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
 	struct spdk_bdev_io *orig_io = cb_arg;
+	struct qdlimit_bdev_io *io_ctx = (struct qdlimit_bdev_io *)orig_io->driver_ctx;
+	struct qdlimit_io_channel *qd_ch = spdk_io_channel_get_ctx(io_ctx->ch);
 	int status = success ? SPDK_BDEV_IO_STATUS_SUCCESS : SPDK_BDEV_IO_STATUS_FAILED;
 
-	spdk_bdev_io_complete(orig_io, status);
 	spdk_bdev_free_io(bdev_io);
+	_qdlimit_release_and_drain(qd_ch, io_ctx);
+	spdk_bdev_io_complete(orig_io, status);
+}
+
+/* Re-dispatch an IO whose base submission previously failed with -ENOMEM.
+ * The slot stays reserved across the wait, so we go straight to dispatch.
+ */
+static void
+vbdev_qdlimit_resubmit_io(void *arg)
+{
+	struct spdk_bdev_io *bdev_io = (struct spdk_bdev_io *)arg;
+	struct qdlimit_bdev_io *io_ctx = (struct qdlimit_bdev_io *)bdev_io->driver_ctx;
+	struct qdlimit_io_channel *qd_ch = spdk_io_channel_get_ctx(io_ctx->ch);
+
+	_qdlimit_dispatch(qd_ch, bdev_io);
+}
+
+static void
+vbdev_qdlimit_queue_io_wait(struct qdlimit_io_channel *qd_ch, struct spdk_bdev_io *bdev_io)
+{
+	struct qdlimit_bdev_io *io_ctx = (struct qdlimit_bdev_io *)bdev_io->driver_ctx;
+	int rc;
+
+	io_ctx->bdev_io_wait.bdev = bdev_io->bdev;
+	io_ctx->bdev_io_wait.cb_fn = vbdev_qdlimit_resubmit_io;
+	io_ctx->bdev_io_wait.cb_arg = bdev_io;
+
+	rc = spdk_bdev_queue_io_wait(bdev_io->bdev, qd_ch->base_ch, &io_ctx->bdev_io_wait);
+	if (rc != 0) {
+		SPDK_ERRLOG("Queue io failed in vbdev_qdlimit_queue_io_wait, rc=%d.\n", rc);
+		_qdlimit_release_and_drain(qd_ch, io_ctx);
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+	}
 }
 
 static void
@@ -131,8 +197,15 @@ pt_read_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io, boo
 					    bdev_io->u.bdev.num_blocks,
 					    _qdlimit_complete_io, bdev_io);
 	if (rc != 0) {
-		SPDK_ERRLOG("ERROR on bdev_io read submission, rc=%d\n", rc);
-		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		if (rc == -ENOMEM) {
+			vbdev_qdlimit_queue_io_wait(qd_ch, bdev_io);
+		} else {
+			struct qdlimit_bdev_io *io_ctx =
+				(struct qdlimit_bdev_io *)bdev_io->driver_ctx;
+			SPDK_ERRLOG("ERROR on bdev_io read submission, rc=%d\n", rc);
+			_qdlimit_release_and_drain(qd_ch, io_ctx);
+			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		}
 	}
 }
 
@@ -197,12 +270,18 @@ _qdlimit_dispatch(struct qdlimit_io_channel *qd_ch, struct spdk_bdev_io *bdev_io
 	}
 
 	if (rc != 0) {
-		SPDK_ERRLOG("ERROR on bdev_io submission, rc=%d\n", rc);
-		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		struct qdlimit_bdev_io *io_ctx = (struct qdlimit_bdev_io *)bdev_io->driver_ctx;
+
+		if (rc == -ENOMEM) {
+			vbdev_qdlimit_queue_io_wait(qd_ch, bdev_io);
+		} else {
+			SPDK_ERRLOG("ERROR on bdev_io submission, rc=%d\n", rc);
+			_qdlimit_release_and_drain(qd_ch, io_ctx);
+			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		}
 	}
 }
 
-/* Task 1: plain passthru. Replaced in Task 3 with the depth-limiting version. */
 static void
 vbdev_qdlimit_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 {
@@ -211,7 +290,20 @@ vbdev_qdlimit_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bd
 
 	io_ctx->ch = ch;
 	io_ctx->counted = false;
-	_qdlimit_dispatch(qd_ch, bdev_io);
+
+	/* Management / buffer ops bypass the depth limit. */
+	if (!qdlimit_io_is_limited(bdev_io->type)) {
+		_qdlimit_dispatch(qd_ch, bdev_io);
+		return;
+	}
+
+	if (qdlimit_try_acquire(qd_ch)) {
+		io_ctx->counted = true;
+		_qdlimit_dispatch(qd_ch, bdev_io);
+	} else {
+		/* At per-core cap: hold the IO until a slot frees up. */
+		STAILQ_INSERT_TAIL(&qd_ch->queued_io, io_ctx, link);
+	}
 }
 
 static bool
