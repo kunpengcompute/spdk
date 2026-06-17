@@ -2622,7 +2622,7 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.set_defaults(func=nvmf_set_crdt)
 
     def nvmf_qdlimit_set_depth(args):
-        rpc.nvmf.nvmf_qdlimit_set_depth(args.client, bdev_name=args.bdev_name, depth=args.depth)
+        print_dict(rpc.nvmf.nvmf_qdlimit_set_depth(args.client, bdev_name=args.bdev_name, depth=args.depth))
 
     p = subparsers.add_parser('nvmf_qdlimit_set_depth',
                               help='Set per-SSD pre-buffer admission depth (0 = unlimited)')

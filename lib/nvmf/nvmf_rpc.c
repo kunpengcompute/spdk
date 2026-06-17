@@ -2507,6 +2507,8 @@ rpc_nvmf_qdlimit_set_depth(struct spdk_jsonrpc_request *request,
 
 	if (spdk_json_decode_object(params, rpc_qdlimit_set_depth_decoders,
 				    SPDK_COUNTOF(rpc_qdlimit_set_depth_decoders), &req)) {
+		SPDK_ERRLOG("spdk_json_decode_object failed\n");
+		free(req.bdev_name);
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 "Invalid parameters");
 		return;
@@ -2514,7 +2516,11 @@ rpc_nvmf_qdlimit_set_depth(struct spdk_jsonrpc_request *request,
 	rc = nvmf_qdlimit_set_depth(req.bdev_name, req.depth);
 	free(req.bdev_name);
 	if (rc != 0) {
-		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
+		SPDK_ERRLOG("nvmf_qdlimit_set_depth failed: %s\n", spdk_strerror(-rc));
+		spdk_jsonrpc_send_error_response(request,
+						 rc == -ENOMEM ? SPDK_JSONRPC_ERROR_INTERNAL_ERROR :
+						 SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 spdk_strerror(-rc));
 		return;
 	}
 	spdk_jsonrpc_send_bool_response(request, true);
@@ -2536,14 +2542,25 @@ rpc_nvmf_qdlimit_get_depth(struct spdk_jsonrpc_request *request,
 	struct rpc_qdlimit_get_depth req = {};
 	struct spdk_json_write_ctx *w;
 	uint32_t depth = 0;
+	int rc;
 
 	if (spdk_json_decode_object(params, rpc_qdlimit_get_depth_decoders,
 				    SPDK_COUNTOF(rpc_qdlimit_get_depth_decoders), &req)) {
+		SPDK_ERRLOG("spdk_json_decode_object failed\n");
+		free(req.bdev_name);
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 "Invalid parameters");
 		return;
 	}
-	(void)nvmf_qdlimit_get_depth(req.bdev_name, &depth);
+	/* -ENOENT means the bdev has no qdlimit config entry; report that distinctly rather than
+	 * masquerading it as depth 0 (which means "configured unlimited"). */
+	rc = nvmf_qdlimit_get_depth(req.bdev_name, &depth);
+	if (rc != 0) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "bdev not configured for qdlimit");
+		free(req.bdev_name);
+		return;
+	}
 
 	w = spdk_jsonrpc_begin_result(request);
 	spdk_json_write_object_begin(w);
