@@ -69,7 +69,15 @@ struct qdlimit_pg_ssd {
 
 struct qdlimit_pg_ctx {
 	TAILQ_HEAD(, qdlimit_pg_ssd)	ssds;
+	TAILQ_ENTRY(qdlimit_pg_ctx)	global_link;	/* membership in g_qdlimit_pg_list */
 };
+
+/* Registry of all live per-poll-group contexts, so nvmf_qdlimit_get_stats can aggregate the
+ * per-core inflight counters from the RPC thread. Guarded by g_qdlimit_config_lock: pg
+ * register/unregister, per-SSD entry creation, and stats reads are all serialized under it,
+ * so the RPC-thread read never races a poll-thread list mutation. The per-IO hot path
+ * (entry-already-exists lookup, inflight ++/--) stays lock-free. */
+static TAILQ_HEAD(, qdlimit_pg_ctx) g_qdlimit_pg_list = TAILQ_HEAD_INITIALIZER(g_qdlimit_pg_list);
 
 void
 nvmf_qdlimit_pg_init(struct spdk_nvmf_transport_poll_group *group)
@@ -83,6 +91,10 @@ nvmf_qdlimit_pg_init(struct spdk_nvmf_transport_poll_group *group)
 	}
 	TAILQ_INIT(&ctx->ssds);
 	group->qdlimit_ctx = ctx;
+
+	pthread_mutex_lock(&g_qdlimit_config_lock);
+	TAILQ_INSERT_TAIL(&g_qdlimit_pg_list, ctx, global_link);
+	pthread_mutex_unlock(&g_qdlimit_config_lock);
 }
 
 void
@@ -94,6 +106,11 @@ nvmf_qdlimit_pg_fini(struct spdk_nvmf_transport_poll_group *group)
 	if (ctx == NULL) {
 		return;
 	}
+
+	pthread_mutex_lock(&g_qdlimit_config_lock);
+	TAILQ_REMOVE(&g_qdlimit_pg_list, ctx, global_link);
+	pthread_mutex_unlock(&g_qdlimit_config_lock);
+
 	TAILQ_FOREACH_SAFE(s, &ctx->ssds, link, tmp) {
 		/* Parked requests must have been drained by the transport teardown path
 		 * (it walks pending_buf_queue + wait queues). Assert none leaked. */
@@ -115,21 +132,25 @@ qdlimit_pg_get_ssd(struct qdlimit_pg_ctx *ctx, struct spdk_bdev *bdev, const cha
 	struct qdlimit_pg_ssd *s;
 	struct qdlimit_config_entry *cfg;
 
+	/* Hot path: entry already exists. Lock-free read on the owning poll thread (the only
+	 * writer of this list; the insert below and get_stats reads are serialized by the lock). */
 	TAILQ_FOREACH(s, &ctx->ssds, link) {
 		if (s->bdev == bdev) {
 			return s;
 		}
 	}
 
+	/* First time this core sees this bdev: create the entry under the lock so a concurrent
+	 * nvmf_qdlimit_get_stats() (RPC thread) never observes a half-linked node. */
 	pthread_mutex_lock(&g_qdlimit_config_lock);
 	cfg = qdlimit_config_find(bdev_name);
-	pthread_mutex_unlock(&g_qdlimit_config_lock);
 	if (cfg == NULL) {
+		pthread_mutex_unlock(&g_qdlimit_config_lock);
 		return NULL;	/* never configured: unlimited */
 	}
-
 	s = calloc(1, sizeof(*s));
 	if (s == NULL) {
+		pthread_mutex_unlock(&g_qdlimit_config_lock);
 		SPDK_ERRLOG("Failed to allocate qdlimit per-SSD entry for %s\n", bdev_name);
 		return NULL;
 	}
@@ -137,6 +158,7 @@ qdlimit_pg_get_ssd(struct qdlimit_pg_ctx *ctx, struct spdk_bdev *bdev, const cha
 	s->cfg = cfg;
 	STAILQ_INIT(&s->wait_q);
 	TAILQ_INSERT_TAIL(&ctx->ssds, s, link);
+	pthread_mutex_unlock(&g_qdlimit_config_lock);
 	return s;
 }
 
@@ -189,6 +211,48 @@ nvmf_qdlimit_config_cleanup(void)
 		free(e);
 	}
 	pthread_mutex_unlock(&g_qdlimit_config_lock);
+}
+
+int
+nvmf_qdlimit_get_stats(const char *bdev_name, uint32_t *depth, uint32_t *total_inflight,
+		       uint32_t *num_poll_groups)
+{
+	struct qdlimit_config_entry *cfg;
+	struct qdlimit_pg_ctx *ctx;
+	struct qdlimit_pg_ssd *s;
+	uint32_t total = 0, pgs = 0;
+
+	if (bdev_name == NULL || depth == NULL || total_inflight == NULL || num_poll_groups == NULL) {
+		return -EINVAL;
+	}
+
+	pthread_mutex_lock(&g_qdlimit_config_lock);
+	cfg = qdlimit_config_find(bdev_name);
+	if (cfg == NULL) {
+		pthread_mutex_unlock(&g_qdlimit_config_lock);
+		return -ENOENT;
+	}
+	*depth = cfg->depth;
+	/* Walk every live poll group and sum the per-core inflight count for this SSD (matched by
+	 * stable cfg pointer). num_poll_groups counts only the cores that have actually driven IO
+	 * to this SSD (i.e. have an entry for it), so depth * num_poll_groups is the exact global
+	 * in-flight ceiling. The list structure is stable here because pg register/unregister and
+	 * per-SSD entry creation all hold this same lock; the inflight value reads are benign races
+	 * against the owning poll threads' lock-free ++/-- (stats are approximate). */
+	TAILQ_FOREACH(ctx, &g_qdlimit_pg_list, global_link) {
+		TAILQ_FOREACH(s, &ctx->ssds, link) {
+			if (s->cfg == cfg) {
+				total += s->inflight;
+				pgs++;
+				break;
+			}
+		}
+	}
+	pthread_mutex_unlock(&g_qdlimit_config_lock);
+
+	*total_inflight = total;
+	*num_poll_groups = pgs;
+	return 0;
 }
 
 static enum nvmf_qdlimit_status

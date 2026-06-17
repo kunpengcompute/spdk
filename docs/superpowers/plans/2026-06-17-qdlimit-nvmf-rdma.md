@@ -1174,7 +1174,7 @@ rpc_nvmf_qdlimit_get_depth(struct spdk_jsonrpc_request *request,
 SPDK_RPC_REGISTER("nvmf_qdlimit_get_depth", rpc_nvmf_qdlimit_get_depth, SPDK_RPC_RUNTIME)
 ```
 
-Note on `get_stats`: per-core in-flight counters live in per-poll-group context on individual cores; gathering them requires an `spdk_for_each_channel`-style fan-out across poll groups. That observability RPC is deferred — the buffer-occupancy ceiling test (Task 7) derives occupancy from the transport mempool counter instead, so `get_stats` is not on the critical path. Add a TODO comment in `qdlimit.h` noting the deferral.
+Note on `get_stats`: **UN-DEFERRED during T7 code review.** The original plan deferred `get_stats` and had the ceiling test read the transport's `pending_data_buffer` counter — but that counter is a cumulative buffer-*starvation* event counter (incremented at rdma.c, never decremented), not an occupancy gauge, so the ceiling assertion would have passed vacuously. `nvmf_qdlimit_get_stats(bdev_name, &depth, &total_inflight, &num_poll_groups)` is therefore implemented: it aggregates the per-core `inflight` counters across all poll groups via a global pg registry (`g_qdlimit_pg_list`) guarded by the existing config mutex (pg register/unregister and per-SSD entry creation also take it, so the RPC-thread read never races a poll-thread list mutation; the per-IO hot path stays lock-free). Exposed via `nvmf_qdlimit_get_stats` RPC + Python + CLI, with a unit test (`test_get_stats_aggregates_across_cores`).
 
 - [ ] **Step 2: Build and smoke-test the RPC registration**
 
@@ -1244,6 +1244,8 @@ git commit -m "nvmf/qdlimit: add set_depth/get_depth RPC, Python bindings and CL
 - Create: `test/nvmf/target/qdlimit.sh`
 
 This test uses SoftRoCE (`rxe`) so it runs without RDMA hardware. It proves (a) isolation and (b) the buffer-occupancy ceiling from spec §8.
+
+> **IMPLEMENTATION NOTE (post-review): the committed `test/nvmf/target/qdlimit.sh` supersedes the draft script below.** Code review found the draft measured the wrong metric (`pending_data_buffer`, a starvation counter — see the `get_stats` note in Task 6) and used non-existent device paths (`/dev/nvme-fabric-ssd_a`). The committed version instead: (1) measures real per-SSD in-flight via `nvmf_qdlimit_get_stats` and asserts it never exceeds and saturates at `depth * num_poll_groups` (the exact ceiling); (2) puts SSD_A and SSD_B in **separate subsystems** (distinct serials) and resolves the actual `/dev/nvmeXnY` nodes by serial via `nvme id-ctrl`; (3) measures SSD_B p99 **baseline alone vs under SSD_A overload** and asserts ≤3× (real isolation evidence, not an arbitrary absolute threshold); (4) guards `jq`/`fio`/`nvme`, uses `$NVME_CONNECT`/`waitforserial_disconnect`, and installs an EXIT trap that kills fio and disconnects. The draft below is retained for historical context only.
 
 - [ ] **Step 1: Write the integration test script**
 

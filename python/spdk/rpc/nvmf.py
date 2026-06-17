@@ -611,3 +611,13 @@ def nvmf_qdlimit_get_depth(client, bdev_name):
     """Get the configured per-SSD admission depth for a backing bdev."""
     params = {'bdev_name': bdev_name}
     return client.call('nvmf_qdlimit_get_depth', params)
+
+
+def nvmf_qdlimit_get_stats(client, bdev_name):
+    """Get live qdlimit stats for a backing bdev.
+
+    Returns the configured depth, the total in-flight (buffer-holding) admitted requests
+    summed across all cores, and the number of poll groups qdlimit is active on.
+    """
+    params = {'bdev_name': bdev_name}
+    return client.call('nvmf_qdlimit_get_stats', params)

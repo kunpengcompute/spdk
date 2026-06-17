@@ -205,6 +205,43 @@ test_abort_dequeue_parked(void)
 	nvmf_qdlimit_config_cleanup();
 }
 
+static void
+test_get_stats_aggregates_across_cores(void)
+{
+	/* Two poll groups (two "cores"), each admitting requests for bdevA. get_stats must sum
+	 * the per-core inflight counters and report both poll groups. */
+	struct spdk_nvmf_transport_poll_group g0 = {}, g1 = {};
+	struct spdk_nvmf_request a = {}, b = {}, c = {};
+	uint32_t depth = 0, total = 0, npg = 0;
+
+	STAILQ_INIT(&g0.pending_buf_queue);
+	STAILQ_INIT(&g1.pending_buf_queue);
+	nvmf_qdlimit_pg_init(&g0);
+	nvmf_qdlimit_pg_init(&g1);
+	CU_ASSERT(nvmf_qdlimit_set_depth("bdevA", 4) == 0);
+
+	/* g0: two admitted (charged). g1: one admitted (charged). */
+	STAILQ_INSERT_TAIL(&g0.pending_buf_queue, &a, buf_link);
+	qdlimit_admit_bdev(&g0, &a, (void *)&g_fake_bdev_a, "bdevA");
+	STAILQ_INSERT_TAIL(&g0.pending_buf_queue, &b, buf_link);
+	qdlimit_admit_bdev(&g0, &b, (void *)&g_fake_bdev_a, "bdevA");
+	STAILQ_INSERT_TAIL(&g1.pending_buf_queue, &c, buf_link);
+	qdlimit_admit_bdev(&g1, &c, (void *)&g_fake_bdev_a, "bdevA");
+
+	CU_ASSERT(nvmf_qdlimit_get_stats("bdevA", &depth, &total, &npg) == 0);
+	CU_ASSERT(depth == 4);
+	CU_ASSERT(total == 3);	/* 2 on g0 + 1 on g1 */
+	CU_ASSERT(npg == 2);
+
+	/* Unconfigured bdev -> ENOENT; bad args -> EINVAL. */
+	CU_ASSERT(nvmf_qdlimit_get_stats("bdevB", &depth, &total, &npg) == -ENOENT);
+	CU_ASSERT(nvmf_qdlimit_get_stats(NULL, &depth, &total, &npg) == -EINVAL);
+
+	nvmf_qdlimit_pg_fini(&g0);
+	nvmf_qdlimit_pg_fini(&g1);
+	nvmf_qdlimit_config_cleanup();
+}
+
 int
 main(int argc, char **argv)
 {
@@ -222,6 +259,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_release_rearms_waiter);
 	CU_ADD_TEST(suite, test_release_uncharged_is_noop);
 	CU_ADD_TEST(suite, test_abort_dequeue_parked);
+	CU_ADD_TEST(suite, test_get_stats_aggregates_across_cores);
 
 	CU_basic_set_mode(CU_BRM_VERBOSE);
 	CU_basic_run_tests();

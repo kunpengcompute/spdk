@@ -2638,6 +2638,14 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('bdev_name', help='Backing bdev (SSD) name')
     p.set_defaults(func=nvmf_qdlimit_get_depth)
 
+    def nvmf_qdlimit_get_stats(args):
+        print_dict(rpc.nvmf.nvmf_qdlimit_get_stats(args.client, bdev_name=args.bdev_name))
+
+    p = subparsers.add_parser('nvmf_qdlimit_get_stats',
+                              help='Get live qdlimit stats (depth, total in-flight, poll groups)')
+    p.add_argument('bdev_name', help='Backing bdev (SSD) name')
+    p.set_defaults(func=nvmf_qdlimit_get_stats)
+
     # pmem
     def bdev_pmem_create_pool(args):
         num_blocks = int((args.total_size * 1024 * 1024) / args.block_size)

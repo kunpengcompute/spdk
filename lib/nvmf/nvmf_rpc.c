@@ -2572,3 +2572,49 @@ rpc_nvmf_qdlimit_get_depth(struct spdk_jsonrpc_request *request,
 	free(req.bdev_name);
 }
 SPDK_RPC_REGISTER("nvmf_qdlimit_get_depth", rpc_nvmf_qdlimit_get_depth, SPDK_RPC_RUNTIME)
+
+struct rpc_qdlimit_get_stats {
+	char		*bdev_name;
+};
+
+static const struct spdk_json_object_decoder rpc_qdlimit_get_stats_decoders[] = {
+	{"bdev_name", offsetof(struct rpc_qdlimit_get_stats, bdev_name), spdk_json_decode_string},
+};
+
+static void
+rpc_nvmf_qdlimit_get_stats(struct spdk_jsonrpc_request *request,
+			   const struct spdk_json_val *params)
+{
+	struct rpc_qdlimit_get_stats req = {};
+	struct spdk_json_write_ctx *w;
+	uint32_t depth = 0, total_inflight = 0, num_poll_groups = 0;
+	int rc;
+
+	if (spdk_json_decode_object(params, rpc_qdlimit_get_stats_decoders,
+				    SPDK_COUNTOF(rpc_qdlimit_get_stats_decoders), &req)) {
+		SPDK_ERRLOG("spdk_json_decode_object failed\n");
+		free(req.bdev_name);
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "Invalid parameters");
+		return;
+	}
+	rc = nvmf_qdlimit_get_stats(req.bdev_name, &depth, &total_inflight, &num_poll_groups);
+	if (rc != 0) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "bdev not configured for qdlimit");
+		free(req.bdev_name);
+		return;
+	}
+
+	w = spdk_jsonrpc_begin_result(request);
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_string(w, "bdev_name", req.bdev_name);
+	spdk_json_write_named_uint32(w, "depth", depth);
+	spdk_json_write_named_uint32(w, "total_inflight", total_inflight);
+	spdk_json_write_named_uint32(w, "num_poll_groups", num_poll_groups);
+	spdk_json_write_object_end(w);
+	spdk_jsonrpc_end_result(request, w);
+
+	free(req.bdev_name);
+}
+SPDK_RPC_REGISTER("nvmf_qdlimit_get_stats", rpc_nvmf_qdlimit_get_stats, SPDK_RPC_RUNTIME)
