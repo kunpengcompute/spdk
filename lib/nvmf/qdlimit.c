@@ -234,7 +234,7 @@ nvmf_qdlimit_admit(struct spdk_nvmf_transport_poll_group *group, struct spdk_nvm
 		return NVMF_QDLIMIT_ADMIT;
 	}
 	ctrlr = req->qpair->ctrlr;
-	if (ctrlr == NULL || ctrlr->subsys == NULL) {
+	if (ctrlr == NULL || ctrlr->subsys == NULL || req->cmd == NULL) {
 		return NVMF_QDLIMIT_ADMIT;
 	}
 	ns = _nvmf_subsystem_get_ns(ctrlr->subsys, req->cmd->nvme_cmd.nsid);

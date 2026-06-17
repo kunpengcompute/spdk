@@ -794,7 +794,79 @@ nvmf_qdlimit_release(struct spdk_nvmf_transport_poll_group *group, struct spdk_n
 	}
 	qdlimit_release_bdev(group, req, ns->bdev);
 }
+
+/* Remove req from a per-SSD wait queue if it is currently parked there. Returns true if it
+ * was parked (and has now been removed), false if it was not on any wait queue. Used by the
+ * transport abort path: a throttled request in NEED_BUFFER state lives on a wait_q, NOT on
+ * pending_buf_queue, so the abort handler must consult this before doing its own
+ * STAILQ_REMOVE(pending_buf_queue). A throttled request is never charged, so no counter
+ * adjustment is needed here. */
+bool
+nvmf_qdlimit_abort_dequeue(struct spdk_nvmf_transport_poll_group *group,
+			   struct spdk_nvmf_request *req)
+{
+	struct qdlimit_pg_ctx *ctx = group->qdlimit_ctx;
+	struct qdlimit_pg_ssd *s;
+	struct spdk_nvmf_request *w;
+
+	if (ctx == NULL) {
+		return false;
+	}
+	TAILQ_FOREACH(s, &ctx->ssds, link) {
+		STAILQ_FOREACH(w, &s->wait_q, buf_link) {
+			if (w == req) {
+				STAILQ_REMOVE(&s->wait_q, req, spdk_nvmf_request, buf_link);
+				return true;
+			}
+		}
+	}
+	return false;
+}
 ```
+
+Add the prototype to `qdlimit.h` immediately after `nvmf_qdlimit_release`'s declaration:
+
+```c
+/* Remove req from its per-SSD wait queue if parked there (transport abort path).
+ * Returns true if it was parked and removed, false otherwise. */
+bool nvmf_qdlimit_abort_dequeue(struct spdk_nvmf_transport_poll_group *group,
+			       struct spdk_nvmf_request *req);
+```
+
+- [ ] **Step 2b: Add a unit test for abort_dequeue**
+
+In `qdlimit_ut.c`, add and register:
+
+```c
+static void
+test_abort_dequeue_parked(void)
+{
+	struct spdk_nvmf_transport_poll_group group = {};
+	struct spdk_nvmf_request r1 = {}, r2 = {}, r3 = {};
+
+	STAILQ_INIT(&group.pending_buf_queue);
+	nvmf_qdlimit_pg_init(&group);
+	CU_ASSERT(nvmf_qdlimit_set_depth("bdevA", 2) == 0);
+
+	STAILQ_INSERT_TAIL(&group.pending_buf_queue, &r1, buf_link);
+	qdlimit_admit_bdev(&group, &r1, (void *)&g_fake_bdev_a, "bdevA");	/* charged */
+	STAILQ_INSERT_TAIL(&group.pending_buf_queue, &r2, buf_link);
+	qdlimit_admit_bdev(&group, &r2, (void *)&g_fake_bdev_a, "bdevA");	/* charged */
+	STAILQ_INSERT_TAIL(&group.pending_buf_queue, &r3, buf_link);
+	qdlimit_admit_bdev(&group, &r3, (void *)&g_fake_bdev_a, "bdevA");	/* throttled, parked */
+
+	/* r3 is parked -> dequeue returns true and removes it. */
+	CU_ASSERT(nvmf_qdlimit_abort_dequeue(&group, &r3) == true);
+	CU_ASSERT(nvmf_qdlimit_abort_dequeue(&group, &r3) == false);	/* no longer parked */
+
+	/* r1 is charged/admitted, never parked -> dequeue returns false. */
+	CU_ASSERT(nvmf_qdlimit_abort_dequeue(&group, &r1) == false);
+
+	nvmf_qdlimit_pg_fini_drain(&group);	/* wait_q now empty; safe */
+	nvmf_qdlimit_config_cleanup();
+}
+```
+Register: `CU_ADD_TEST(suite, test_abort_dequeue_parked);` in `main`.
 
 - [ ] **Step 3: Build and run**
 
@@ -808,8 +880,8 @@ Expected: PASS, release/re-arm and uncharged-noop tests green.
 - [ ] **Step 4: Commit**
 
 ```bash
-git add lib/nvmf/qdlimit.c test/unit/lib/nvmf/qdlimit.c/qdlimit_ut.c
-git commit -m "nvmf/qdlimit: implement slot release and per-SSD waiter re-arm"
+git add lib/nvmf/qdlimit.c lib/nvmf/qdlimit.h test/unit/lib/nvmf/qdlimit.c/qdlimit_ut.c
+git commit -m "nvmf/qdlimit: implement slot release, waiter re-arm, and abort dequeue"
 ```
 
 ---
@@ -894,6 +966,46 @@ Replace with (release the qdlimit slot at the same point the buffer returns to t
 ```
 
 Note: `rgroup` was previously declared and only assigned inside the `if`; it is declared at the top of the function (line 1881), so hoisting the assignment is safe. Verify no "unused/used-uninitialized" warning after building.
+
+- [ ] **Step 3b: Fix the NEED_BUFFER abort path for parked requests**
+
+A request in `RDMA_REQUEST_STATE_NEED_BUFFER` that was throttled by qdlimit lives on a per-SSD
+`wait_q`, NOT on `pending_buf_queue`. The existing abort handler unconditionally does
+`STAILQ_REMOVE(pending_buf_queue, ...)`, which corrupts the list when the request isn't there.
+Consult the qdlimit wait queue first.
+
+In `lib/nvmf/rdma.c`, find the abort handler's NEED_BUFFER case:
+```bash
+grep -n "case RDMA_REQUEST_STATE_NEED_BUFFER:" lib/nvmf/rdma.c
+```
+The one inside `_nvmf_rdma_qpair_abort_request` (around line 4351) currently reads:
+
+```c
+	case RDMA_REQUEST_STATE_NEED_BUFFER:
+		STAILQ_REMOVE(&rqpair->poller->group->group.pending_buf_queue,
+			      &rdma_req_to_abort->req, spdk_nvmf_request, buf_link);
+
+		nvmf_rdma_request_set_abort_status(req, rdma_req_to_abort);
+		break;
+```
+
+Replace with:
+
+```c
+	case RDMA_REQUEST_STATE_NEED_BUFFER:
+		/* A qdlimit-throttled request sits on a per-SSD wait queue, not on
+		 * pending_buf_queue. Remove it from whichever queue actually holds it. */
+		if (!nvmf_qdlimit_abort_dequeue(&rqpair->poller->group->group,
+						&rdma_req_to_abort->req)) {
+			STAILQ_REMOVE(&rqpair->poller->group->group.pending_buf_queue,
+				      &rdma_req_to_abort->req, spdk_nvmf_request, buf_link);
+		}
+
+		nvmf_rdma_request_set_abort_status(req, rdma_req_to_abort);
+		break;
+```
+
+(The throttled request is not charged, so no `inflight` adjustment is needed; an admitted-but-buffer-waiting request stays on `pending_buf_queue` and takes the `STAILQ_REMOVE` branch, then releases its slot normally via `_nvmf_rdma_request_free`.)
 
 - [ ] **Step 4: Insert `pg_init` in poll-group create**
 

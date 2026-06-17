@@ -87,6 +87,7 @@ test_admit_under_and_over_limit(void)
 
 	STAILQ_INSERT_TAIL(&group.pending_buf_queue, &r2, buf_link);
 	CU_ASSERT(qdlimit_admit_bdev(&group, &r2, (void *)&g_fake_bdev_a, "bdevA") == NVMF_QDLIMIT_ADMIT);
+	CU_ASSERT(r2.qdlimit_charged == true);
 
 	/* Third request exceeds depth=2: throttled and removed from pending_buf_queue. */
 	STAILQ_INSERT_TAIL(&group.pending_buf_queue, &r3, buf_link);
@@ -94,6 +95,14 @@ test_admit_under_and_over_limit(void)
 	CU_ASSERT(r3.qdlimit_charged == false);
 	/* r3 left pending_buf_queue; r1 and r2 remain. */
 	CU_ASSERT(STAILQ_FIRST(&group.pending_buf_queue) == &r1);
+	/* r3 is parked on bdevA's wait_q (not dropped entirely). */
+	{
+		struct qdlimit_pg_ctx *ctx = group.qdlimit_ctx;
+		struct qdlimit_pg_ssd *s = TAILQ_FIRST(&ctx->ssds);
+
+		CU_ASSERT(s != NULL);
+		CU_ASSERT(STAILQ_FIRST(&s->wait_q) == &r3);
+	}
 
 	nvmf_qdlimit_pg_fini_drain(&group); /* test helper, see step 3 */
 	nvmf_qdlimit_config_cleanup();
