@@ -43,6 +43,19 @@ test_config_set_get(void)
 	nvmf_qdlimit_config_cleanup();
 }
 
+static void
+test_pg_init_fini(void)
+{
+	struct spdk_nvmf_transport_poll_group group = {};
+
+	nvmf_qdlimit_pg_init(&group);
+	CU_ASSERT(group.qdlimit_ctx != NULL);
+	CU_ASSERT(TAILQ_EMPTY(&((struct qdlimit_pg_ctx *)group.qdlimit_ctx)->ssds));
+
+	nvmf_qdlimit_pg_fini(&group);
+	CU_ASSERT(group.qdlimit_ctx == NULL);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -54,6 +67,7 @@ main(int argc, char **argv)
 
 	suite = CU_add_suite("qdlimit", NULL, NULL);
 	CU_ADD_TEST(suite, test_config_set_get);
+	CU_ADD_TEST(suite, test_pg_init_fini);
 
 	CU_basic_set_mode(CU_BRM_VERBOSE);
 	CU_basic_run_tests();
