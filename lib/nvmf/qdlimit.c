@@ -264,14 +264,23 @@ qdlimit_release_bdev(struct spdk_nvmf_transport_poll_group *group,
 		}
 	}
 	if (s == NULL) {
-		return;		/* should not happen for a charged request */
+		/* A charged request always has a live per-SSD entry (entries are freed only in
+		 * pg_fini, after all requests are drained). Reaching here means a teardown-ordering
+		 * bug upstream; log it so the leaked slot is diagnosable rather than silent. */
+		SPDK_ERRLOG("qdlimit release: no per-SSD entry for charged request (bdev %p)\n", bdev);
+		return;
 	}
 
 	assert(s->inflight > 0);
 	s->inflight--;
 
-	/* Re-arm the oldest waiter for this SSD by putting it back at the head of the shared
-	 * queue; the next poll re-runs the gate, which now passes (inflight < depth). */
+	/* Re-arm the oldest waiter for this SSD at the HEAD of the shared queue. HEAD (not TAIL)
+	 * intentionally preserves per-SSD FIFO: the oldest parked request is reclaimed first and
+	 * cannot be jumped by a newer same-SSD arrival. This does not starve other SSDs: the
+	 * re-armed request is admitted on the next poll (inflight was just decremented) and
+	 * removed from the queue, and nvmf_rdma_qpair_process_pending continues past it
+	 * (STAILQ_FOREACH_SAFE) to service other SSDs in the same poll. (Validate cross-SSD
+	 * fairness under saturation during VM perf testing.) */
 	if (!STAILQ_EMPTY(&s->wait_q)) {
 		next = STAILQ_FIRST(&s->wait_q);
 		STAILQ_REMOVE_HEAD(&s->wait_q, buf_link);
@@ -312,13 +321,13 @@ nvmf_qdlimit_abort_dequeue(struct spdk_nvmf_transport_poll_group *group,
 {
 	struct qdlimit_pg_ctx *ctx = group->qdlimit_ctx;
 	struct qdlimit_pg_ssd *s;
-	struct spdk_nvmf_request *w;
+	struct spdk_nvmf_request *w, *tmp_w;
 
 	if (ctx == NULL) {
 		return false;
 	}
 	TAILQ_FOREACH(s, &ctx->ssds, link) {
-		STAILQ_FOREACH(w, &s->wait_q, buf_link) {
+		STAILQ_FOREACH_SAFE(w, &s->wait_q, buf_link, tmp_w) {
 			if (w == req) {
 				STAILQ_REMOVE(&s->wait_q, req, spdk_nvmf_request, buf_link);
 				return true;
