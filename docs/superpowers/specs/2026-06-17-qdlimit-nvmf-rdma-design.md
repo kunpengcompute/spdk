@@ -242,6 +242,21 @@ existing nvmf RPC conventions.
 - assert: SSD-B p99 latency is unaffected while SSD-A is throttled; the shared pool is not
   exhausted (no global stalls); SSD-A throughput tracks its configured depth
 
+**Buffer-occupancy ceiling test (key acceptance criterion).** Prove that admission control
+caps per-SSD buffer-pool usage regardless of client load:
+- Configure one SSD with depth `qd` and a fixed IO size `iosize`. Sweep client concurrency
+  (fio `iodepth` × jobs / number of connections) from below `qd` to well above it.
+- Measure that SSD's buffer occupancy at each step. Occupancy is derived from
+  `nvmf_qdlimit_get_stats` (sum of per-core `inflight` for the SSD) × `iosize`, cross-checked
+  against the transport pool consumption (`spdk_mempool_count(data_buf_pool)` delta).
+- **Expected shape:** occupancy rises **linearly** with offered concurrency while offered
+  < `qd` (per core), then **plateaus** once offered ≥ `qd` — it does not keep growing.
+  Ceiling = `qd × iosize` per core, i.e. `qd × iosize × cores` globally. Excess client
+  concurrency is absorbed by the per-SSD wait queue, not by additional buffers.
+- Assert: measured occupancy never exceeds the ceiling (within one in-flight quantum) and
+  is flat across all over-subscribed steps; with the limit removed (`depth = 0`), occupancy
+  instead keeps climbing with concurrency (control case).
+
 **Cross-machine perf** (repurposed harness): two hosts over RDMA/RoCE, demonstrate tail-latency
 isolation under buffer-pool pressure with vs without a configured limit.
 
