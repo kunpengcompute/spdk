@@ -74,6 +74,7 @@ nvmf_qdlimit_pg_init(struct spdk_nvmf_transport_poll_group *group)
 	struct qdlimit_pg_ctx *ctx = calloc(1, sizeof(*ctx));
 
 	if (ctx == NULL) {
+		SPDK_ERRLOG("Failed to allocate qdlimit poll-group context\n");
 		group->qdlimit_ctx = NULL;
 		return;
 	}
@@ -101,8 +102,10 @@ nvmf_qdlimit_pg_fini(struct spdk_nvmf_transport_poll_group *group)
 	group->qdlimit_ctx = NULL;
 }
 
-/* Find-or-create the per-core entry for bdev. Returns NULL if the bdev has no configured
- * limit (depth 0 / unconfigured) — callers treat NULL as "unlimited, bypass". */
+/* Find-or-create the per-core entry for bdev. Returns NULL only if the bdev has never been
+ * configured (no config entry exists); callers treat NULL as "unlimited, bypass". Note a
+ * configured-but-zero depth still returns a valid entry — the depth==0 bypass is applied at
+ * the admission gate (cfg->depth == 0), not here. */
 static struct qdlimit_pg_ssd *
 qdlimit_pg_get_ssd(struct qdlimit_pg_ctx *ctx, struct spdk_bdev *bdev, const char *bdev_name)
 {
@@ -124,11 +127,11 @@ qdlimit_pg_get_ssd(struct qdlimit_pg_ctx *ctx, struct spdk_bdev *bdev, const cha
 
 	s = calloc(1, sizeof(*s));
 	if (s == NULL) {
+		SPDK_ERRLOG("Failed to allocate qdlimit per-SSD entry for %s\n", bdev_name);
 		return NULL;
 	}
 	s->bdev = bdev;
 	s->cfg = cfg;
-	s->inflight = 0;
 	STAILQ_INIT(&s->wait_q);
 	TAILQ_INSERT_TAIL(&ctx->ssds, s, link);
 	return s;

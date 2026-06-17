@@ -423,7 +423,7 @@ qdlimit_pg_get_ssd(struct qdlimit_pg_ctx *ctx, struct spdk_bdev *bdev, const cha
 
 - [ ] **Step 2: Add the poll-group field to the generic transport poll group**
 
-In `lib/nvmf/nvmf_internal.h`, find `struct spdk_nvmf_transport_poll_group {` and add, immediately after its `STAILQ_HEAD(, spdk_nvmf_request) pending_buf_queue;` member:
+`struct spdk_nvmf_transport_poll_group` is defined in `include/spdk/nvmf_transport.h` (NOT `nvmf_internal.h`). Find it and add, immediately after its `STAILQ_HEAD(, spdk_nvmf_request) pending_buf_queue;` member:
 
 ```c
 	void				*qdlimit_ctx;	/* opaque per-group qdlimit state; NULL when unused */
@@ -431,7 +431,7 @@ In `lib/nvmf/nvmf_internal.h`, find `struct spdk_nvmf_transport_poll_group {` an
 
 Run to find the exact line:
 ```bash
-grep -n "pending_buf_queue" lib/nvmf/nvmf_internal.h
+grep -n "pending_buf_queue" include/spdk/nvmf_transport.h
 ```
 Expected: one hit inside `struct spdk_nvmf_transport_poll_group`; insert the new field right after it.
 

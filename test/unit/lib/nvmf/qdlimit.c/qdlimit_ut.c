@@ -54,6 +54,10 @@ test_pg_init_fini(void)
 
 	nvmf_qdlimit_pg_fini(&group);
 	CU_ASSERT(group.qdlimit_ctx == NULL);
+
+	/* Idempotent: fini on a NULL-ctx group (OOM/double-fini) must not crash. */
+	nvmf_qdlimit_pg_fini(&group);
+	CU_ASSERT(group.qdlimit_ctx == NULL);
 }
 
 int
