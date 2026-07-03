@@ -270,11 +270,11 @@ To use SPDK compression, configure the zlib driver of DPDK and then create a com
 
             The following figure shows the result of a normal NVMe drive queried using `fdisk -l`.
 
-            ![](figures/zh-cn_image_0000002520353642.png)
+            ![](figures/en-us_image_0000002520353642.png)
 
         - The following figure shows the result of the mounted NVMe drive queried using `fdisk -l`.
 
-            ![](figures/zh-cn_image_0000002520033642.png)
+            ![](figures/en-us_image_0000002520033642.png)
 
         ```sh
         fio -filename=/dev/nvme0n1 -direct=1 -iodepth=64 -thread -rw=randwrite -ioengine=libaio -bs=4k -size=10G -numjobs=1 -group_reporting -name=mytest --verify_pattern=0x12345678 -verify=pattern -do_verify=1
