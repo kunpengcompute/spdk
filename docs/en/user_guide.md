@@ -41,7 +41,7 @@ This feature enables the crypto feature at the SPDK bdev layer and uses OpenSSL 
 6. <a id="li973719565375"></a>Create an encrypted bdev. Example encryption algorithms supported by the current version are listed below. You can select one based on the actual application scenario.
     - Create a bdev encrypted using AES\_CBC
 
-        >![](public_sys-resources/icon-note.gif) **Note:**
+        >![](public_sys-resources/icon-note.gif) **NOTE**
         >
         >For details about how to use a specific command, run `-h` or see SPDK official documentation.
         >
@@ -82,7 +82,7 @@ This feature enables the crypto feature at the SPDK bdev layer and uses OpenSSL 
         ./scripts/rpc.py bdev_crypto_create sdd crypto_sm4_ctr crypto_openssl 0123456789123456 -c SM4_CTR
         ```
 
-        >![](public_sys-resources/icon-note.gif) **Note:**
+        >![](public_sys-resources/icon-note.gif) **NOTE**
         >
         >Before creating an asymmetrically encrypted bdev, you need to create an RSA key. The current version supports only 4096-bit RSA keys.
         >
@@ -106,7 +106,7 @@ This feature enables the crypto feature at the SPDK bdev layer and uses OpenSSL 
 
 7. Mount the NVMe drive.
 
-    >![](public_sys-resources/icon-note.gif) **Note:**
+    >![](public_sys-resources/icon-note.gif) **NOTE**
     >
     >`crypto_aes_cbc` created in [Step 6](#li973719565375) is used as an example to mount the NVMe drive.
     >For details about how to use a specific command, run **-h** or see SPDK official documentation.
@@ -173,7 +173,7 @@ To use SPDK compression, configure the zlib driver of DPDK and then create a com
     ./scripts/setup.sh
     ```
 
-    >![](public_sys-resources/icon-note.gif) **Note:**
+    >![](public_sys-resources/icon-note.gif) **NOTE**
     >
     >`0000:84:00.0` indicates the PCI number of the NVMe drive. Change it to the actual one that can be queried by running the following command:
     >
@@ -203,7 +203,7 @@ To use SPDK compression, configure the zlib driver of DPDK and then create a com
     ./scripts/rpc.py compressdev_zlib_module_set_wbits --wbits 31
     ```
 
-    >![](public_sys-resources/icon-notice.gif) **Notice:**
+    >![](public_sys-resources/icon-notice.gif) **NOTICE**
     >
     >- `bdev_compress_set_pmd -p` specifies the compression driver. `3` indicates the zlib driver.
     >- `compressdev_zlib_module_set_wbits --wbits` sets the bit width for zlib compression.
@@ -229,7 +229,7 @@ To use SPDK compression, configure the zlib driver of DPDK and then create a com
     ./scripts/rpc.py bdev_compress_create -b NVMe1n1 -p /dev/pmem0n1 -l 512
     ```
 
-    >![](public_sys-resources/icon-notice.gif) **Notice:**
+    >![](public_sys-resources/icon-notice.gif) **NOTICE**
     >
     >- `-b` specifies the bdev for storing compressed data, and `NVMe1n1` is the name of the bdev created after the command in [Step 7](#li1429814711177) is executed.
     >- `-p` specifies the persistent memory drive for storing metadata, and `/dev/pmem0n1` is the name of the persistent memory drive.
@@ -246,7 +246,7 @@ To use SPDK compression, configure the zlib driver of DPDK and then create a com
         nvme connect -t tcp -n "nqn.2017-06.io.spdk:cnode2" -a 96.10.57.104 -s 4521 -g -G
         ```
 
-        >![](public_sys-resources/icon-note.gif) **Note:**
+        >![](public_sys-resources/icon-note.gif) **NOTE**
         >
         > Running `nvme` requires nvme-cli. Run the following command to install it:
         >
@@ -296,7 +296,7 @@ SPDK has built-in isal-crc32c and isal-crc16 algorithms. In the spdk21.01.1-for-
     ./crc16_ut
     ```
 
-    >![](public_sys-resources/icon-note.gif) **Note:**
+    >![](public_sys-resources/icon-note.gif) **NOTE**
     >
     >By default, `./crc16_ut` performs 100,000 crc16 calculations on a 4 KB data block and obtain the average value. One CRC calculation takes only nanoseconds. To ensure a stable and correct value, you need to obtain the average value of a large number of CRC calculations. During execution, you can specify the block size, number of calculations, and checksum verification (to check whether the calculation result is correct). For details, run the `./crc16_ut -h` command.
 
@@ -338,7 +338,7 @@ SPDK has built-in isal-crc32c and isal-crc16 algorithms. In the spdk21.01.1-for-
     ./scripts/rpc.py bdev_crypto_create sda crypto crypto_openssl 0123456789123456 -c AES_CBC
     ```
 
-    >![](public_sys-resources/icon-note.gif) **Note:**
+    >![](public_sys-resources/icon-note.gif) **NOTE**
     >
     >A bdev with encryption and decryption enabled is created. You can also create another bdev for testing.
 
@@ -359,8 +359,14 @@ SPDK has built-in isal-crc32c and isal-crc16 algorithms. In the spdk21.01.1-for-
     fio -filename=/dev/nvme0n1 -direct=1 -iodepth=64 -thread -rw=randwrite -ioengine=libaio -bs=4k -size=10G -numjobs=1 -group_reporting -name=mytest --verify_pattern=0x12345678
     ```
 
-    >![](public_sys-resources/icon-note.gif) **Note:**
+    >![](public_sys-resources/icon-note.gif) **NOTE**
     >
     >The read and write data delivered by fio is transmitted to the NVMe drive over the NVMe-oF protocol. In SPDK, NVMe-oF uses the CRC algorithm to verify each protocol data unit \(PDU\) to be transmitted. Therefore, each I/O operation requires a CRC calculation. During fio execution, check whether KSAL-CRC is enabled using the perf tool to capture function hotspot information of the SPDK process. Check whether the KsalCrc32c function exists in the function hotspot information. If it does, ksal-crc is enabled successfully.
 
 SPDK has built-in isal-crc32c and isal-crc16 algorithms. In the spdk21.01.1-for-KAE branch, the Huawei-developed KSAL-CRC algorithm is introduced, providing 20% higher performance than the CRC implementation in isal 2.29. This section describes how to perform performance and system tests on KSAL-CRC in SPDK.
+
+## Change History
+
+| Date  | Description       |
+|-------|----------|
+| 2024-09-30 | This is the first official release. |

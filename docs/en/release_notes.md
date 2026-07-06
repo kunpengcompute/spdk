@@ -12,7 +12,7 @@
 </tr>
 <tr id="row102692044123111"><th class="firstcol" valign="top" width="27.79%" id="mcps1.1.3.2.1"><p id="p1526912441319"><a name="p1526912441319"></a><a name="p1526912441319"></a>Product Version</p>
 </th>
-<td class="cellrowborder" valign="top" width="72.21%" headers="mcps1.1.3.2.1 "><p id="p1864713360227"><a name="p1864713360227"></a><a name="p1864713360227"></a><span id="ph1224011917236"><a name="ph1224011917236"></a><a name="ph1224011917236"></a>21.01.1</span></p>
+<td class="cellrowborder" valign="top" width="72.21%" headers="mcps1.1.3.2.1 "><p id="p1864713360227"><a name="p1864713360227"></a><a name="p1864713360227"></a><span id="ph1224011917236"><a name="ph1224011917236"></a><a name="ph1224011917236"></a>24.0.RC5</span></p>
 </td>
 </tr>
 <tr id="row14269844183118"><th class="firstcol" valign="top" width="27.79%" id="mcps1.1.3.3.1"><p id="p1027044483111"><a name="p1027044483111"></a><a name="p1027044483111"></a>Software Name</p>
@@ -25,7 +25,7 @@
 
 ### Software Version Mapping<a name="EN-US_TOPIC_0000002515966648"></a>
 
-|Type|Version|
+|Item|Version|
 |--|--|
 |OS|openEuler 22.03 LTS SP1<br>openEuler 22.03 LTS SP2|
 |SPDK|21.01.1|
@@ -34,7 +34,7 @@
 
 ### Hardware Version Mapping<a name="EN-US_TOPIC_0000002515966654"></a>
 
-|Project|Requirement|
+|Item|Requirement|
 |--|--|
 |Processor|Kunpeng 920|
 |iBMC|V365 or later|
@@ -58,11 +58,11 @@ CRC is a common algorithm used to detect errors in data transmission or storage.
 
 #### Resolved Issues<a name="EN-US_TOPIC_0000002547606475"></a>
 
-None.
+None
 
 #### Known Issues<a name="EN-US_TOPIC_0000002547526487"></a>
 
-None.
+None
 
 ## Related Documentation<a name="EN-US_TOPIC_0000002515966652"></a>
 
@@ -75,3 +75,9 @@ None.
 ### Obtaining Documentation<a name="EN-US_TOPIC_0000002547526489"></a>
 
 Visit the [open-source repository](https://gitcode.com/boostkit/spdk) to view or download related documents.
+
+## Change History
+
+| Date  | Description       |
+|-------|----------|
+| 2024-09-30 | This is the first official release. |

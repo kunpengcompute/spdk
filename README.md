@@ -1,4 +1,4 @@
-# README<a id="ZH-CN_TOPIC_0000002521402728"></a>
+# README<a id="ZH-CN_TOPIC_0000002521402728"></a> 
 
 ## 项目简介<a id="ZH-CN_TOPIC_0000002551566043"></a>
 
@@ -15,8 +15,6 @@
 **图 1** 软件架构图<a id="fig17242642112411"></a><a id="软件架构图"></a>
 
 ![](docs/zh/figures/introduction.png "软件架构图")
-
-
 
 SPDK整体上从上到下分为应用协议层、存储服务层、块存储设备层、驱动层。
 

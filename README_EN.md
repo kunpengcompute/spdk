@@ -12,9 +12,9 @@ This document describes the encryption/decryption, compression, and cyclic redun
 
 The following figure shows the overall architecture of open-source SPDK.
 
-![](docs/en/figures/introduction.png "Software architecture")
-
 **Figure 1** Software architecture<a id="fig17242642112411"></a><a id="software-architecture"></a>
+
+![](docs/en/figures/introduction.png "Software architecture")
 
 SPDK consists of the application protocol layer, storage service layer, block device layer, and driver layer from top to bottom.
 
@@ -54,25 +54,25 @@ When SPDK CRC is used, you can use the Huawei-developed CRC algorithm to replace
 ## Directory Structure<a id="EN-US_TOPIC_0000002551748963"></a>
 
 ```txt
-├── docs                             # Project document directory
-│   ├── LICENSE                       # Document license agreement
-│   └── en                       # Document directory
+├── docs                              # Project documentation
+│   ├── LICENSE                       # Document license
+│   └── en                            # Document directory
 │       ├── figures                   # Directory of figures in documents
-│       ├── public_sys-resources     # Public resource directory
+│       ├── public_sys-resources      # Public resource directory
 │       ├── installation_guide.md     # SPDK KAE installation guide
-│       ├── user_guide.md            # SPDK KAE user guide
+│       ├── user_guide.md             # SPDK KAE user guide
 │       └── release_notes.md          # Release notes
 ├── spdk-21.01.1-for-KAE.patch        # SPDK patch for enabling KAE
-└── README.md                 # Introduction
+└── README.md                         # Introduction
 ```
 
 ## Version Description<a id="EN-US_TOPIC_0000002520548958"></a>
 
-For details about the version information, see [Release Notes](docs/en/release_notes.md).
+For details about the version information of the KAE-enabled SPDK feature, see [Release Notes](docs/en/release_notes.md).
 
 ## Installation Guide<a id="EN-US_TOPIC_0000002551828937"></a>
 
-For details about the environment requirements and compilation and installation guide, see [Installation Guide](docs/en/installation_guide.md).
+For environmental requirements for KAE-enabled SPDK, KAE installation methods, and SPDK compilation and installation, see [Installation Guide](docs/en/installation_guide.md).
 
 ## User Guide<a id="EN-US_TOPIC_0000002520989184"></a>
 

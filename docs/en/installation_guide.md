@@ -6,7 +6,7 @@ Install KAE 2.0 before installing SPDK. Ensure that the environment satisfies th
 
 **Hardware<a id="en-us_topic_0000001217080138_section10273165810425"></a>**
 
-| Project   | Specifications            |
+| Item   | Specifications            |
 |-------|----------------|
 | CPU model| Kunpeng 920      |
 | Others   | iBMC: V365 or later|
@@ -14,13 +14,13 @@ Install KAE 2.0 before installing SPDK. Ensure that the environment satisfies th
 
 **OS**
 
-| Project  | Version                                        |
+| Item  | Version                                        |
 |------|--------------------------------------------|
 | OS| openEuler 22.03 SP1<br>openEuler 22.03 SP2 |
 
 **Software**
 
-| Project     | Version       | How to Obtain                                                           |
+| Item     | Version       | How to Obtain                                                           |
 |---------|-----------|-----------------------------------------------------------------|
 | KAE     | 2.0.0     | [Link](https://gitcode.com/boostkit/KAE/tree/kae2/)            |
 | SPDK    | 21.01.1   | [Link](https://gitcode.com/boostkit/spdk)                      |
@@ -36,7 +36,7 @@ For details about how to apply for and install a license, see [Huawei Server iBM
 
 Kunpeng Accelerator Engine (KAE) is a hardware acceleration solution provided on the Kunpeng 920 processor. It consists of KAE encryption/decryption and KAEzip. The KAE encryption/decryption module is based on OpenSSL. Therefore, install OpenSSL before installing and using this module.
 
-For details about how to install OpenSSL, see [Installing OpenSSL](https://www.hikunpeng.com/document/detail/en/kunpengaccel/kae/usermanual/kunpengaccel_06_0009.html).
+For details about how to install OpenSSL, see [Installing OpenSSL](https://www.hikunpeng.com/document/detail/en/kunpengaccel/kae/kae/docs/en/installation_guide.md#installing-openssltongsuo).
 
 **Procedure<a id="section1834411526119"></a>**
 
@@ -47,7 +47,7 @@ For details about how to install OpenSSL, see [Installing OpenSSL](https://www.h
     git clone https://gitcode.com/boostkit/KAE.git -b kae2
     ```
 
-    > ![](public_sys-resources/icon-note.gif) **Note:**
+    > ![](public_sys-resources/icon-note.gif) **NOTE**
     > 
     > The kae2 branch applies to openEuler 22.03 LTS SP2. If openEuler 22.03 LTS SP1 is used, use KAE 2.0.0.
 
@@ -57,7 +57,7 @@ For details about how to install OpenSSL, see [Installing OpenSSL](https://www.h
     sh build.sh all
     ```
 
-    This script provides commands for one-click installation. Go to the KAE source package directory and run the `sh build.sh all ` command to install all KAE components. Both the encryption/decryption and decompression modules need to be installed. For details about the installation process, see [Source Code Installation (KAE 2.0)](https://www.hikunpeng.com/document/detail/en/kunpengaccel/kae/usermanual/kunpengaccel_06_0012.html).
+    This script provides commands for one-click installation. Go to the KAE source package directory and run the `sh build.sh all` command to install all KAE components. Both the encryption/decryption and decompression modules need to be installed. For details about the installation process, see [Installation Using the Source Code](https://www.hikunpeng.com/document/detail/en/kunpengaccel/kae/kae/docs/en/installation_guide.md#installation-using-the-source-code).
 
 **Verifying KAE Installation<a id="section10160654163615"></a>**
 
@@ -67,7 +67,7 @@ Go to the KAE directory and run the **env-check.sh** script.
 sh env-check.sh
 ```
 
->![](public_sys-resources/icon-note.gif) **Note:**
+>![](public_sys-resources/icon-note.gif) **NOTE**
 > 
 >After the **build.sh** script is executed, KAE may still fail to be installed even if no error is reported during the process. To verify whether KAE is successfully installed, run the **env-check.sh** script in the KAE directory. This script checks whether the KAE environment is normal. If the environment is abnormal, the script displays the problem. If the environment is normal, KAE is successfully installed.
 
@@ -105,7 +105,7 @@ After KAE is installed, compile SPDK. You do not need to install SPDK. Just comp
     ./scripts/pkgdep.sh
     ```
 
-    >![](public_sys-resources/icon-note.gif) **Note:**
+    >![](public_sys-resources/icon-note.gif) **NOTE**
     >
     >The **pkgdep.sh** script does not adapt to the openEuler system. You need to manually add commands to adapt to the openEuler system. Open the **pkgdep.sh** script and find the following commands:
     >
@@ -129,7 +129,7 @@ After KAE is installed, compile SPDK. You do not need to install SPDK. Just comp
     ./configure --with-crypto --with-reduce --with-ksal --with-crypto_openssl
     ```
 
-    >![](public_sys-resources/icon-note.gif) **Note:**
+    >![](public_sys-resources/icon-note.gif) **NOTE**
     >
     > 1. The `./configure` command is used for configuration and compilation. For example, `--with-ksal` is used to load the KSAL module, `--with-crypto` and `--with-crypto_openssl` are used to load the encryption/decryption module, and `--with-reduce` is used to load the decompression module. You can run the `./configure -h` command to view the detailed configuration.
     > 2. `--with-reduce` is used to load the decompression module. To load this module, you need to configure the environment variable `export CFLAGS="-DZLIB\_MEM\_SIMU\_PMEM"`.
@@ -140,11 +140,16 @@ After KAE is installed, compile SPDK. You do not need to install SPDK. Just comp
     >     patch -p1 < spdk_v21.01.1_dpdk_compress_kae.patch
     >    ```
     >
-    > 4. The `--with-ksal` command is used to load the KSAL algorithm module. KSAL is a Huawei-developed high-performance CRC algorithm and is closed source externally. It is integrated as a dynamic library. Therefore, you need to [install the KSAL algorithm package](https://www.hikunpeng.com/document/detail/en/kunpengsdss/basicAccelFeatures/ksal/kunpengksal_16_0007.html) and load the KSAL dynamic library before configuration and compilation. To perform the compilation, you need to [download the RPM package](https://kunpeng-repo.obs.cn-north-4.myhuaweicloud.com/Kunpeng%20BoostKit/Kunpeng%20BoostKit%2024.0.RC5/BoostKit-KSAL_1.8.0.zip).
+    > 4. The `--with-ksal` command is used to load the KSAL algorithm module. KSAL is a Huawei-developed high-performance CRC algorithm and is closed source externally. It is integrated as a dynamic library. Therefore, you need to [install the KSAL algorithm package](https://www.hikunpeng.com/document/detail/en/kunpengsdss/basicAccelFeatures/ksal/kunpengksal_16_0007.html) and load the KSAL dynamic library before configuration and compilation. To perform the compilation, you need to [download the RPM package](https://www.hikunpeng.com/boostkit/download?version=24.0.RC5).
 
 7. <a id="000001"></a>Perform the compilation.
 
     ```sh
     make -j
     ```
-   
+
+## Change History
+
+| Date  | Description      |
+|-------|----------|
+| 2024-09-30 | This is the first official release. |
