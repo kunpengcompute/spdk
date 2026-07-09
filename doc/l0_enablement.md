@@ -24,23 +24,32 @@ flowchart TB
     end
 
     subgraph storage_node["KVC存储节点"]
-        direction LR
+        direction TB
 
-        subgraph cpu_box["CPU"]
-            direction TB
-            storage_server("StorageServer")
+        subgraph storage_top[" "]
+            direction LR
+
+            subgraph cpu_box["CPU"]
+                direction TB
+                storage_server("StorageServer")
+            end
+
+            storage_nic("网卡")
         end
 
-        ddr_box("DDR")
-        storage_nic("网卡")
-        ssd_box("SSD")
+        subgraph storage_bottom[" "]
+            direction LR
+            ddr_box("DDR")
+            ssd_box("SSD")
+        end
 
-        cpu_box ~~~ ddr_box
+        storage_server ~~~ ddr_box
         storage_nic ~~~ ssd_box
         storage_nic <-->|"2X<br/>DMA"| ddr_box
         ssd_box <-->|"2X<br/>DMA"| ddr_box
     end
 
+    kvc_client ~~~ storage_server
     infer_nic <-->|"<b>1X</b>"| storage_nic
 
     classDef defaultBox fill:#ffffff,stroke:#111111,stroke-width:1px,color:#111111;
@@ -49,11 +58,13 @@ flowchart TB
     class ddr_box ddrBox;
     style inference_node fill:#ffffff,stroke:#111111,stroke-width:1px,color:#111111,rx:8px,ry:8px;
     style storage_node fill:#ffffff,stroke:#111111,stroke-width:1px,color:#111111,rx:8px,ry:8px;
+    style storage_top fill:transparent,stroke:transparent,color:transparent;
+    style storage_bottom fill:transparent,stroke:transparent,color:transparent;
     style cpu_box fill:#ffffff,stroke:#111111,stroke-width:1px,color:#111111,rx:8px,ry:8px;
     linkStyle 0 stroke:#d32f2f,stroke-width:2px;
     linkStyle 3 stroke:#d32f2f,stroke-width:2px;
     linkStyle 4 stroke:#d32f2f,stroke-width:2px;
-    linkStyle 5 stroke:#d32f2f,stroke-width:2px;
+    linkStyle 6 stroke:#d32f2f,stroke-width:2px;
 ```
 
 ### 方案二
