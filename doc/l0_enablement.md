@@ -69,7 +69,59 @@ flowchart TB
 
 ### 方案二
 
-待补充。
+```mermaid
+flowchart TB
+    subgraph inference_node_l0["推理节点"]
+        direction LR
+        kvc_client_l0("KVC客户端") <--> infer_nic_l0("网卡")
+    end
+
+    subgraph storage_node_l0["KVC存储节点"]
+        direction TB
+
+        subgraph storage_top_l0[" "]
+            direction LR
+
+            subgraph cpu_box_l0["CPU"]
+                direction TB
+                storage_server_l0("StorageServer")
+                storage_server_l0 ~~~ l3_cache_l0("L3 Cache")
+            end
+
+            storage_nic_l0("网卡")
+        end
+
+        subgraph storage_bottom_l0[" "]
+            direction LR
+            ddr_box_l0("DDR")
+            ssd_box_l0("SSD")
+        end
+
+        storage_server_l0 ~~~ ddr_box_l0
+        storage_nic_l0 ~~~ ssd_box_l0
+        storage_nic_l0 <-->|"2X<br/>DMA"| storage_server_l0
+        ssd_box_l0 <-->|"2X<br/>DMA"| storage_server_l0
+    end
+
+    kvc_client_l0 ~~~ storage_server_l0
+    infer_nic_l0 <-->|"<b>1X</b>"| storage_nic_l0
+
+    classDef defaultBox fill:#ffffff,stroke:#111111,stroke-width:1px,color:#111111;
+    classDef ddrBox fill:#d9f2d9,stroke:#111111,stroke-width:1px,color:#111111;
+    classDef l3Box fill:#d9e8ff,stroke:#111111,stroke-width:1px,color:#111111;
+    class kvc_client_l0,infer_nic_l0,storage_nic_l0,ssd_box_l0,storage_server_l0 defaultBox;
+    class ddr_box_l0 ddrBox;
+    class l3_cache_l0 l3Box;
+    style inference_node_l0 fill:#ffffff,stroke:#111111,stroke-width:1px,color:#111111,rx:8px,ry:8px;
+    style storage_node_l0 fill:#ffffff,stroke:#111111,stroke-width:1px,color:#111111,rx:8px,ry:8px;
+    style storage_top_l0 fill:transparent,stroke:transparent,color:transparent;
+    style storage_bottom_l0 fill:transparent,stroke:transparent,color:transparent;
+    style cpu_box_l0 fill:#ffffff,stroke:#111111,stroke-width:1px,color:#111111,rx:8px,ry:8px;
+    linkStyle 0 stroke:#d32f2f,stroke-width:2px;
+    linkStyle 4 stroke:#d32f2f,stroke-width:2px;
+    linkStyle 5 stroke:#d32f2f,stroke-width:2px;
+    linkStyle 7 stroke:#d32f2f,stroke-width:2px;
+```
 
 ## BIOS 设置
 
