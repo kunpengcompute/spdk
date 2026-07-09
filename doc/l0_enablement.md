@@ -99,8 +99,8 @@ flowchart TB
 
         storage_server_l0 ~~~ ddr_box_l0
         storage_nic_l0 ~~~ ssd_box_l0
-        storage_nic_l0 <-->|"2X<br/>DMA"| storage_server_l0
-        ssd_box_l0 <-->|"2X<br/>DMA"| storage_server_l0
+        storage_nic_l0 <-->|"2X<br/>DMA"| l3_cache_l0
+        ssd_box_l0 <-->|"2X<br/>DMA"| l3_cache_l0
     end
 
     kvc_client_l0 ~~~ storage_server_l0
