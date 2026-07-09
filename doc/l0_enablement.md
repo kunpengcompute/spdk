@@ -2,7 +2,7 @@
 
 本文主要说明在 io stash、L0 两个特性使能场景下，`spdk_tgt` 的测试方式。
 
-注意点：网卡、盘不要跨P，spdk_tgt启用绑定核和网卡、盘也同P
+注意点：spdk_tgt启用绑、配置的大页内存、网卡、盘不要跨P
 
 ## 推荐启用策略
 
@@ -11,6 +11,54 @@
 如果只开启 io stash 后，内存带宽吸收效果不好，再叠加开启 L0。开启 L0 时需要加载 L0 驱动，SPDK 源码需要打入 L0 使能适配 patch 并重新编译，具体使能方式见后续章节。
 
 测试时建议从低并发、大块 I/O 开始，例如先使用 128K I/O size 和较低并发数验证链路、带宽与稳定性，再逐步增加并发数。
+
+## 前后方案对比
+
+### 方案一
+
+```mermaid
+flowchart TB
+    subgraph inference_node["推理节点"]
+        direction LR
+        kvc_client("KVC客户端") <--> infer_nic("网卡")
+    end
+
+    subgraph storage_node["KVC存储节点"]
+        direction LR
+
+        subgraph cpu_box["CPU"]
+            direction TB
+            storage_server("StorageServer")
+        end
+
+        ddr_box("DDR")
+        storage_nic("网卡")
+        ssd_box("SSD")
+
+        cpu_box ~~~ ddr_box
+        storage_nic ~~~ ssd_box
+        storage_nic <-->|"2X<br/>DMA"| ddr_box
+        ssd_box <-->|"2X<br/>DMA"| ddr_box
+    end
+
+    infer_nic <-->|"<b>1X</b>"| storage_nic
+
+    classDef defaultBox fill:#ffffff,stroke:#111111,stroke-width:1px,color:#111111;
+    classDef ddrBox fill:#d9f2d9,stroke:#111111,stroke-width:1px,color:#111111;
+    class kvc_client,infer_nic,storage_nic,ssd_box,storage_server defaultBox;
+    class ddr_box ddrBox;
+    style inference_node fill:#ffffff,stroke:#111111,stroke-width:1px,color:#111111,rx:8px,ry:8px;
+    style storage_node fill:#ffffff,stroke:#111111,stroke-width:1px,color:#111111,rx:8px,ry:8px;
+    style cpu_box fill:#ffffff,stroke:#111111,stroke-width:1px,color:#111111,rx:8px,ry:8px;
+    linkStyle 0 stroke:#d32f2f,stroke-width:2px;
+    linkStyle 3 stroke:#d32f2f,stroke-width:2px;
+    linkStyle 4 stroke:#d32f2f,stroke-width:2px;
+    linkStyle 5 stroke:#d32f2f,stroke-width:2px;
+```
+
+### 方案二
+
+待补充。
 
 ## BIOS 设置
 
