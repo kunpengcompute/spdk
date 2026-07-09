@@ -38,11 +38,13 @@ flowchart TB
         subgraph storage_right[" "]
             direction TB
             storage_nic("网卡")
+            right_mid_spacer[" "]
             ssd_box("SSD")
         end
 
         storage_server ~~~ ddr_box
-        storage_nic ~~~ ssd_box
+        storage_nic ~~~ right_mid_spacer
+        right_mid_spacer ~~~ ssd_box
         storage_nic <-->|"2X<br/>DMA"| ddr_box
         ssd_box <-->|"2X<br/>DMA"| ddr_box
     end
@@ -58,11 +60,12 @@ flowchart TB
     style storage_node fill:#ffffff,stroke:#111111,stroke-width:1px,color:#111111,rx:8px,ry:8px;
     style storage_left fill:transparent,stroke:transparent,color:transparent;
     style storage_right fill:transparent,stroke:transparent,color:transparent;
+    style right_mid_spacer fill:transparent,stroke:transparent,color:transparent;
     style cpu_box fill:#ffffff,stroke:#111111,stroke-width:1px,color:#111111,rx:8px,ry:8px;
     linkStyle 0 stroke:#d32f2f,stroke-width:2px;
-    linkStyle 3 stroke:#d32f2f,stroke-width:2px;
     linkStyle 4 stroke:#d32f2f,stroke-width:2px;
-    linkStyle 6 stroke:#d32f2f,stroke-width:2px;
+    linkStyle 5 stroke:#d32f2f,stroke-width:2px;
+    linkStyle 7 stroke:#d32f2f,stroke-width:2px;
 ```
 
 ### 方案二
