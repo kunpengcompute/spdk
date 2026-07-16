@@ -1754,6 +1754,7 @@ nvmf_ub_req_complete(struct spdk_nvmf_request *req)
 
 	// 暂时在complete里处理data和rsp
 	struct spdk_nvmf_ub_resources *resources= uqpair->resources;
+	ub_req->buf_idx = ub_req - resources->reqs;
 
 	if (req->xfer == SPDK_NVME_DATA_CONTROLLER_TO_HOST) {
 		urma_seg_t remote_seg = {0};
@@ -1777,7 +1778,6 @@ nvmf_ub_req_complete(struct spdk_nvmf_request *req)
 			return ;
 		}
 
-		ub_req->buf_idx = ub_req - resources->reqs;
 		void *resp = (void *)((uint8_t *)uqpair->va + PAGE_SIZE * 128 + ub_req->buf_idx * SPDK_NVMF_UB_DEFAULT_MAX_IO_SIZE);
 		fprintf(stderr, "iov_base=0x%llx, iov_len=%d\n", req->iov[0].iov_base, req->iov[0].iov_len);
 		uint64_t *va64 = req->iov[0].iov_base;
@@ -1842,7 +1842,7 @@ nvmf_ub_req_complete(struct spdk_nvmf_request *req)
 		uint64_t offset = 16;
 		*(uint64_t *)uqpair->va = magic_num;
 
-		void *resp = uqpair->va + PAGE_SIZE * 128 + ;
+		void *resp = uqpair->va + PAGE_SIZE * 128 + ub_req->buf_idx * SPDK_NVMF_UB_DEFAULT_MAX_IO_SIZE;
 		memcpy(resp, req->rsp, sizeof(union nvmf_c2h_msg));
 		magic_num++;
     	urma_sge_t src_sge = {
