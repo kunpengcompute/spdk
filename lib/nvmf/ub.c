@@ -163,8 +163,6 @@ struct spdk_nvmf_ub_transport {
 	struct spdk_sock_group		*pending_sock_group;
 	struct spdk_poller			*pending_poller;
 
-	struct spdk_nvmf_transport_poll_group *ugroup;
-
 	TAILQ_HEAD(, spdk_nvmf_ub_device)	devices;
 	/* List of ports */
 	TAILQ_HEAD(, spdk_nvmf_ub_port)	ports;
@@ -192,6 +190,13 @@ nvmf_ub_get_poll_group(struct spdk_nvmf_transport_poll_group *group)
 	return SPDK_CONTAINEROF(group, struct spdk_nvmf_ub_poll_group, group);
 }
 
+enum spdk_nvmf_ub_req_rdma_state {
+	UB_REQ_RDMA_STATE_NONE = 0,
+	UB_REQ_RDMA_STATE_WAIT_READ,	/* Waiting for RDMA READ completion */
+	UB_REQ_RDMA_STATE_WAIT_WRITE,	/* Waiting for RDMA WRITE completion */
+	UB_REQ_RDMA_STATE_WAIT_SEND,	/* Waiting for SEND completion */
+};
+
 struct spdk_nvmf_ub_request {
 	struct spdk_nvmf_request		req;
 
@@ -210,6 +215,9 @@ struct spdk_nvmf_ub_request {
 	 */
 	bool					awaiting_rdma_read_completion;
 	bool					awaiting_rdma_write_completion;
+
+	/* Async state machine: tracks which URMA completion we are waiting for */
+	enum spdk_nvmf_ub_req_rdma_state	rdma_state;
 	STAILQ_ENTRY(spdk_nvmf_ub_request)		link;
 };
 
@@ -1298,9 +1306,6 @@ nvmf_ub_poll_group_create(struct spdk_nvmf_transport *transport,
 	ugroup->max_crs = NVMF_UB_MAX_POLL_CRS;
 	ugroup->crs = calloc(ugroup->max_crs, sizeof(urma_cr_t));
 
-	struct spdk_nvmf_ub_transport *utransport;
-	utransport = nvmf_ub_get_transport(transport);
-	utransport->ugroup = ugroup;
 	if (!ugroup->crs) {
 		SPDK_ERRLOG("UB poll_group_create: crs allocation failed\n");
 		return NULL;
@@ -1388,6 +1393,7 @@ nvmf_ub_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 	*/
 	
 
+	uqpair->group = ugroup;
 	TAILQ_INIT(&uqpair->reqs);
 	TAILQ_INSERT_TAIL(&ugroup->qpairs, uqpair, link);
 
@@ -1555,6 +1561,7 @@ nvmf_ub_handle_cmd(struct spdk_nvmf_ub_qpair *uqpair, void *cmd)
 				};
 
 				ub_req->awaiting_rdma_read_completion = 1;
+				ub_req->rdma_state = UB_REQ_RDMA_STATE_WAIT_READ;
 				urma_jfs_wr_t read_wr = {
 					.opcode = URMA_OPC_READ,
 					.flag.bs.complete_enable = 1,
@@ -1707,25 +1714,42 @@ nvmf_ub_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 					nvmf_ub_handle_cmd(uqpair, cmd);
 
 				} else {
-					/* Send/RDMA completion */
-					// 判断当前的req 是dma的还是rsp的
-					// 如果是dma的 那么要把计数加上
-					struct spdk_nvmf_ub_request *completed_ub_req = (struct spdk_nvmf_ub_request *)(uintptr_t)cr->user_ctx;
-					SPDK_WARNLOG("---------UB poll: RDMA/SEND completion, req=%p, opcode=%d\n",
-						     completed_ub_req, cr->opcode);
+					/* Send/RDMA completion - drive the async state machine
+					 * based on the request's rdma_state rather than the
+					 * completion opcode, which is more reliable. */
+					struct spdk_nvmf_ub_request *completed_ub_req =
+						(struct spdk_nvmf_ub_request *)(uintptr_t)cr->user_ctx;
+					SPDK_WARNLOG("---------UB poll: RDMA/SEND completion, req=%p, opcode=%d, state=%d\n",
+						     completed_ub_req, cr->opcode, completed_ub_req->rdma_state);
 
-					if (completed_ub_req->awaiting_rdma_read_completion && cr->opcode == URMA_CR_OPC_SEND) {
-						/* RDMA READ completed - now we can execute the request */
+					switch (completed_ub_req->rdma_state) {
+					case UB_REQ_RDMA_STATE_WAIT_READ:
+						/* RDMA READ completed - now execute the request */
 						SPDK_NOTICELOG("RDMA READ completed, executing request\n");
-						spdk_nvmf_request_exec(&completed_ub_req->req);
 						completed_ub_req->awaiting_rdma_read_completion = 0;
-					} 
-					if (completed_ub_req->awaiting_rdma_write_completion && cr->opcode == URMA_CR_OPC_SEND) {
-						/* RDMA READ completed - now we can execute the request */
-						SPDK_NOTICELOG("RDMA WRITE completed, executing request\n");
+						completed_ub_req->rdma_state = UB_REQ_RDMA_STATE_NONE;
+						spdk_nvmf_request_exec(&completed_ub_req->req);
+						break;
+
+					case UB_REQ_RDMA_STATE_WAIT_WRITE:
+						/* RDMA WRITE completed - now post SEND response */
+						SPDK_NOTICELOG("RDMA WRITE completed, posting SEND response\n");
 						completed_ub_req->awaiting_rdma_write_completion = 0;
-					}else {
-						SPDK_NOTICELOG("SEND rsp completed!\n");
+						nvmf_ub_post_send_response(completed_ub_req);
+						break;
+
+					case UB_REQ_RDMA_STATE_WAIT_SEND:
+						/* SEND completed - request is done, return to free queue */
+						SPDK_NOTICELOG("SEND response completed!\n");
+						completed_ub_req->rdma_state = UB_REQ_RDMA_STATE_NONE;
+						STAILQ_INSERT_TAIL(&uqpair->resources->free_queue,
+							      completed_ub_req, link);
+						break;
+
+					default:
+						SPDK_ERRLOG("Unexpected completion for req %p in state %d\n",
+							    completed_ub_req, completed_ub_req->rdma_state);
+						break;
 					}
 				}
 			}
@@ -1740,13 +1764,61 @@ nvmf_ub_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 
 int magic_num = 777;
 
+/*
+ * Post the SEND response capsule to the host.
+ * Sets rdma_state to WAIT_SEND; the request is returned to the free
+ * queue only after the SEND completion arrives in poll_group_poll().
+ */
+static void
+nvmf_ub_post_send_response(struct spdk_nvmf_ub_request *ub_req)
+{
+	struct spdk_nvmf_request *req = &ub_req->req;
+	struct spdk_nvmf_ub_qpair *uqpair = SPDK_CONTAINEROF(req->qpair,
+		struct spdk_nvmf_ub_qpair, qpair);
+
+	void *resp = uqpair->va + PAGE_SIZE * 128 +
+		    ub_req->buf_idx * SPDK_NVMF_UB_DEFAULT_MAX_IO_SIZE;
+	memcpy(resp, req->rsp, sizeof(union nvmf_c2h_msg));
+
+	magic_num++;
+	urma_sge_t src_sge = {
+		.addr = (uint64_t)resp,
+		.len = 16,
+		.tseg = uqpair->local_tseg,
+	};
+
+	urma_sg_t src_sg = {
+		.sge = &src_sge,
+		.num_sge = 1
+	};
+
+	urma_send_wr_t send_wr = {
+		.src = src_sg,
+	};
+
+	urma_jfs_wr_t jfs_wr = {
+		.opcode = URMA_OPC_SEND,
+		.flag.bs.complete_enable = 1,
+		.tjetty = uqpair->target_jetty,
+		.user_ctx = (uint64_t)(uintptr_t)ub_req,
+		.send = send_wr,
+		.next = NULL
+	};
+	urma_jfs_wr_t *bad_wr = NULL;
+
+	if (urma_post_jetty_send_wr(uqpair->jetty, &jfs_wr, &bad_wr) != URMA_SUCCESS) {
+		SPDK_WARNLOG("UB req_complete: Failed to post SEND WR, req=%p\n", req);
+	} else {
+		SPDK_WARNLOG("UB req_complete: posted SEND WR, req=%p\n", req);
+	}
+
+	ub_req->rdma_state = UB_REQ_RDMA_STATE_WAIT_SEND;
+}
+
 static void
 nvmf_ub_req_complete(struct spdk_nvmf_request *req)
 {
 	SPDK_WARNLOG("UB nvmf_ub_req_complete\n");
-	struct spdk_nvmf_ub_transport	*utransport = SPDK_CONTAINEROF(req->qpair->transport,
-			struct spdk_nvmf_ub_transport, transport);
-
 	struct spdk_nvmf_ub_request	*ub_req = SPDK_CONTAINEROF(req,
 		struct spdk_nvmf_ub_request, req);
 
@@ -1756,11 +1828,13 @@ nvmf_ub_req_complete(struct spdk_nvmf_request *req)
 	SPDK_DEBUGLOG(ub, "UB req_complete: qid=%u, xfer=%d, iovcnt=%u, length=%u\n",
 		      uqpair->qid, req->xfer, req->iovcnt, req->length);
 
-	// 暂时在complete里处理data和rsp
-	struct spdk_nvmf_ub_resources *resources= uqpair->resources;
+	struct spdk_nvmf_ub_resources *resources = uqpair->resources;
 	ub_req->buf_idx = ub_req - resources->reqs;
 
 	if (req->xfer == SPDK_NVME_DATA_CONTROLLER_TO_HOST) {
+		/* Post RDMA WRITE to push data to host.  The SEND response
+		 * capsule will be posted after the WRITE completes, which
+		 * is handled in poll_group_poll().  No busy-waiting here. */
 		urma_seg_t remote_seg = {0};
 		remote_seg.ubva.eid = resources->remote_eid;
 		remote_seg.ubva.uasid = resources->remote_uasid;
@@ -1778,19 +1852,16 @@ nvmf_ub_req_complete(struct spdk_nvmf_request *req)
 
 		resources->tseg = urma_import_seg(uqpair->jetty->urma_ctx, &remote_seg, &token, 0, flag);
 		if (resources->tseg == NULL) {
-			fprintf(stderr, "Failed to import remote segment\n");
-			return ;
+			SPDK_ERRLOG("Failed to import remote segment\n");
+			STAILQ_INSERT_TAIL(&resources->free_queue, ub_req, link);
+			return;
 		}
 
-		void *resp = (void *)((uint8_t *)uqpair->va + PAGE_SIZE * 128 + ub_req->buf_idx * SPDK_NVMF_UB_DEFAULT_MAX_IO_SIZE);
-		fprintf(stderr, "iov_base=0x%llx, iov_len=%d\n", req->iov[0].iov_base, req->iov[0].iov_len);
-		uint64_t *va64 = req->iov[0].iov_base;
-		for (int j = 0; j < 8; j++) {
-			fprintf(stderr, "0x%llx   **\n", va64[j]);
-		}
+		void *resp = (void *)((uint8_t *)uqpair->va + PAGE_SIZE * 128 +
+				      ub_req->buf_idx * SPDK_NVMF_UB_DEFAULT_MAX_IO_SIZE);
 		memcpy(resp, req->iov[0].iov_base, req->iov[0].iov_len);
-		magic_num++;
-    	urma_sg_t dst_sg = {
+
+		urma_sg_t dst_sg = {
 			.sge = &(urma_sge_t){
 				.addr = req->cmd->nvme_cmd.dptr.sgl1.address,
 				.len = req->cmd->nvme_cmd.dptr.sgl1.keyed.length,
@@ -1800,15 +1871,13 @@ nvmf_ub_req_complete(struct spdk_nvmf_request *req)
 		};
 		urma_sg_t src_sg = {
 			.sge = &(urma_sge_t){
-			.addr = (uint64_t)resp,
-			.len = req->cmd->nvme_cmd.dptr.sgl1.keyed.length,
-			.tseg = uqpair->local_tseg  /* Remote memory, no local tseg */
+				.addr = (uint64_t)resp,
+				.len = req->cmd->nvme_cmd.dptr.sgl1.keyed.length,
+				.tseg = uqpair->local_tseg
 			},
 			.num_sge = 1
 		};
-		// fprintf(stderr, "va start=%llx\n", uqpair->va);
-		// req->iov[0].iov_base = (uint64_t)va + PAGE_SIZE * 128;
-		
+
 		urma_rw_wr_t rdma_wr = {
 			.src = src_sg,
 			.dst = dst_sg
@@ -1824,78 +1893,23 @@ nvmf_ub_req_complete(struct spdk_nvmf_request *req)
 		};
 		urma_jfs_wr_t *bad_wr = NULL;
 		ub_req->awaiting_rdma_write_completion = 1;
+		ub_req->rdma_state = UB_REQ_RDMA_STATE_WAIT_WRITE;
 
 		if (urma_post_jetty_send_wr(uqpair->jetty, &write_wr, &bad_wr) != URMA_SUCCESS) {
-			SPDK_WARNLOG("UB poll: Failed to re-post send write WR, slot=0x%llx\n", req);
+			SPDK_WARNLOG("UB req_complete: Failed to post WRITE WR, req=%p\n", req);
+			ub_req->awaiting_rdma_write_completion = 0;
+			ub_req->rdma_state = UB_REQ_RDMA_STATE_NONE;
+			STAILQ_INSERT_TAIL(&resources->free_queue, ub_req, link);
 		} else {
-			SPDK_WARNLOG("UB poll: post send write WR, slot=0x%llx\n", req);
+			SPDK_WARNLOG("UB req_complete: posted WRITE WR, req=%p\n", req);
 		}
-
-		struct spdk_nvmf_ub_transport *utransport;
-		utransport = nvmf_ub_get_transport(uqpair->qpair.transport);
-		while (ub_req->awaiting_rdma_write_completion) {
-			// fprintf(stderr, "awaiting_rdma_write_completion!\n");
-			// usleep(10000);
-			nvmf_ub_poll_group_poll(utransport->ugroup);
-		}
-
+		/* Return now; SEND will be posted after WRITE completion
+		 * arrives in poll_group_poll(). */
+		return;
 	}
 
-    // post send
-	{
-		uint64_t offset = 16;
-		*(uint64_t *)uqpair->va = magic_num;
-
-		void *resp = uqpair->va + PAGE_SIZE * 128 + ub_req->buf_idx * SPDK_NVMF_UB_DEFAULT_MAX_IO_SIZE;
-		memcpy(resp, req->rsp, sizeof(union nvmf_c2h_msg));
-		magic_num++;
-    	urma_sge_t src_sge = {
-        	.addr = (uint64_t)resp,
-        	.len = 16,
-        	.tseg = uqpair->local_tseg,
-    	};
-
-		fprintf(stderr, "DEBUG: %s 1696 req->rsp=%llx\n", __func__, req->rsp);
-		fprintf(stderr, "DEBUG: %s 1697 va=%llx, local_tseg=%llx\n", __func__, uqpair->va, uqpair->local_tseg);
-		if (req->iov[0].iov_base) {
-			uint64_t *va64 = req->iov[0].iov_base;
-			fprintf(stderr, "-------------------------------\n");
-			fprintf(stderr, "the read context is:\n");
-			for (int j = 0; j < 8; j++) {
-				fprintf(stderr, "0x%llx  **\n", va64[j]);
-			}
-			fprintf(stderr, "-------------------------------\n");
-		}
-		
-
-    	urma_sg_t src_sg = {
-        	.sge = &src_sge,
-        	.num_sge = 1
-    	};
-
-    	urma_send_wr_t send_wr = {
-        	.src = src_sg,
-    	};
-
-    	urma_jfs_wr_t jfs_wr = {
-        	.opcode = URMA_OPC_SEND,
-        	.flag.bs.complete_enable = 1,
-        	.tjetty = uqpair->target_jetty,
-        	.user_ctx = (uint64_t)(uintptr_t)ub_req,
-        	.send = send_wr,
-        	.next = NULL
-    	};
-    	urma_jfs_wr_t *bad_wr = NULL;
-
-		if (urma_post_jetty_send_wr(uqpair->jetty, &jfs_wr, &bad_wr) != URMA_SUCCESS) {
-			SPDK_WARNLOG("UB poll: Failed to re-post recv WR, slot=0x%llx\n", req);
-		} else {
-			SPDK_WARNLOG("UB poll: post send WR, slot=0x%llx\n", req);
-		}
-	}
-
-	/* Return the request back to the free queue */
-	STAILQ_INSERT_TAIL(&resources->free_queue, ub_req, link);
+	/* Non-C2H: just post the SEND response capsule. */
+	nvmf_ub_post_send_response(ub_req);
 }
 
 static int
