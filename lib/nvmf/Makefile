@@ -15,9 +15,17 @@ C_SRCS = ctrlr.c ctrlr_discovery.c ctrlr_bdev.c \
 
 C_SRCS-$(CONFIG_RDMA) += rdma.c
 C_SRCS-$(CONFIG_HAVE_EVP_MAC) += auth.c
+C_SRCS-$(CONFIG_UB) += ub.c
 
 LIBNAME = nvmf
 LOCAL_SYS_LIBS =
+
+#Attach only if UB is specified with configure
+ifeq ($(CONFIG_UB),y)
+CFLAGS += -I/usr/include/ub/umdk/urma
+LOCAL_SYS_LIBS += -lurma -lurma_common
+endif
+
 ifeq ($(CONFIG_RDMA),y)
 LOCAL_SYS_LIBS += -libverbs -lrdmacm
 #Attach only if FreeBSD and RDMA is specified with configure

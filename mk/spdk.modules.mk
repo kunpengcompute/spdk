@@ -49,6 +49,10 @@ BLOCKDEV_MODULES_PRIVATE_LIBS += -lmlx5
 endif
 endif
 
+ifeq ($(CONFIG_UB),y)
+BLOCKDEV_MODULES_PRIVATE_LIBS += -lurma -lurma_common
+endif
+
 ifeq ($(OS),Linux)
 BLOCKDEV_MODULES_LIST += bdev_aio
 BLOCKDEV_MODULES_PRIVATE_LIBS += -laio

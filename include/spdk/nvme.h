@@ -30,6 +30,7 @@ extern "C" {
 #define SPDK_NVME_TRANSPORT_NAME_RDMA		"RDMA"
 #define SPDK_NVME_TRANSPORT_NAME_TCP		"TCP"
 #define SPDK_NVME_TRANSPORT_NAME_VFIOUSER	"VFIOUSER"
+#define SPDK_NVME_TRANSPORT_NAME_UB		"UB"
 #define SPDK_NVME_TRANSPORT_NAME_CUSTOM		"CUSTOM"
 
 #define SPDK_NVMF_PRIORITY_MAX_LEN 4
@@ -452,6 +453,11 @@ enum spdk_nvme_transport_type {
 	 * TCP Transport
 	 */
 	SPDK_NVME_TRANSPORT_TCP = SPDK_NVMF_TRTYPE_TCP,
+
+	/**
+	 * UB Transport
+	 */
+	SPDK_NVME_TRANSPORT_UB = SPDK_NVMF_TRTYPE_UB,
 
 	/**
 	 * Custom VFIO User Transport (Not spec defined)
