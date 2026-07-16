@@ -2154,27 +2154,27 @@ nvme_ub_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
     for (i;i < num_devices;i++){
         NVME_CTRLR_ERRLOG(&uctrlr->ctrlr, "Device %d: name=%s\n",i, urma_devs[i]->name);
     }
-    i = 3;
-    
-    while (urma_devs[i] != NULL) {
-        rc = urma_query_device(urma_devs[i], &dev_attr);
-        if (rc < 0) {
-            NVME_CTRLR_ERRLOG(&uctrlr->ctrlr, "Failed to query UB device attributes.\n");
-            urma_free_device_list(urma_devs);
-            spdk_free(uctrlr);
-            urma_uninit();
-            return NULL;
-        }
-        NVME_CTRLR_ERRLOG(&uctrlr->ctrlr, "Device %d: name=%s, max_jfc_depth=%u, max_jfs_sge=%u\n",
-                  i, urma_devs[i]->name, dev_attr.dev_cap.max_jfc_depth, dev_attr.dev_cap.max_jfs_sge);
-        uctrlr->max_sge = spdk_min(uctrlr->max_sge, (uint16_t)dev_attr.dev_cap.max_jfs_sge);
-        urma_dev = urma_devs[i];
-        uctrlr->dev_attr = dev_attr;
-        strncpy(uctrlr->dev_name, urma_dev->name, URMA_MAX_DEV_NAME - 1);
-        break; /* Use first device for now */
+    urma_free_device_list(urma_devs);
+
+    char *tmp_dev_name = "udmac0d1e2";
+    urma_dev = urma_get_device_by_name(tmp_dev_name);
+    if (urma_dev == NULL) {
+        NVME_CTRLR_ERRLOG(&uctrlr->ctrlr, "urma get device by name failed!\n");
+        return NULL;
     }
 
-    urma_free_device_list(urma_devs);
+    rc = urma_query_device(urma_dev, &dev_attr);
+    if (rc < 0) {
+        NVME_CTRLR_ERRLOG(&uctrlr->ctrlr, "Failed to query UB device attributes.\n");
+        spdk_free(uctrlr);
+        urma_uninit();
+        return NULL;
+    }
+    NVME_CTRLR_ERRLOG(&uctrlr->ctrlr, "name=%s, max_jfc_depth=%u, max_jfs_sge=%u\n",
+                urma_dev->name, dev_attr.dev_cap.max_jfc_depth, dev_attr.dev_cap.max_jfs_sge);
+    uctrlr->max_sge = spdk_min(uctrlr->max_sge, (uint16_t)dev_attr.dev_cap.max_jfs_sge);
+    uctrlr->dev_attr = dev_attr;
+    strncpy(uctrlr->dev_name, urma_dev->name, URMA_MAX_DEV_NAME - 1);
 
     if (urma_dev == NULL) {
         NVME_CTRLR_ERRLOG(&uctrlr->ctrlr, "No URMA device found.\n");

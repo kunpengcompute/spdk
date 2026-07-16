@@ -388,10 +388,7 @@ nvmf_ub_create_urma(struct spdk_nvmf_ub_transport *utransport)
 {
 	urma_init_attr_t init_attr = {};
 	int rc;
-	// 4245:4944:0000:0000:0000:0000:0200:0000
-	// 0000:0000:0000:1000:0010:0000:df00:0460
-	urma_eid_t tgt_eid = {{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x10, 0x00, 0x00, 0xdf, 0x00, 0x04, 0x60 }};
-	// urma_eid_t tgt_eid = {{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x20, 0x00, 0x10, 0x00, 0x00, 0xdf, 0x00, 0x04, 0x43 }};
+
 	if (g_nvmf_urma_initialized) {
 		SPDK_NOTICELOG("URMA library already initialized\n");
 		return 0;
@@ -412,12 +409,19 @@ nvmf_ub_create_urma(struct spdk_nvmf_ub_transport *utransport)
 	g_nvmf_urma_initialized = true;
 	SPDK_NOTICELOG("URMA library initialized successfully\n");
 
-	/* Get device by target EID */
-	urma_device_t *dev = urma_get_device_by_eid(tgt_eid, URMA_TRANSPORT_UB);
+	char *dev_name = "udmac0d1e2";
+	urma_device_t *dev = urma_get_device_by_name(dev_name);
 	if (dev == NULL) {
-		SPDK_ERRLOG("Failed to get URMA device by eid\n");
+		SPDK_ERRLOG("urma get device by name failed!\n");
 		return -1;
 	}
+
+	urma_device_attr_t dev_attr;
+	if (urma_query_device(dev, &dev_attr) != URMA_SUCCESS) {
+		SPDK_ERRLOG("Failed to query device %s.\n", dev_name);
+		return -1;
+	}
+
 	SPDK_NOTICELOG("Got URMA device by eid successfully\n");
 
     int eid_index = get_eid_index(dev);
