@@ -2024,9 +2024,14 @@ nvme_ub_poll_group_destroy(struct spdk_nvme_transport_poll_group *tgroup)
 {
     fprintf(stderr, "DEBUG: [ENTER] %s (tgroup=%p)\n", __func__, (void*)tgroup);
     struct nvme_ub_poll_group *group = nvme_ub_poll_group(tgroup);
+    int rc;
 
     if (group->sock_group) {
-        spdk_fd_group_destroy(group->sock_group);
+        rc = spdk_sock_group_close(&group->sock_group);
+        if (rc != 0) {
+            SPDK_ERRLOG("Unable to close UB socket group, rc=%d\n", rc);
+            return rc;
+        }
     }
     pthread_mutex_destroy(&group->lock);
     free(group);
