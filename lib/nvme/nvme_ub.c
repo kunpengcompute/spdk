@@ -707,7 +707,12 @@ nvme_ub_ctrlr_create_io_qpair(struct spdk_nvme_ctrlr *ctrlr, uint16_t qid,
     TAILQ_INIT(&uqpair->outstanding_reqs);
 
     /* Allocate requests using helper function */
-    rc = nvme_ub_alloc_qpair_reqs(uqpair, opts->io_queue_requests);
+    /* Transport request contexts are SQ credits.  io_queue_requests is the
+     * size of SPDK's software request pool and can be much larger when an I/O
+     * is split into child requests.  Limiting the UB pool to num_entries makes
+     * nvme_ub_req_get() return -EAGAIN at the negotiated SQ depth so excess
+     * children remain on qpair->queued_req. */
+    rc = nvme_ub_alloc_qpair_reqs(uqpair, uqpair->num_entries);
     if (rc != 0) {
         NVME_CTRLR_ERRLOG(ctrlr, "failed to allocate requests\n");
         nvme_qpair_deinit(qpair);
@@ -798,9 +803,9 @@ nvme_ub_ctrlr_create_io_qpair(struct spdk_nvme_ctrlr *ctrlr, uint16_t qid,
 
     /* Keep command/payload staging and response capsules private to the qpair. */
     uqpair->payload_buffer_offset = SPDK_ALIGN_CEIL(
-            (uint64_t)opts->io_queue_requests * sizeof(struct spdk_nvme_cmd), PAGE_SIZE);
+            (uint64_t)uqpair->num_entries * sizeof(struct spdk_nvme_cmd), PAGE_SIZE);
     uqpair->cmd_buffer_size = uqpair->payload_buffer_offset +
-                              (uint64_t)opts->io_queue_requests * MAX_IO_SIZE;
+                              (uint64_t)uqpair->num_entries * MAX_IO_SIZE;
     uqpair->resp_buffer_size = (uint64_t)uqpair->recv_depth * MSG_SIZE;
 
     rc = posix_memalign(&uqpair->cmd_buffer, PAGE_SIZE, uqpair->cmd_buffer_size);
@@ -2169,6 +2174,7 @@ nvme_ub_poll_group_process_completions(struct spdk_nvme_transport_poll_group *tg
     }
 
     TAILQ_FOREACH_SAFE(uqpair, &group->active_qpairs, link_active, tmp_uqpair) {
+        uint32_t qpair_completions = 0;
         uint32_t i;
 
         for (i = 0; i < completions_per_qpair; i++) {
@@ -2186,7 +2192,15 @@ nvme_ub_poll_group_process_completions(struct spdk_nvme_transport_poll_group *tg
                 nvme_ub_fail_qpair(&uqpair->qpair, 0);
                 break;
             }
+            qpair_completions += rc;
             total_completions += rc;
+        }
+
+        /* Unlike the single-qpair completion path, the generic poll-group
+         * layer only aggregates completion counts.  The transport must
+         * resubmit this qpair's software-queued requests itself. */
+        if (qpair_completions > 0 && uqpair->is_connected) {
+            nvme_qpair_resubmit_requests(&uqpair->qpair, qpair_completions);
         }
 
         if (!uqpair->is_connected && disconnected_qpair_cb != NULL) {
@@ -2565,8 +2579,7 @@ nvme_ub_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
         return NULL;
     }
 
-    /* Allocate admin requests - increase to 128 to support more outstanding requests */
-    rc = nvme_ub_alloc_qpair_reqs(admin_uqpair, 128);
+    rc = nvme_ub_alloc_qpair_reqs(admin_uqpair, admin_uqpair->num_entries);
     if (rc != 0) {
         NVME_CTRLR_ERRLOG(&uctrlr->ctrlr, "failed to allocate admin requests\n");
         free(admin_uqpair->recv_ctxs);
