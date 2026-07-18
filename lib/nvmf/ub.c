@@ -575,6 +575,7 @@ nvmf_ub_create_jetty(struct spdk_nvmf_ub_qpair *uqpair, bool is_admin_qpair)
 	if (uqpair->jfr == NULL) {
 		SPDK_ERRLOG("Failed to create jfr for qid %u\n", uqpair->qid);
 		urma_delete_jfc(uqpair->send_jfc);
+		uqpair->send_jfc = NULL;
 		return -1;
 	}
 
@@ -600,7 +601,9 @@ nvmf_ub_create_jetty(struct spdk_nvmf_ub_qpair *uqpair, bool is_admin_qpair)
 	uqpair->jetty = urma_create_jetty(utransport->urma_ctx, &jetty_cfg);
 	if (uqpair->jetty == NULL) {
 		urma_delete_jfr(uqpair->jfr);
+		uqpair->jfr = NULL;
 		urma_delete_jfc(uqpair->send_jfc);
+		uqpair->send_jfc = NULL;
 		SPDK_ERRLOG("Failed to create jetty\n");
 		return -1;
 	}
@@ -947,6 +950,39 @@ nvmf_ub_qpair_destroy(struct spdk_nvmf_ub_qpair *uqpair)
 }
 
 static void
+_nvmf_ub_qpair_destroy(void *ctx)
+{
+	struct spdk_nvmf_ub_qpair *uqpair = ctx;
+	spdk_nvmf_transport_qpair_fini_cb cb_fn = uqpair->fini_cb_fn;
+	void *cb_arg = uqpair->fini_cb_arg;
+
+	uqpair->state = UB_QPAIR_STATE_DISCONNECTED;
+	nvmf_ub_qpair_destroy(uqpair);
+
+	if (cb_fn != NULL) {
+		cb_fn(cb_arg);
+	}
+}
+
+static void
+nvmf_ub_close_qpair(struct spdk_nvmf_qpair *qpair,
+			spdk_nvmf_transport_qpair_fini_cb cb_fn, void *cb_arg)
+{
+	struct spdk_nvmf_ub_qpair *uqpair;
+
+	uqpair = SPDK_CONTAINEROF(qpair, struct spdk_nvmf_ub_qpair, qpair);
+	assert(uqpair->fini_cb_fn == NULL);
+	uqpair->fini_cb_fn = cb_fn;
+	uqpair->fini_cb_arg = cb_arg;
+	uqpair->state = UB_QPAIR_STATE_DISCONNECTING;
+
+	/* qpair_fini can be reached from a completion callback.  Defer the
+	 * actual destruction so the current UB poll pass cannot access a freed
+	 * qpair or request after spdk_nvmf_qpair_disconnect() returns. */
+	spdk_thread_send_msg(spdk_get_thread(), _nvmf_ub_qpair_destroy, uqpair);
+}
+
+static void
 nvmf_ub_pending_sock_cb(void *ctx, struct spdk_sock_group *group, struct spdk_sock *sock);
 
 static void
@@ -1064,9 +1100,6 @@ nvmf_ub_pending_sock_cb(void *ctx, struct spdk_sock_group *group, struct spdk_so
 		goto cleanup;
 	}
 
-	/* Remove from sock_group before handling connect */
-	//spdk_sock_group_remove_sock(group, sock);
-
 	rc = nvmf_ub_handle_connect(pending->uqpair, req, sock);
 	if (rc < 0) {
 		SPDK_ERRLOG("Failed to handle connect: %d\n", rc);
@@ -1076,35 +1109,24 @@ nvmf_ub_pending_sock_cb(void *ctx, struct spdk_sock_group *group, struct spdk_so
 	// fprintf(stderr, "DEBUG: %s 1013 transport=%llx\n", __func__, (void*)pending->uqpair->qpair.transport);
 	SPDK_NOTICELOG("UB qpair connected: qid=%u\n", pending->uqpair->qid);
 
-	urma_seg_t remote_seg = {0};
-	remote_seg.ubva.eid = req->eid;
-	remote_seg.ubva.uasid = req->uasid;
-	remote_seg.ubva.va = req->seg_va;
-	remote_seg.len = req->seg_len;
-	remote_seg.attr.bs.token_policy = URMA_TOKEN_NONE;
-	remote_seg.attr.bs.cacheable = URMA_NON_CACHEABLE;
-	remote_seg.token_id = req->seg_token_id;
-
-	urma_token_t token = {0};
-	token.token = 0xABCD;
-
-	urma_import_seg_flag_t flag = {0};
-	flag.bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE | URMA_ACCESS_ATOMIC;
-
-	urma_target_seg_t *tseg;
-	tseg = urma_import_seg(pending->uqpair->jetty->urma_ctx, &remote_seg, &token, 0, flag);
-	if (tseg == NULL) {
-		fprintf(stderr, "Failed to import remote segment\n");
-		return ;
+	/* The socket is only used for the out-of-band connection exchange.
+	 * The qpair now belongs to the NVMf core, but the pending context and
+	 * socket must be released before the pending sock group is destroyed. */
+	rc = spdk_sock_group_remove_sock(group, sock);
+	if (rc != 0) {
+		SPDK_ERRLOG("Failed to remove connected UB socket from pending group: %d\n", rc);
 	}
-
+	spdk_sock_close(&sock);
+	free(pending);
 	return;
 
 cleanup:
-	spdk_sock_group_remove_sock(group, sock);
-	// free(pending->uqpair);
+	rc = spdk_sock_group_remove_sock(group, sock);
+	if (rc != 0) {
+		SPDK_ERRLOG("Failed to remove UB socket from pending group: %d\n", rc);
+	}
+	nvmf_ub_qpair_destroy(pending->uqpair);
 	free(pending);
-	// fprintf(stderr, "DEBUG: %s 1022 transport=%llx\n", __func__, (void*)pending->uqpair->qpair.transport);
 	spdk_sock_close(&sock);
 }
 
@@ -1475,6 +1497,21 @@ nvmf_ub_req_abort(struct spdk_nvmf_ub_request *ub_req)
 	 * credit while releasing local request resources. */
 	ub_req->recv_slot = NVMF_UB_INVALID_RECV_SLOT;
 	nvmf_ub_req_put(ub_req);
+}
+
+static void
+nvmf_ub_req_free(struct spdk_nvmf_request *req)
+{
+	struct spdk_nvmf_ub_request *ub_req;
+
+	ub_req = SPDK_CONTAINEROF(req, struct spdk_nvmf_ub_request, req);
+	if (ub_req->in_use) {
+		if (req->qpair->state == SPDK_NVMF_QPAIR_ENABLED) {
+			nvmf_ub_req_put(ub_req);
+		} else {
+			nvmf_ub_req_abort(ub_req);
+		}
+	}
 }
 
 static void
@@ -2037,6 +2074,22 @@ nvmf_ub_qpair_get_listen_trid(struct spdk_nvmf_qpair *qpair,
 	return 0;
 }
 
+static int
+nvmf_ub_qpair_get_peer_trid(struct spdk_nvmf_qpair *qpair,
+			     struct spdk_nvme_transport_id *trid)
+{
+	(void)qpair;
+	(void)trid;
+	return -ENOTSUP;
+}
+
+static int
+nvmf_ub_qpair_get_local_trid(struct spdk_nvmf_qpair *qpair,
+			      struct spdk_nvme_transport_id *trid)
+{
+	return nvmf_ub_qpair_get_listen_trid(qpair, trid);
+}
+
 const struct spdk_nvmf_transport_ops spdk_nvmf_transport_ub = {
 	.name = "UB",
 	.type = SPDK_NVME_TRANSPORT_UB,
@@ -2058,13 +2111,13 @@ const struct spdk_nvmf_transport_ops spdk_nvmf_transport_ub = {
 	.poll_group_remove = nvmf_ub_poll_group_remove,
 	.poll_group_poll = nvmf_ub_poll_group_poll,
 
-	.req_free = NULL,
+	.req_free = nvmf_ub_req_free,
 	.req_complete = nvmf_ub_req_complete,
 	.req_get_buffers_done = NULL,
 
-	.qpair_fini = NULL,
-	.qpair_get_peer_trid = NULL,
-	.qpair_get_local_trid = NULL,
+	.qpair_fini = nvmf_ub_close_qpair,
+	.qpair_get_peer_trid = nvmf_ub_qpair_get_peer_trid,
+	.qpair_get_local_trid = nvmf_ub_qpair_get_local_trid,
 	.qpair_get_listen_trid = nvmf_ub_qpair_get_listen_trid,
 	.qpair_abort_request = NULL,
 
