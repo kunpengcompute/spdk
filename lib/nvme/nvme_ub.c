@@ -12,6 +12,7 @@
 
 #include "spdk/assert.h"
 #include "spdk/dma.h"
+#include "spdk/env.h"
 #include "spdk/log.h"
 #include "spdk/trace.h"
 #include "spdk/queue.h"
@@ -186,6 +187,7 @@ struct nvme_ub_request {
     uint32_t data_len;
     urma_target_seg_t *data_tseg;
     void *addr;
+    bool payload_staged;
 
     /* Completion Callback */
     spdk_nvme_cmd_cb cb_fn;
@@ -238,6 +240,7 @@ struct nvme_ub_ctrlr {
     void *send_buffer;
     void *recv_buffer;
     uint32_t buffer_size;
+    struct spdk_mem_map *mem_map;
 
     /* Token for memory registration */
     urma_token_t token;
@@ -344,6 +347,11 @@ nvme_ub_req_put(struct nvme_ub_qpair *uqpair, struct nvme_ub_request *ub_req)
             __func__, (void*)uqpair, (void*)ub_req, uqpair->qid); */
     ub_req->completion_flags = 0;
     ub_req->req = NULL;
+    ub_req->data_buffer = NULL;
+    ub_req->data_len = 0;
+    ub_req->data_tseg = NULL;
+    ub_req->addr = NULL;
+    ub_req->payload_staged = false;
     TAILQ_INSERT_HEAD(&uqpair->free_reqs, ub_req, link);
 }
 
@@ -469,6 +477,73 @@ nvme_ub_unregister_segs(urma_target_seg_t *tseg1, urma_target_seg_t *tseg2,
         free(buf2);
     }
 }
+
+static int
+nvme_ub_mem_map_notify(void *cb_ctx, struct spdk_mem_map *map,
+                       enum spdk_mem_map_notify_action action, void *vaddr, size_t size)
+{
+    struct nvme_ub_ctrlr *uctrlr = cb_ctx;
+    urma_target_seg_t *tseg;
+    int rc;
+
+    switch (action) {
+    case SPDK_MEM_MAP_NOTIFY_REGISTER: {
+        urma_reg_seg_flag_t flag = {
+            .bs.token_policy = URMA_TOKEN_NONE,
+            .bs.cacheable = URMA_NON_CACHEABLE,
+            .bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE | URMA_ACCESS_ATOMIC,
+            .bs.token_id_valid = 0,
+            .bs.reserved = 0,
+        };
+        urma_seg_cfg_t seg_cfg = {
+            .va = (uint64_t)(uintptr_t)vaddr,
+            .len = size,
+            .token_id = NULL,
+            .token_value = uctrlr->token,
+            .flag = flag,
+            .user_ctx = 0,
+            .iova = 0,
+        };
+
+        tseg = urma_register_seg(uctrlr->urma_ctx, &seg_cfg);
+        if (tseg == NULL) {
+            SPDK_WARNLOG("Unable to register application memory %p/%zu with URMA\n",
+                         vaddr, size);
+            return -EFAULT;
+        }
+
+        rc = spdk_mem_map_set_translation(map, (uint64_t)(uintptr_t)vaddr, size,
+                                          (uint64_t)(uintptr_t)tseg);
+        if (rc != 0) {
+            urma_unregister_seg(tseg);
+        }
+        return rc;
+    }
+    case SPDK_MEM_MAP_NOTIFY_UNREGISTER:
+        tseg = (urma_target_seg_t *)(uintptr_t)
+               spdk_mem_map_translate(map, (uint64_t)(uintptr_t)vaddr, NULL);
+        if (tseg != NULL && urma_unregister_seg(tseg) != URMA_SUCCESS) {
+            SPDK_WARNLOG("Unable to unregister application memory %p/%zu from URMA\n",
+                         vaddr, size);
+        }
+        return spdk_mem_map_clear_translation(map, (uint64_t)(uintptr_t)vaddr, size);
+    default:
+        SPDK_UNREACHABLE();
+    }
+
+    return -EINVAL;
+}
+
+static int
+nvme_ub_mem_map_are_contiguous(uint64_t addr_1, uint64_t addr_2)
+{
+    return addr_1 == addr_2;
+}
+
+static const struct spdk_mem_map_ops g_nvme_ub_mem_map_ops = {
+    .notify_cb = nvme_ub_mem_map_notify,
+    .are_contiguous = nvme_ub_mem_map_are_contiguous,
+};
 
 /* Helper function to allocate requests for a qpair */
 static int
@@ -608,6 +683,9 @@ nvme_ub_ctrlr_destruct(struct spdk_nvme_ctrlr *ctrlr)
     }
     if (uctrlr->jfce) {
         urma_delete_jfce(uctrlr->jfce);
+    }
+    if (uctrlr->mem_map) {
+        spdk_mem_map_free(&uctrlr->mem_map);
     }
     if (uctrlr->urma_ctx) {
         urma_delete_context(uctrlr->urma_ctx);
@@ -984,6 +1062,45 @@ nvme_ub_configure_null_request(struct nvme_ub_request *ub_req, struct nvme_reque
 
     /* Record that we have a null request (no data payload) */
     ub_req->num_sge = 0;
+    ub_req->payload_staged = false;
+}
+
+static inline urma_target_seg_t *
+nvme_ub_get_registered_tseg(struct nvme_ub_qpair *uqpair, void *addr, size_t length)
+{
+    struct spdk_mem_map *map = uqpair->uctrlr->mem_map;
+    urma_target_seg_t *tseg;
+    uint64_t translated_length = length;
+
+    if (map == NULL || addr == NULL || length == 0) {
+        return NULL;
+    }
+
+    tseg = (urma_target_seg_t *)(uintptr_t)
+           spdk_mem_map_translate(map, (uint64_t)(uintptr_t)addr, &translated_length);
+    if (tseg == NULL || translated_length < length) {
+        return NULL;
+    }
+
+    return tseg;
+}
+
+static inline void
+nvme_ub_configure_keyed_sgl(struct nvme_ub_request *ub_req, struct nvme_request *req,
+                            void *payload_buffer, urma_target_seg_t *payload_tseg,
+                            bool payload_staged)
+{
+    req->cmd.psdt = SPDK_NVME_PSDT_SGL_MPTR_CONTIG;
+    req->cmd.dptr.sgl1.keyed.type = SPDK_NVME_SGL_TYPE_KEYED_DATA_BLOCK;
+    req->cmd.dptr.sgl1.keyed.subtype = SPDK_NVME_SGL_SUBTYPE_ADDRESS;
+    req->cmd.dptr.sgl1.keyed.length = (uint32_t)req->payload_size;
+    req->cmd.dptr.sgl1.keyed.key = payload_tseg->seg.token_id;
+    req->cmd.dptr.sgl1.address = (uint64_t)(uintptr_t)payload_buffer;
+
+    ub_req->data_buffer = payload_buffer;
+    ub_req->data_len = req->payload_size;
+    ub_req->data_tseg = payload_tseg;
+    ub_req->payload_staged = payload_staged;
 }
 
 /* Helper function to configure dptr for contiguous payload
@@ -995,8 +1112,8 @@ nvme_ub_configure_contig_request(struct nvme_ub_qpair *uqpair,
                                   struct nvme_request *req)
 {
     urma_target_seg_t *send_tseg = nvme_ub_qpair_send_tseg(uqpair);
+    urma_target_seg_t *payload_tseg;
     void *payload_buffer;
-    uint32_t rkey;
 
     assert(req->payload_size != 0);
     assert(req->payload_size <= NVME_UB_MAX_KEYED_SGL_LENGTH);
@@ -1006,29 +1123,30 @@ nvme_ub_configure_contig_request(struct nvme_ub_qpair *uqpair,
         return -EINVAL;
     }
 
-    payload_buffer = nvme_ub_qpair_payload_buffer(uqpair, req->cmd.cid);
-    if (spdk_unlikely((uint8_t *)payload_buffer + req->payload_size >
-                      (uint8_t *)nvme_ub_qpair_send_buffer(uqpair) +
-                      nvme_ub_qpair_send_buffer_size(uqpair))) {
-        NVME_UQPAIR_ERRLOG(uqpair, "payload buffer exceeds registered segment\n");
-        return -EINVAL;
+    payload_buffer = (uint8_t *)req->payload.contig_or_cb_arg + req->payload_offset;
+    payload_tseg = nvme_ub_get_registered_tseg(uqpair, payload_buffer, req->payload_size);
+    if (payload_tseg != NULL) {
+        nvme_ub_configure_keyed_sgl(ub_req, req, payload_buffer, payload_tseg, false);
+    } else {
+        payload_buffer = nvme_ub_qpair_payload_buffer(uqpair, req->cmd.cid);
+        if (spdk_unlikely((uint8_t *)payload_buffer + req->payload_size >
+                          (uint8_t *)nvme_ub_qpair_send_buffer(uqpair) +
+                          nvme_ub_qpair_send_buffer_size(uqpair))) {
+            NVME_UQPAIR_ERRLOG(uqpair, "payload buffer exceeds registered segment\n");
+            return -EINVAL;
+        }
+
+        if (spdk_nvme_opc_get_data_transfer(req->cmd.opc) !=
+            SPDK_NVME_DATA_CONTROLLER_TO_HOST) {
+            memcpy(payload_buffer, (uint8_t *)req->payload.contig_or_cb_arg + req->payload_offset,
+                   req->payload_size);
+        }
+        nvme_ub_configure_keyed_sgl(ub_req, req, payload_buffer, send_tseg, true);
     }
 
-    rkey = send_tseg->seg.token_id;
-
-    /* Configure SGL descriptor in the NVMe command dptr */
-    req->cmd.psdt = SPDK_NVME_PSDT_SGL_MPTR_CONTIG;
-    req->cmd.dptr.sgl1.keyed.type = SPDK_NVME_SGL_TYPE_KEYED_DATA_BLOCK;
-    req->cmd.dptr.sgl1.keyed.subtype = SPDK_NVME_SGL_SUBTYPE_ADDRESS;
-    req->cmd.dptr.sgl1.keyed.length = (uint32_t)req->payload_size;
-    req->cmd.dptr.sgl1.keyed.key = rkey;
-
-    memcpy(payload_buffer, (uint8_t *)req->payload.contig_or_cb_arg + req->payload_offset,
-           req->payload_size);
-    req->cmd.dptr.sgl1.address = (uint64_t)(uintptr_t)payload_buffer;
-
     /* fprintf(stderr, "DEBUG: %s contig: addr=0x%lx, length=%u, key=0x%x\n",
-            __func__, req->cmd.dptr.sgl1.address, req->cmd.dptr.sgl1.keyed.length, rkey); */
+            __func__, req->cmd.dptr.sgl1.address, req->cmd.dptr.sgl1.keyed.length,
+            req->cmd.dptr.sgl1.keyed.key); */
 
     /* Record num_sge for this request */
     ub_req->num_sge = 1;
@@ -1045,11 +1163,11 @@ nvme_ub_configure_sgl_request(struct nvme_ub_qpair *uqpair,
                                struct nvme_request *req)
 {
     urma_target_seg_t *send_tseg = nvme_ub_qpair_send_tseg(uqpair);
+    urma_target_seg_t *payload_tseg;
     uint8_t *payload_buffer;
     uint32_t remaining_size;
     uint32_t sge_length;
     uint32_t copied = 0;
-    uint32_t rkey;
     int num_sge = 0;
     int rc;
 
@@ -1062,6 +1180,31 @@ nvme_ub_configure_sgl_request(struct nvme_ub_qpair *uqpair,
         return -EINVAL;
     }
 
+    req->payload.reset_sgl_fn(req->payload.contig_or_cb_arg, req->payload_offset);
+
+    /* A single registered SGE can be exposed directly to the target.  Multi-SGE
+     * requests continue to use the contiguous staging buffer below. */
+    {
+        void *addr;
+        uint32_t length;
+
+        rc = req->payload.next_sge_fn(req->payload.contig_or_cb_arg, &addr, &length);
+        if (spdk_unlikely(rc != 0 || length == 0)) {
+            NVME_UQPAIR_ERRLOG(uqpair, "failed to get first SGE\n");
+            return rc != 0 ? rc : -EINVAL;
+        }
+
+        if (length >= req->payload_size) {
+            payload_tseg = nvme_ub_get_registered_tseg(uqpair, addr, req->payload_size);
+            if (payload_tseg != NULL) {
+                nvme_ub_configure_keyed_sgl(ub_req, req, addr, payload_tseg, false);
+                ub_req->addr = addr;
+                ub_req->num_sge = 1;
+                return 0;
+            }
+        }
+    }
+
     payload_buffer = nvme_ub_qpair_payload_buffer(uqpair, req->cmd.cid);
     if (spdk_unlikely(payload_buffer + req->payload_size >
                       (uint8_t *)nvme_ub_qpair_send_buffer(uqpair) +
@@ -1069,8 +1212,6 @@ nvme_ub_configure_sgl_request(struct nvme_ub_qpair *uqpair,
         NVME_UQPAIR_ERRLOG(uqpair, "payload buffer exceeds registered segment\n");
         return -EINVAL;
     }
-
-    rkey = send_tseg->seg.token_id;
 
     req->payload.reset_sgl_fn(req->payload.contig_or_cb_arg, req->payload_offset);
 
@@ -1099,18 +1240,16 @@ nvme_ub_configure_sgl_request(struct nvme_ub_qpair *uqpair,
             ub_req->addr = addr;
         }
 
-        memcpy(payload_buffer + copied, addr, sge_length);
+        if (spdk_nvme_opc_get_data_transfer(req->cmd.opc) !=
+            SPDK_NVME_DATA_CONTROLLER_TO_HOST) {
+            memcpy(payload_buffer + copied, addr, sge_length);
+        }
         copied += sge_length;
         remaining_size -= sge_length;
         num_sge++;
     } while (remaining_size > 0);
 
-    req->cmd.psdt = SPDK_NVME_PSDT_SGL_MPTR_CONTIG;
-    req->cmd.dptr.sgl1.keyed.key = rkey;
-    req->cmd.dptr.sgl1.keyed.type = SPDK_NVME_SGL_TYPE_KEYED_DATA_BLOCK;
-    req->cmd.dptr.sgl1.keyed.subtype = SPDK_NVME_SGL_SUBTYPE_ADDRESS;
-    req->cmd.dptr.sgl1.keyed.length = req->payload_size;
-    req->cmd.dptr.sgl1.address = (uint64_t)(uintptr_t)payload_buffer;
+    nvme_ub_configure_keyed_sgl(ub_req, req, payload_buffer, send_tseg, true);
 
     ub_req->num_sge = num_sge;
 
@@ -1196,7 +1335,8 @@ nvme_ub_copy_payload_from_staging(struct nvme_ub_request *ub_req)
     uint32_t remaining, copied = 0;
     enum nvme_payload_type payload_type;
 
-    if (req->payload_size == 0) {
+    if (req->payload_size == 0 || !ub_req->payload_staged ||
+        spdk_nvme_opc_get_data_transfer(req->cmd.opc) != SPDK_NVME_DATA_CONTROLLER_TO_HOST) {
         return 0;
     }
 
@@ -1744,13 +1884,14 @@ nvme_ub_connect_established(struct nvme_ub_qpair *uqpair)
 {
     struct nvme_ub_ctrlr *uctrlr = uqpair->uctrlr;
     struct spdk_nvme_qpair *qpair = &uqpair->qpair;
+    urma_target_seg_t *send_tseg = nvme_ub_qpair_send_tseg(uqpair);
     urma_target_seg_t *recv_tseg = nvme_ub_qpair_recv_tseg(uqpair);
     urma_rjetty_t remote_jetty = {};
     nvme_ub_conn_info_t local_info, remote_info;
     struct iovec iov[2];
     int rc;
 
-    if (uqpair->sock == NULL || recv_tseg == NULL || uqpair->jfc == NULL ||
+    if (uqpair->sock == NULL || send_tseg == NULL || recv_tseg == NULL || uqpair->jfc == NULL ||
         uqpair->recv_ctxs == NULL || uqpair->recv_depth == 0) {
         NVME_UQPAIR_ERRLOG(uqpair, "Incomplete qpair resources\n");
         return -1;
@@ -1766,10 +1907,12 @@ nvme_ub_connect_established(struct nvme_ub_qpair *uqpair)
     local_info.msg_type = 1;
     local_info.trans_mode = 2;
 
-    local_info.seg_va = recv_tseg->seg.ubva.va;
-    local_info.seg_len = recv_tseg->seg.len;
-    local_info.seg_flag = recv_tseg->seg.attr.value;
-    local_info.seg_token_id = recv_tseg->seg.token_id;
+    /* The target accesses command payloads, not the response receive ring.
+     * Advertise the command/payload segment so it can import it once. */
+    local_info.seg_va = send_tseg->seg.ubva.va;
+    local_info.seg_len = send_tseg->seg.len;
+    local_info.seg_flag = send_tseg->seg.attr.value;
+    local_info.seg_token_id = send_tseg->seg.token_id;
 
 
 
@@ -2651,6 +2794,15 @@ nvme_ub_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
         spdk_free(uctrlr);
         urma_uninit();
         return NULL;
+    }
+
+    /* Register SPDK-managed application memory once per controller.  If a
+     * provider cannot register the complete memory map, retain the staging
+     * path rather than failing controller construction. */
+    uctrlr->mem_map = spdk_mem_map_alloc(0, &g_nvme_ub_mem_map_ops, uctrlr);
+    if (uctrlr->mem_map == NULL) {
+        NVME_CTRLR_WARNLOG(&uctrlr->ctrlr,
+                           "Unable to create UB application memory map; using staging buffers\n");
     }
 
     NVME_CTRLR_DEBUGLOG(&uctrlr->ctrlr, "successfully initialized the nvmf ctrlr\n");

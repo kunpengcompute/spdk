@@ -217,10 +217,15 @@ struct spdk_nvmf_ub_request {
 
 	/* Async state machine: tracks which URMA completion we are waiting for */
 	enum spdk_nvmf_ub_req_rdma_state	rdma_state;
-	urma_target_seg_t			*remote_tseg;
 	uint32_t				recv_slot;
 	bool					in_use;
 	STAILQ_ENTRY(spdk_nvmf_ub_request)		link;
+};
+
+struct spdk_nvmf_ub_remote_seg {
+	uint32_t				token_id;
+	urma_target_seg_t			*tseg;
+	TAILQ_ENTRY(spdk_nvmf_ub_remote_seg)	link;
 };
 
 struct spdk_nvmf_ub_qpair {
@@ -252,6 +257,8 @@ struct spdk_nvmf_ub_qpair {
 
 	void					*va;
 	urma_target_seg_t			*local_tseg;
+	urma_target_seg_t			*remote_tseg;
+	TAILQ_HEAD(, spdk_nvmf_ub_remote_seg)	remote_segs;
 	size_t				rsp_offset;
 	size_t				data_offset;
 	size_t				seg_len;
@@ -279,9 +286,6 @@ struct spdk_nvmf_ub_resources {
 	/* Queue to track free requests */
 	STAILQ_HEAD(, spdk_nvmf_ub_request)	free_queue;
 
-	/* Remote peer information - used for RDMA operations */
-	uint32_t		remote_uasid;
-	urma_eid_t		remote_eid;
 };
 
 struct spdk_nvmf_ub_port {
@@ -779,6 +783,82 @@ nvmf_ub_resources_create(struct spdk_nvmf_ub_qpair *uqpair, uint32_t max_queue_d
 	return resources;
 }
 
+static urma_target_seg_t *
+nvmf_ub_import_remote_seg(struct spdk_nvmf_ub_qpair *uqpair, uint64_t addr, uint64_t length,
+			  uint32_t attr, uint32_t token_id)
+{
+	urma_seg_t remote_seg = {0};
+	urma_token_t token = { .token = 0xABCD };
+	urma_import_seg_flag_t flag = {0};
+
+	remote_seg.ubva.eid = uqpair->remote_eid;
+	remote_seg.ubva.uasid = uqpair->remote_uasid;
+	remote_seg.ubva.va = addr;
+	remote_seg.len = length;
+	remote_seg.attr.value = attr;
+	remote_seg.token_id = token_id;
+
+	flag.bs.cacheable = URMA_NON_CACHEABLE;
+	flag.bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE | URMA_ACCESS_ATOMIC;
+	flag.bs.mapping = URMA_SEG_NOMAP;
+
+	return urma_import_seg(uqpair->jetty->urma_ctx, &remote_seg, &token, 0, flag);
+}
+
+static urma_target_seg_t *
+nvmf_ub_get_remote_tseg(struct spdk_nvmf_ub_qpair *uqpair, uint64_t addr, uint32_t length,
+			uint32_t token_id)
+{
+	struct spdk_nvmf_ub_remote_seg *entry;
+	urma_target_seg_t *tseg;
+	urma_seg_attr_t attr = {0};
+
+	if (uqpair->remote_tseg != NULL && uqpair->remote_tseg->seg.token_id == token_id) {
+		return uqpair->remote_tseg;
+	}
+
+	TAILQ_FOREACH(entry, &uqpair->remote_segs, link) {
+		if (entry->token_id == token_id) {
+			return entry->tseg;
+		}
+	}
+
+	entry = calloc(1, sizeof(*entry));
+	if (entry == NULL) {
+		return NULL;
+	}
+
+	attr.bs.token_policy = URMA_TOKEN_NONE;
+	attr.bs.cacheable = URMA_NON_CACHEABLE;
+	tseg = nvmf_ub_import_remote_seg(uqpair, addr, length, attr.value, token_id);
+	if (tseg == NULL) {
+		free(entry);
+		return NULL;
+	}
+
+	entry->token_id = token_id;
+	entry->tseg = tseg;
+	TAILQ_INSERT_TAIL(&uqpair->remote_segs, entry, link);
+	return tseg;
+}
+
+static void
+nvmf_ub_unimport_remote_segs(struct spdk_nvmf_ub_qpair *uqpair)
+{
+	struct spdk_nvmf_ub_remote_seg *entry, *tmp;
+
+	if (uqpair->remote_tseg != NULL) {
+		urma_unimport_seg(uqpair->remote_tseg);
+		uqpair->remote_tseg = NULL;
+	}
+
+	TAILQ_FOREACH_SAFE(entry, &uqpair->remote_segs, link, tmp) {
+		TAILQ_REMOVE(&uqpair->remote_segs, entry, link);
+		urma_unimport_seg(entry->tseg);
+		free(entry);
+	}
+}
+
 static int
 nvmf_ub_handle_connect(struct spdk_nvmf_ub_qpair *uqpair, struct ub_connect_req_rsp *req,
 		       struct spdk_sock *sock)
@@ -831,6 +911,15 @@ nvmf_ub_handle_connect(struct spdk_nvmf_ub_qpair *uqpair, struct ub_connect_req_
 	SPDK_NOTICELOG("Imported remote jetty for qid %u, tpn=%u\n",
 		       uqpair->qid, uqpair->target_jetty->tp.tpn);
 
+	/* The initiator advertises its command/payload segment during OOB
+	 * connection setup.  Import it once and reuse it for normal staging I/O. */
+	uqpair->remote_tseg = nvmf_ub_import_remote_seg(uqpair, req->seg_va, req->seg_len,
+						       req->seg_flag, req->seg_token_id);
+	if (uqpair->remote_tseg == NULL) {
+		SPDK_WARNLOG("Unable to pre-import initiator payload segment for qid %u; "
+			     "segments will be imported lazily\n", uqpair->qid);
+	}
+
 	/* Create UB resources (pre-allocated requests) */
 	uqpair->resources = nvmf_ub_resources_create(uqpair, uqpair->depth);
 	if (uqpair->resources == NULL) {
@@ -838,10 +927,6 @@ nvmf_ub_handle_connect(struct spdk_nvmf_ub_qpair *uqpair, struct ub_connect_req_
 		rc = -1;
 		goto error;
 	}
-
-	/* Copy remote peer information to resources for RDMA operations */
-	uqpair->resources->remote_uasid = uqpair->remote_uasid;
-	uqpair->resources->remote_eid = uqpair->remote_eid;
 
 	fprintf(stderr, "start send local info\n");
 	/* Build and send connect response */
@@ -896,13 +981,6 @@ nvmf_ub_resources_destroy(struct spdk_nvmf_ub_resources *resources)
 		return;
 	}
 
-	for (uint32_t i = 0; i < resources->depth; i++) {
-		if (resources->reqs[i].remote_tseg) {
-			urma_unimport_seg(resources->reqs[i].remote_tseg);
-			resources->reqs[i].remote_tseg = NULL;
-		}
-	}
-
 	spdk_free(resources->cpls);
 	spdk_free(resources->reqs);
 	free(resources);
@@ -911,6 +989,8 @@ nvmf_ub_resources_destroy(struct spdk_nvmf_ub_resources *resources)
 static int
 nvmf_ub_qpair_destroy(struct spdk_nvmf_ub_qpair *uqpair)
 {
+	nvmf_ub_unimport_remote_segs(uqpair);
+
 	if (uqpair->target_jetty) {
 		urma_unimport_jetty(uqpair->target_jetty);
 		uqpair->target_jetty = NULL;
@@ -1013,6 +1093,7 @@ nvmf_ub_handle_accept(struct spdk_nvmf_transport *transport, struct spdk_sock *s
 	pending->uqpair->state = UB_QPAIR_STATE_CONNECTING;
 	pending->uqpair->qpair.state = SPDK_NVMF_QPAIR_CONNECTING;
 	pending->uqpair->qpair.transport = transport;
+	TAILQ_INIT(&pending->uqpair->remote_segs);
 	pending->req_offset = 0;
 
 	SPDK_NOTICELOG("New connection accepted, waiting for connect request\n");
@@ -1426,15 +1507,6 @@ nvmf_ub_repost_recv(struct spdk_nvmf_ub_qpair *uqpair, uint32_t recv_slot)
 	return 0;
 }
 
-static void
-nvmf_ub_unimport_remote_seg(struct spdk_nvmf_ub_request *ub_req)
-{
-	if (ub_req->remote_tseg) {
-		urma_unimport_seg(ub_req->remote_tseg);
-		ub_req->remote_tseg = NULL;
-	}
-}
-
 static bool
 nvmf_ub_req_is_valid(struct spdk_nvmf_ub_qpair *uqpair,
 			     struct spdk_nvmf_ub_request *ub_req)
@@ -1470,7 +1542,6 @@ nvmf_ub_req_put(struct spdk_nvmf_ub_request *ub_req)
 	}
 
 	recv_slot = ub_req->recv_slot;
-	nvmf_ub_unimport_remote_seg(ub_req);
 	ub_req->rdma_state = UB_REQ_RDMA_STATE_NONE;
 	ub_req->awaiting_rdma_read_completion = false;
 	ub_req->awaiting_rdma_write_completion = false;
@@ -1545,7 +1616,6 @@ nvmf_ub_handle_cmd(struct spdk_nvmf_ub_qpair *uqpair, uint32_t recv_slot)
 	}
 	STAILQ_REMOVE_HEAD(&resources->free_queue, link);
 	assert(!ub_req->in_use);
-	assert(ub_req->remote_tseg == NULL);
 
 	nvmf_req = &ub_req->req;
 
@@ -1635,26 +1705,12 @@ nvmf_ub_handle_cmd(struct spdk_nvmf_ub_qpair *uqpair, uint32_t recv_slot)
 			/* If this is a Host-to-Controller transfer, we need to RDMA READ the data
 			 * from client's remote memory before executing the command. */
 			if (nvmf_req->xfer == SPDK_NVME_DATA_HOST_TO_CONTROLLER) {
+				urma_target_seg_t *remote_tseg;
+
 				/* Post RDMA READ to fetch data from client */
-
-				urma_seg_t remote_seg = {0};
-				remote_seg.ubva.eid = resources->remote_eid;
-				remote_seg.ubva.uasid = resources->remote_uasid;
-				remote_seg.ubva.va = nvmf_req->cmd->nvme_cmd.dptr.sgl1.address;
-				remote_seg.len = nvmf_req->cmd->nvme_cmd.dptr.sgl1.keyed.length;
-				remote_seg.attr.bs.token_policy = URMA_TOKEN_NONE;
-				remote_seg.attr.bs.cacheable = URMA_NON_CACHEABLE;
-				remote_seg.token_id = nvmf_req->cmd->nvme_cmd.dptr.sgl1.keyed.key;
-
-				urma_token_t token = {0};
-				token.token = 0xABCD;
-
-				urma_import_seg_flag_t flag = {0};
-				flag.bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE | URMA_ACCESS_ATOMIC;
-
-				ub_req->remote_tseg = urma_import_seg(uqpair->jetty->urma_ctx, &remote_seg,
-								      &token, 0, flag);
-				if (ub_req->remote_tseg == NULL) {
+				remote_tseg = nvmf_ub_get_remote_tseg(uqpair, sgl->address,
+								    sgl->keyed.length, sgl->keyed.key);
+				if (remote_tseg == NULL) {
 					SPDK_ERRLOG("Failed to import remote segment for qid %u\n", uqpair->qid);
 					nvmf_req->rsp->nvme_cpl.cid = nvmf_req->cmd->nvme_cmd.cid;
 					nvmf_req->rsp->nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
@@ -1666,7 +1722,7 @@ nvmf_ub_handle_cmd(struct spdk_nvmf_ub_qpair *uqpair, uint32_t recv_slot)
 					.sge = &(urma_sge_t){
 						.addr = sgl->address,
 						.len = sgl->keyed.length,
-						.tseg = ub_req->remote_tseg
+						.tseg = remote_tseg
 					},
 					.num_sge = 1
 				};
@@ -1705,7 +1761,6 @@ nvmf_ub_handle_cmd(struct spdk_nvmf_ub_qpair *uqpair, uint32_t recv_slot)
 					SPDK_ERRLOG("Failed to post RDMA READ WR\n");
 					ub_req->awaiting_rdma_read_completion = false;
 					ub_req->rdma_state = UB_REQ_RDMA_STATE_NONE;
-					nvmf_ub_unimport_remote_seg(ub_req);
 					nvmf_req->rsp->nvme_cpl.cid = nvmf_req->cmd->nvme_cmd.cid;
 					nvmf_req->rsp->nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 					nvmf_ub_post_send_response(ub_req);
@@ -1856,7 +1911,6 @@ nvmf_ub_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 						/* RDMA READ completed - now execute the request */
 						completed_ub_req->awaiting_rdma_read_completion = false;
 						completed_ub_req->rdma_state = UB_REQ_RDMA_STATE_NONE;
-						nvmf_ub_unimport_remote_seg(completed_ub_req);
 						spdk_nvmf_request_exec(&completed_ub_req->req);
 						break;
 
@@ -1864,7 +1918,6 @@ nvmf_ub_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 						/* RDMA WRITE completed - now post SEND response */
 						completed_ub_req->awaiting_rdma_write_completion = false;
 						completed_ub_req->rdma_state = UB_REQ_RDMA_STATE_NONE;
-						nvmf_ub_unimport_remote_seg(completed_ub_req);
 						nvmf_ub_post_send_response(completed_ub_req);
 						break;
 
@@ -1991,24 +2044,11 @@ nvmf_ub_req_complete(struct spdk_nvmf_request *req)
 		/* Post RDMA WRITE to push data to host.  The SEND response
 		 * capsule will be posted after the WRITE completes, which
 		 * is handled in poll_group_poll().  No busy-waiting here. */
-		urma_seg_t remote_seg = {0};
-		remote_seg.ubva.eid = resources->remote_eid;
-		remote_seg.ubva.uasid = resources->remote_uasid;
-		remote_seg.ubva.va = req->cmd->nvme_cmd.dptr.sgl1.address;
-		remote_seg.len = req->cmd->nvme_cmd.dptr.sgl1.keyed.length;
-		remote_seg.attr.bs.token_policy = URMA_TOKEN_NONE;
-		remote_seg.attr.bs.cacheable = URMA_NON_CACHEABLE;
-		remote_seg.token_id = req->cmd->nvme_cmd.dptr.sgl1.keyed.key;
-
-		urma_token_t token = {0};
-		token.token = 0xABCD;
-
-		urma_import_seg_flag_t flag = {0};
-		flag.bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE | URMA_ACCESS_ATOMIC;
-
-		ub_req->remote_tseg = urma_import_seg(uqpair->jetty->urma_ctx, &remote_seg,
-						      &token, 0, flag);
-		if (ub_req->remote_tseg == NULL) {
+		urma_target_seg_t *remote_tseg = nvmf_ub_get_remote_tseg(
+			uqpair, req->cmd->nvme_cmd.dptr.sgl1.address,
+			req->cmd->nvme_cmd.dptr.sgl1.keyed.length,
+			req->cmd->nvme_cmd.dptr.sgl1.keyed.key);
+		if (remote_tseg == NULL) {
 			SPDK_ERRLOG("Failed to import remote segment for qid %u\n", uqpair->qid);
 			req->rsp->nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 			nvmf_ub_post_send_response(ub_req);
@@ -2025,7 +2065,7 @@ nvmf_ub_req_complete(struct spdk_nvmf_request *req)
 			.sge = &(urma_sge_t){
 				.addr = req->cmd->nvme_cmd.dptr.sgl1.address,
 				.len = req->cmd->nvme_cmd.dptr.sgl1.keyed.length,
-				.tseg = ub_req->remote_tseg
+				.tseg = remote_tseg
 			},
 			.num_sge = 1
 		};
@@ -2059,7 +2099,6 @@ nvmf_ub_req_complete(struct spdk_nvmf_request *req)
 			SPDK_ERRLOG("Failed to post UB WRITE for qid %u, req=%p\n", uqpair->qid, req);
 			ub_req->awaiting_rdma_write_completion = false;
 			ub_req->rdma_state = UB_REQ_RDMA_STATE_NONE;
-			nvmf_ub_unimport_remote_seg(ub_req);
 			req->rsp->nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 			nvmf_ub_post_send_response(ub_req);
 		} else {
