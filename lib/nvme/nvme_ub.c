@@ -42,8 +42,9 @@
 #define JFC_DEPTH    1024
 #define SEND_CNT    4
 #define SEND    0
-#define MAX_IO_SIZE  8192
+#define MAX_IO_SIZE  (128 * 1024)
 #define NVME_UB_MAX_COMPLETIONS_PER_POLL 128
+#define NVME_UB_COMPLETION_BATCH_SIZE 32
 
 #define NVME_UQPAIR_ERRLOG(uqpair, format, ...) NVME_QPAIR_ERRLOG((uqpair) ? &(uqpair)->qpair : NULL, format, ##__VA_ARGS__)
 #define NVME_UQPAIR_WARNLOG(uqpair, format, ...) NVME_QPAIR_WARNLOG((uqpair) ? &(uqpair)->qpair : NULL, format, ##__VA_ARGS__)
@@ -338,8 +339,9 @@ nvme_ub_req_get(struct nvme_ub_qpair *uqpair)
 static inline void
 nvme_ub_req_put(struct nvme_ub_qpair *uqpair, struct nvme_ub_request *ub_req)
 {
-    fprintf(stderr, "DEBUG: [ENTER] %s (uqpair=%p, ub_req=%p, qid=%u)\n",
-            __func__, (void*)uqpair, (void*)ub_req, uqpair->qid);
+    /* Hot-path tracing intentionally disabled. */
+    /* fprintf(stderr, "DEBUG: [ENTER] %s (uqpair=%p, ub_req=%p, qid=%u)\n",
+            __func__, (void*)uqpair, (void*)ub_req, uqpair->qid); */
     ub_req->completion_flags = 0;
     ub_req->req = NULL;
     TAILQ_INSERT_HEAD(&uqpair->free_reqs, ub_req, link);
@@ -348,8 +350,8 @@ nvme_ub_req_put(struct nvme_ub_qpair *uqpair, struct nvme_ub_request *ub_req)
 static inline void
 nvme_ub_req_complete(struct nvme_ub_request *ub_req, struct spdk_nvme_cpl *cpl, bool print_on_error)
 {
-    fprintf(stderr, "DEBUG: [ENTER] %s (ub_req=%p, qid=%u)\n",
-            __func__, (void*)ub_req, ub_req->uqpair->qid);
+    /* fprintf(stderr, "DEBUG: [ENTER] %s (ub_req=%p, qid=%u)\n",
+            __func__, (void*)ub_req, ub_req->uqpair->qid); */
     struct nvme_ub_qpair *uqpair = ub_req->uqpair;
     struct spdk_nvme_qpair *qpair = &uqpair->qpair;
     struct nvme_request *req = ub_req->req;
@@ -362,14 +364,14 @@ nvme_ub_req_complete(struct nvme_ub_request *ub_req, struct spdk_nvme_cpl *cpl, 
     nvme_ub_remove_req(uqpair, ub_req);
     nvme_ub_req_put(uqpair, ub_req);
     nvme_complete_request(req->cb_fn, req->cb_arg, qpair, req, cpl);
-    fprintf(stderr, "DEBUG: [EXIT] %s\n", __func__);
+    /* fprintf(stderr, "DEBUG: [EXIT] %s\n", __func__); */
 }
 
 static inline void
 nvme_ub_add_req(struct nvme_ub_qpair *uqpair, struct nvme_ub_request *ub_req)
 {
-    fprintf(stderr, "DEBUG: [ENTER] %s (uqpair=%p, ub_req=%p, qid=%u, outstanding=%u)\n",
-            __func__, (void*)uqpair, (void*)ub_req, uqpair->qid, uqpair->outstanding_requests);
+    /* fprintf(stderr, "DEBUG: [ENTER] %s (uqpair=%p, ub_req=%p, qid=%u, outstanding=%u)\n",
+            __func__, (void*)uqpair, (void*)ub_req, uqpair->qid, uqpair->outstanding_requests); */
     TAILQ_INSERT_TAIL(&uqpair->outstanding_reqs, ub_req, link);
     uqpair->outstanding_requests++;
 }
@@ -377,8 +379,8 @@ nvme_ub_add_req(struct nvme_ub_qpair *uqpair, struct nvme_ub_request *ub_req)
 static inline void
 nvme_ub_remove_req(struct nvme_ub_qpair *uqpair, struct nvme_ub_request *ub_req)
 {
-    fprintf(stderr, "DEBUG: [ENTER] %s (uqpair=%p, ub_req=%p, qid=%u, outstanding=%u)\n",
-            __func__, (void*)uqpair, (void*)ub_req, uqpair->qid, uqpair->outstanding_requests);
+    /* fprintf(stderr, "DEBUG: [ENTER] %s (uqpair=%p, ub_req=%p, qid=%u, outstanding=%u)\n",
+            __func__, (void*)uqpair, (void*)ub_req, uqpair->qid, uqpair->outstanding_requests); */
     TAILQ_REMOVE(&uqpair->outstanding_reqs, ub_req, link);
     assert(uqpair->outstanding_requests > 0);
     uqpair->outstanding_requests--;
@@ -1025,8 +1027,8 @@ nvme_ub_configure_contig_request(struct nvme_ub_qpair *uqpair,
            req->payload_size);
     req->cmd.dptr.sgl1.address = (uint64_t)(uintptr_t)payload_buffer;
 
-    fprintf(stderr, "DEBUG: %s contig: addr=0x%lx, length=%u, key=0x%x\n",
-            __func__, req->cmd.dptr.sgl1.address, req->cmd.dptr.sgl1.keyed.length, rkey);
+    /* fprintf(stderr, "DEBUG: %s contig: addr=0x%lx, length=%u, key=0x%x\n",
+            __func__, req->cmd.dptr.sgl1.address, req->cmd.dptr.sgl1.keyed.length, rkey); */
 
     /* Record num_sge for this request */
     ub_req->num_sge = 1;
@@ -1112,8 +1114,8 @@ nvme_ub_configure_sgl_request(struct nvme_ub_qpair *uqpair,
 
     ub_req->num_sge = num_sge;
 
-    fprintf(stderr, "DEBUG: %s SGL: num_sge=%d, addr=0x%lx, length=%u\n",
-            __func__, num_sge, req->cmd.dptr.sgl1.address, req->cmd.dptr.sgl1.keyed.length);
+    /* fprintf(stderr, "DEBUG: %s SGL: num_sge=%d, addr=0x%lx, length=%u\n",
+            __func__, num_sge, req->cmd.dptr.sgl1.address, req->cmd.dptr.sgl1.keyed.length); */
 
     return 0;
 }
@@ -1320,6 +1322,7 @@ nvme_ub_process_cr(struct nvme_ub_qpair *poll_uqpair, const urma_cr_t *cr)
 static int
 nvme_ub_qpair_submit_request(struct spdk_nvme_qpair *qpair, volatile struct nvme_request *req)
 {
+    /* Hot-path command tracing and command capsule dumps are intentionally disabled.
     fprintf(stderr, "DEBUG: [ENTER] %s (qpair=%p, qid=%u, req=%p, payload_size=%u, opc=0x%02x)\n",
             __func__, (void*)qpair, qpair->id, (void*)req, req->payload_size, req->cmd.opc);
     fprintf(stderr, "------------------------\n");
@@ -1337,7 +1340,7 @@ nvme_ub_qpair_submit_request(struct spdk_nvme_qpair *qpair, volatile struct nvme
     if (req->parent) {
         fprintf(stderr, "DEBUG: [ENTER] %s req->parent=%llx\n",
             __func__, req->parent);
-    }
+    } */
     struct nvme_ub_qpair *uqpair = nvme_ub_qpair(qpair);
     struct nvme_ub_ctrlr *uctrlr = uqpair->uctrlr;
     struct nvme_ub_request *ub_req;
@@ -1348,7 +1351,7 @@ nvme_ub_qpair_submit_request(struct spdk_nvme_qpair *qpair, volatile struct nvme
     assert(req != NULL);
 
     if (uqpair->state != NVME_UB_JETTY_STATE_READY) {
-        fprintf(stderr, "DEBUG: %s qpair not ready, state=%d\n", __func__, uqpair->state);
+        /* fprintf(stderr, "DEBUG: %s qpair not ready, state=%d\n", __func__, uqpair->state); */
         return -EAGAIN;
     }
 
@@ -1360,7 +1363,7 @@ nvme_ub_qpair_submit_request(struct spdk_nvme_qpair *qpair, volatile struct nvme
     /* Get a free request structure - 参考 nvme_rdma_qpair_submit_request */
     ub_req = nvme_ub_req_get(uqpair);
     if (spdk_unlikely(!ub_req)) {
-        fprintf(stderr, "DEBUG: %s no free requests\n", __func__);
+        /* fprintf(stderr, "DEBUG: %s no free requests\n", __func__); */
         return -EAGAIN;
     }
 
@@ -1368,7 +1371,7 @@ nvme_ub_qpair_submit_request(struct spdk_nvme_qpair *qpair, volatile struct nvme
     ub_req->uqpair = uqpair;
     ub_req->req = (struct nvme_request *)req;
     req->cmd.cid = ub_req->id;
-    fprintf(stderr, "***********DEBUG: %s CID=%d*****************\n", __func__, req->cmd.cid);
+    /* fprintf(stderr, "***********DEBUG: %s CID=%d*****************\n", __func__, req->cmd.cid); */
 
     /* Initialize the request - 配置 dptr 和 SGE，参考 nvme_rdma_req_init */
     rc = nvme_ub_req_init(uqpair, ub_req);
@@ -1388,10 +1391,10 @@ nvme_ub_qpair_submit_request(struct spdk_nvme_qpair *qpair, volatile struct nvme
     }
 
     /* Determine the URMA opcode based on NVMe command opcode - 参考 urma_sample.c */
-    uint8_t nvme_opc = req->cmd.opc;
+    /* uint8_t nvme_opc = req->cmd.opc; */
     urma_opcode_t urma_opc = URMA_OPC_SEND;
 
-    fprintf(stderr, "DEBUG: %s nvme_opc=0x%02x -> urma_opc=%d\n", __func__, nvme_opc, urma_opc);
+    /* fprintf(stderr, "DEBUG: %s nvme_opc=0x%02x -> urma_opc=%d\n", __func__, nvme_opc, urma_opc); */
 
     /* Build the URMA work request based on opcode - 参考 urma_sample.c */
     ub_req->send_wr.opcode = urma_opc;
@@ -1433,8 +1436,8 @@ nvme_ub_qpair_submit_request(struct spdk_nvme_qpair *qpair, volatile struct nvme
     };
     ub_req->send_wr.send = send_wr;
 
-    fprintf(stderr, "DEBUG: %s SEND op: addr=0x%lx len=%u, userctx=%d\n", __func__, 
-            ub_req->sge[0].addr, ub_req->sge[0].len, ub_req->send_wr.user_ctx);
+    /* fprintf(stderr, "DEBUG: %s SEND op: addr=0x%lx len=%u, userctx=%d\n", __func__,
+            ub_req->sge[0].addr, ub_req->sge[0].len, ub_req->send_wr.user_ctx); */
 
     /* Post the work request - 参考 _nvme_rdma_qpair_submit_request */
     rc = urma_post_jetty_send_wr(uqpair->jetty, &ub_req->send_wr, &bad_wr);
@@ -1446,8 +1449,8 @@ nvme_ub_qpair_submit_request(struct spdk_nvme_qpair *qpair, volatile struct nvme
     }
 
     uqpair->current_num_sends++;
-    fprintf(stderr, "DEBUG: %s posted successfully, urma_opc=%d, current_num_sends=%u\n",
-            __func__, urma_opc, uqpair->current_num_sends);
+    /* fprintf(stderr, "DEBUG: %s posted successfully, urma_opc=%d, current_num_sends=%u\n",
+            __func__, urma_opc, uqpair->current_num_sends); */
     uctrlr->requests_sent++;
 
     return 0;
@@ -1668,9 +1671,10 @@ nvme_ub_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_co
 {
     struct nvme_ub_qpair *uqpair = nvme_ub_qpair(qpair);
     struct spdk_nvme_transport_poll_group *tgroup = qpair->poll_group;
+    urma_cr_t crs[NVME_UB_COMPLETION_BATCH_SIZE];
     int32_t total_completions = 0;
+    uint32_t num_polled = 0;
     int rc = 0;
-    uint32_t i;
 
     /* If poll_group is set, delegate to poll_group_process_completions.
      * This is the normal path when using poll groups. */
@@ -1706,21 +1710,26 @@ nvme_ub_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_co
         break;
     }
 
-    /* Poll JFC for completions */
-    for (i = 0; i < max_completions; i++) {
-        urma_cr_t cr = {0};
+    /* Poll the JFC in batches to amortize the SDK call overhead. */
+    while (num_polled < max_completions) {
+        uint32_t batch_size = spdk_min(max_completions - num_polled,
+                                       (uint32_t)NVME_UB_COMPLETION_BATCH_SIZE);
+        uint32_t i;
         int cnt;
 
-        cnt = urma_poll_jfc(uqpair->jfc, 1, &cr);
+        cnt = urma_poll_jfc(uqpair->jfc, batch_size, crs);
         if (cnt <= 0) {
             break;
         }
 
-        rc = nvme_ub_process_cr(uqpair, &cr);
-        if (spdk_unlikely(rc < 0)) {
-            goto failed;
+        num_polled += cnt;
+        for (i = 0; i < (uint32_t)cnt; i++) {
+            rc = nvme_ub_process_cr(uqpair, &crs[i]);
+            if (spdk_unlikely(rc < 0)) {
+                goto failed;
+            }
+            total_completions += rc;
         }
-        total_completions += rc;
     }
 
     return total_completions;
@@ -2174,26 +2183,38 @@ nvme_ub_poll_group_process_completions(struct spdk_nvme_transport_poll_group *tg
     }
 
     TAILQ_FOREACH_SAFE(uqpair, &group->active_qpairs, link_active, tmp_uqpair) {
+        urma_cr_t crs[NVME_UB_COMPLETION_BATCH_SIZE];
         uint32_t qpair_completions = 0;
-        uint32_t i;
+        uint32_t num_polled = 0;
+        bool qpair_failed = false;
 
-        for (i = 0; i < completions_per_qpair; i++) {
-            urma_cr_t cr = {0};
+        while (num_polled < completions_per_qpair) {
+            uint32_t batch_size = spdk_min(completions_per_qpair - num_polled,
+                                           (uint32_t)NVME_UB_COMPLETION_BATCH_SIZE);
+            uint32_t i;
             int cnt;
 
-            cnt = urma_poll_jfc(uqpair->jfc, 1, &cr);
+            cnt = urma_poll_jfc(uqpair->jfc, batch_size, crs);
             if (cnt <= 0) {
                 break;
             }
 
-            rc = nvme_ub_process_cr(uqpair, &cr);
-            if (spdk_unlikely(rc < 0)) {
-                NVME_UQPAIR_ERRLOG(uqpair, "Failed to process completion, rc=%d\n", rc);
-                nvme_ub_fail_qpair(&uqpair->qpair, 0);
+            num_polled += cnt;
+            for (i = 0; i < (uint32_t)cnt; i++) {
+                rc = nvme_ub_process_cr(uqpair, &crs[i]);
+                if (spdk_unlikely(rc < 0)) {
+                    NVME_UQPAIR_ERRLOG(uqpair, "Failed to process completion, rc=%d\n", rc);
+                    nvme_ub_fail_qpair(&uqpair->qpair, 0);
+                    qpair_failed = true;
+                    break;
+                }
+                qpair_completions += rc;
+                total_completions += rc;
+            }
+
+            if (qpair_failed) {
                 break;
             }
-            qpair_completions += rc;
-            total_completions += rc;
         }
 
         /* Unlike the single-qpair completion path, the generic poll-group
