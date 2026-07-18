@@ -43,7 +43,6 @@
 #define SEND_CNT    4
 #define SEND    0
 #define MAX_IO_SIZE  8192
-#define NVME_UB_RECV_DEPTH 32
 #define NVME_UB_MAX_COMPLETIONS_PER_POLL 128
 
 #define NVME_UQPAIR_ERRLOG(uqpair, format, ...) NVME_QPAIR_ERRLOG((uqpair) ? &(uqpair)->qpair : NULL, format, ##__VA_ARGS__)
@@ -688,7 +687,10 @@ nvme_ub_ctrlr_create_io_qpair(struct spdk_nvme_ctrlr *ctrlr, uint16_t qid,
     uqpair->qid = qid;
     uqpair->sq_depth = opts->io_queue_size;
     uqpair->cq_depth = opts->io_queue_size;
-    uqpair->recv_depth = spdk_min((uint32_t)NVME_UB_RECV_DEPTH, opts->io_queue_size);
+    /* A large application I/O can be split into multiple NVMe commands.  Size
+     * the response receive queue for the full SQ, not the application's queue
+     * depth, so every command that can be outstanding has a response credit. */
+    uqpair->recv_depth = uqpair->num_entries;
     uqpair->state = NVME_UB_JETTY_STATE_RESET;
     uqpair->qpair_state = NVME_UB_QPAIR_STATE_INVALID;
 
@@ -2537,7 +2539,7 @@ nvme_ub_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
     admin_uqpair->qid = 0;
     admin_uqpair->sq_depth = admin_queue_size;
     admin_uqpair->cq_depth = admin_queue_size;
-    admin_uqpair->recv_depth = spdk_min((uint32_t)NVME_UB_RECV_DEPTH, admin_queue_size);
+    admin_uqpair->recv_depth = admin_uqpair->num_entries;
     admin_uqpair->payload_buffer_offset = 256 * PAGE_SIZE;
     admin_uqpair->state = NVME_UB_JETTY_STATE_RESET;
     admin_uqpair->qpair_state = NVME_UB_QPAIR_STATE_INVALID;
