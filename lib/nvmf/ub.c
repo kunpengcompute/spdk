@@ -1791,7 +1791,11 @@ nvmf_ub_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 
 	/* Poll each per-connection qpair's JFC until it is empty. */
 	TAILQ_FOREACH_SAFE(uqpair, &ugroup->qpairs, link, tmp) {
-		while ((npolled = urma_poll_jfc(uqpair->send_jfc,
+		bool qpair_failed = false;
+
+		npolled = 0;
+		while (!qpair_failed &&
+		       (npolled = urma_poll_jfc(uqpair->send_jfc,
 						(int)ugroup->max_crs,
 						ugroup->crs)) > 0) {
 			total_completions += npolled;
@@ -1812,7 +1816,8 @@ nvmf_ub_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 						}
 					}
 					spdk_nvmf_qpair_disconnect(&uqpair->qpair);
-					continue;
+					qpair_failed = true;
+					break;
 				}
 
 				/*
@@ -1825,7 +1830,8 @@ nvmf_ub_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 						SPDK_ERRLOG("Invalid UB recv slot 0x%" PRIx64 " on qid %u\n",
 							    cr->user_ctx, uqpair->qid);
 						spdk_nvmf_qpair_disconnect(&uqpair->qpair);
-						continue;
+						qpair_failed = true;
+						break;
 					}
 					SPDK_DEBUGLOG(ub, "Received command: qid=%u slot=%" PRIu64 " len=%u\n",
 						      uqpair->qid, cr->user_ctx, cr->completion_len);
@@ -1838,7 +1844,8 @@ nvmf_ub_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 						SPDK_ERRLOG("Invalid UB request completion: qid=%u req=%p opcode=%d\n",
 							    uqpair->qid, completed_ub_req, cr->opcode);
 						spdk_nvmf_qpair_disconnect(&uqpair->qpair);
-						continue;
+						qpair_failed = true;
+						break;
 					}
 					SPDK_DEBUGLOG(ub, "UB completion: qid=%u req=%p opcode=%d state=%d\n",
 						      uqpair->qid, completed_ub_req, cr->opcode,
@@ -1871,12 +1878,20 @@ nvmf_ub_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 							    completed_ub_req, completed_ub_req->rdma_state);
 						nvmf_ub_req_abort(completed_ub_req);
 						spdk_nvmf_qpair_disconnect(&uqpair->qpair);
+						qpair_failed = true;
 						break;
 					}
 				}
+
+				/* A nested request handler can also initiate disconnect.  Do not
+				 * consume any more CRs after the qpair leaves its poll group. */
+				if (__atomic_load_n(&uqpair->qpair.disconnect_started, __ATOMIC_RELAXED)) {
+					qpair_failed = true;
+					break;
+				}
 			}
 		}
-		if (npolled < 0) {
+		if (!qpair_failed && npolled < 0) {
 			SPDK_ERRLOG("UB poll: urma_poll_jfc failed for qid %u: %d\n",
 				    uqpair->qid, npolled);
 			spdk_nvmf_qpair_disconnect(&uqpair->qpair);
