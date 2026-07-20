@@ -188,7 +188,7 @@ enum spdk_nvmf_ub_req_rdma_state {
 	UB_REQ_RDMA_STATE_NONE = 0,
 	UB_REQ_RDMA_STATE_WAIT_READ,	/* Waiting for RDMA READ completion */
 	UB_REQ_RDMA_STATE_WAIT_WRITE,	/* Waiting for RDMA WRITE completion */
-	UB_REQ_RDMA_STATE_WAIT_SEND,	/* Waiting for SEND completion */
+	UB_REQ_RDMA_STATE_WAIT_RESPONSE,	/* Waiting for a response SEND context */
 };
 
 struct spdk_nvmf_ub_request {
@@ -215,6 +215,13 @@ struct spdk_nvmf_ub_request {
 	uint32_t				recv_slot;
 	bool					in_use;
 	STAILQ_ENTRY(spdk_nvmf_ub_request)		link;
+};
+
+struct spdk_nvmf_ub_response {
+	/* SEND-owned completion storage remains stable after its request is free. */
+	uint32_t				buf_idx;
+	bool					in_use;
+	STAILQ_ENTRY(spdk_nvmf_ub_response)	link;
 };
 
 struct spdk_nvmf_ub_remote_seg {
@@ -274,6 +281,7 @@ struct spdk_nvmf_ub_qpair {
 struct spdk_nvmf_ub_resources {
 	/* Array of size "max_queue_depth" containing UB requests. */
 	struct spdk_nvmf_ub_request		*reqs;
+	struct spdk_nvmf_ub_response		*responses;
 
 	/* Array of size "max_queue_depth" containing 16 byte completions
 	 * to be sent back to the user.
@@ -283,6 +291,12 @@ struct spdk_nvmf_ub_resources {
 
 	/* Queue to track free requests */
 	STAILQ_HEAD(, spdk_nvmf_ub_request)	free_queue;
+	/* Response SEND contexts are independent from request/receive credits. */
+	STAILQ_HEAD(, spdk_nvmf_ub_response)	free_response_queue;
+	/* Completed requests wait here only while every SEND context is busy. */
+	STAILQ_HEAD(, spdk_nvmf_ub_request)	pending_response_queue;
+	uint32_t				pending_response_count;
+	uint32_t				pending_response_high_watermark;
 
 };
 
@@ -553,8 +567,9 @@ nvmf_ub_create_jetty(struct spdk_nvmf_ub_qpair *uqpair, bool is_admin_qpair)
 
 	/* Create a single shared JFC using transport's JFCE - 参考 urma_server/client */
 	urma_jfc_cfg_t jfc_cfg = {
-		/* Receive and send/RDMA completions share this JFC. */
-		.depth = uqpair->depth * 2,
+		/* Up to depth receive completions and 2 * depth JFS completions
+		 * (response SENDs plus data READ/WRITEs) share this JFC. */
+		.depth = uqpair->depth * 3,
 		.jfce  = utransport->jfce,
 	};
 
@@ -586,7 +601,9 @@ nvmf_ub_create_jetty(struct spdk_nvmf_ub_qpair *uqpair, bool is_admin_qpair)
 
 	/* JFS configuration - 使用 URMA_TM_RM 模式 */
 	urma_jfs_cfg_t jfs_cfg = {
-		.depth           = uqpair->depth,
+		/* A response SEND may still await its local completion after the host
+		 * submits a replacement command that needs a data READ or WRITE. */
+		.depth           = uqpair->depth * 2,
 		.trans_mode      = URMA_TM_RM,
 		.priority        = URMA_MAX_PRIORITY,
 		.max_sge         = 1,
@@ -735,6 +752,7 @@ nvmf_ub_resources_create(struct spdk_nvmf_ub_qpair *uqpair, uint32_t max_queue_d
 {
 	struct spdk_nvmf_ub_resources *resources;
 	struct spdk_nvmf_ub_request *ub_req;
+	struct spdk_nvmf_ub_response *ub_rsp;
 	uint32_t i;
 
 	resources = calloc(1, sizeof(*resources));
@@ -745,18 +763,22 @@ nvmf_ub_resources_create(struct spdk_nvmf_ub_qpair *uqpair, uint32_t max_queue_d
 
 	resources->reqs = spdk_zmalloc(max_queue_depth * sizeof(*resources->reqs),
 				       0x1000, NULL, SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
+	resources->responses = calloc(max_queue_depth, sizeof(*resources->responses));
 	resources->cpls = spdk_zmalloc(max_queue_depth * sizeof(*resources->cpls),
 				       0x1000, NULL, SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
 
-	if (!resources->reqs || !resources->cpls) {
+	if (!resources->reqs || !resources->responses || !resources->cpls) {
 		SPDK_ERRLOG("Unable to allocate sufficient memory for UB qpair %u\n", uqpair->qid);
 		spdk_free(resources->reqs);
+		free(resources->responses);
 		spdk_free(resources->cpls);
 		free(resources);
 		return NULL;
 	}
 
 	STAILQ_INIT(&resources->free_queue);
+	STAILQ_INIT(&resources->free_response_queue);
+	STAILQ_INIT(&resources->pending_response_queue);
 	resources->depth = max_queue_depth;
 
 	for (i = 0; i < max_queue_depth; i++) {
@@ -774,6 +796,10 @@ nvmf_ub_resources_create(struct spdk_nvmf_ub_qpair *uqpair, uint32_t max_queue_d
 		ub_req->recv_slot = NVMF_UB_INVALID_RECV_SLOT;
 
 		STAILQ_INSERT_TAIL(&resources->free_queue, ub_req, link);
+
+		ub_rsp = &resources->responses[i];
+		ub_rsp->buf_idx = i;
+		STAILQ_INSERT_TAIL(&resources->free_response_queue, ub_rsp, link);
 	}
 
 	SPDK_DEBUGLOG(ub, "Created UB resources for qpair %u with %u requests\n",
@@ -980,7 +1006,12 @@ nvmf_ub_resources_destroy(struct spdk_nvmf_ub_resources *resources)
 		return;
 	}
 
+	SPDK_DEBUGLOG(ub, "Destroying UB resources: pending responses=%u, high watermark=%u\n",
+		      resources->pending_response_count,
+		      resources->pending_response_high_watermark);
+
 	spdk_free(resources->cpls);
+	free(resources->responses);
 	spdk_free(resources->reqs);
 	free(resources);
 }
@@ -1542,6 +1573,8 @@ nvmf_ub_poll_group_remove(struct spdk_nvmf_transport_poll_group *group,
 }
 
 static void nvmf_ub_post_send_response(struct spdk_nvmf_ub_request *ub_req);
+static int nvmf_ub_post_send_response_ctx(struct spdk_nvmf_ub_request *ub_req,
+		struct spdk_nvmf_ub_response *ub_rsp);
 
 static int
 nvmf_ub_repost_recv(struct spdk_nvmf_ub_qpair *uqpair, uint32_t recv_slot)
@@ -1590,6 +1623,108 @@ nvmf_ub_req_is_valid(struct spdk_nvmf_ub_qpair *uqpair,
 	       (req_addr - reqs_begin) % sizeof(*resources->reqs) == 0;
 }
 
+static bool
+nvmf_ub_response_is_valid(struct spdk_nvmf_ub_qpair *uqpair,
+			  struct spdk_nvmf_ub_response *ub_rsp)
+{
+	struct spdk_nvmf_ub_resources *resources = uqpair->resources;
+	uintptr_t rsp_addr = (uintptr_t)ub_rsp;
+	uintptr_t responses_begin;
+	uintptr_t responses_end;
+
+	if (resources == NULL) {
+		return false;
+	}
+
+	responses_begin = (uintptr_t)resources->responses;
+	responses_end = (uintptr_t)(resources->responses + resources->depth);
+	return rsp_addr >= responses_begin && rsp_addr < responses_end &&
+	       (rsp_addr - responses_begin) % sizeof(*resources->responses) == 0;
+}
+
+static void
+nvmf_ub_response_put(struct spdk_nvmf_ub_qpair *uqpair,
+		     struct spdk_nvmf_ub_response *ub_rsp)
+{
+	if (!ub_rsp->in_use) {
+		SPDK_ERRLOG("Attempted to release free UB response %p on qid %u\n",
+			    ub_rsp, uqpair->qid);
+		return;
+	}
+
+	ub_rsp->in_use = false;
+	STAILQ_INSERT_TAIL(&uqpair->resources->free_response_queue, ub_rsp, link);
+}
+
+static struct spdk_nvmf_ub_response *
+nvmf_ub_response_get(struct spdk_nvmf_ub_qpair *uqpair)
+{
+	struct spdk_nvmf_ub_resources *resources = uqpair->resources;
+	struct spdk_nvmf_ub_response *ub_rsp;
+
+	ub_rsp = STAILQ_FIRST(&resources->free_response_queue);
+	if (ub_rsp == NULL) {
+		return NULL;
+	}
+
+	STAILQ_REMOVE_HEAD(&resources->free_response_queue, link);
+	assert(!ub_rsp->in_use);
+	ub_rsp->in_use = true;
+	return ub_rsp;
+}
+
+static void
+nvmf_ub_queue_pending_response(struct spdk_nvmf_ub_request *ub_req)
+{
+	struct spdk_nvmf_ub_qpair *uqpair = SPDK_CONTAINEROF(ub_req->req.qpair,
+		struct spdk_nvmf_ub_qpair, qpair);
+	struct spdk_nvmf_ub_resources *resources = uqpair->resources;
+
+	assert(ub_req->in_use);
+	assert(ub_req->rdma_state == UB_REQ_RDMA_STATE_NONE);
+	assert(resources->pending_response_count < resources->depth);
+	ub_req->rdma_state = UB_REQ_RDMA_STATE_WAIT_RESPONSE;
+	STAILQ_INSERT_TAIL(&resources->pending_response_queue, ub_req, link);
+	resources->pending_response_count++;
+	resources->pending_response_high_watermark = spdk_max(
+			resources->pending_response_high_watermark,
+			resources->pending_response_count);
+}
+
+static struct spdk_nvmf_ub_request *
+nvmf_ub_pending_response_get(struct spdk_nvmf_ub_qpair *uqpair)
+{
+	struct spdk_nvmf_ub_resources *resources = uqpair->resources;
+	struct spdk_nvmf_ub_request *ub_req;
+
+	ub_req = STAILQ_FIRST(&resources->pending_response_queue);
+	if (ub_req == NULL) {
+		return NULL;
+	}
+
+	STAILQ_REMOVE_HEAD(&resources->pending_response_queue, link);
+	assert(resources->pending_response_count > 0);
+	resources->pending_response_count--;
+	assert(ub_req->rdma_state == UB_REQ_RDMA_STATE_WAIT_RESPONSE);
+	ub_req->rdma_state = UB_REQ_RDMA_STATE_NONE;
+	return ub_req;
+}
+
+static void
+nvmf_ub_pending_response_remove(struct spdk_nvmf_ub_request *ub_req)
+{
+	struct spdk_nvmf_ub_qpair *uqpair = SPDK_CONTAINEROF(ub_req->req.qpair,
+		struct spdk_nvmf_ub_qpair, qpair);
+	struct spdk_nvmf_ub_resources *resources = uqpair->resources;
+
+	assert(ub_req->rdma_state == UB_REQ_RDMA_STATE_WAIT_RESPONSE);
+	STAILQ_REMOVE(&resources->pending_response_queue, ub_req,
+			spdk_nvmf_ub_request, link);
+	assert(resources->pending_response_count > 0);
+	resources->pending_response_count--;
+	ub_req->rdma_state = UB_REQ_RDMA_STATE_NONE;
+}
+
 static void
 nvmf_ub_req_put(struct spdk_nvmf_ub_request *ub_req)
 {
@@ -1604,6 +1739,9 @@ nvmf_ub_req_put(struct spdk_nvmf_ub_request *ub_req)
 			    ub_req, uqpair->qid);
 		return;
 	}
+	if (ub_req->rdma_state == UB_REQ_RDMA_STATE_WAIT_RESPONSE) {
+		nvmf_ub_pending_response_remove(ub_req);
+	}
 
 	recv_slot = ub_req->recv_slot;
 	ub_req->rdma_state = UB_REQ_RDMA_STATE_NONE;
@@ -1617,8 +1755,7 @@ nvmf_ub_req_put(struct spdk_nvmf_ub_request *ub_req)
 
 	STAILQ_INSERT_TAIL(&resources->free_queue, ub_req, link);
 
-	/* A receive slot and a request are one credit.  Do not repost the
-	 * receive until the response SEND has completed and the request is free. */
+	/* Return the request and its receive credit together. */
 	if (recv_slot != NVMF_UB_INVALID_RECV_SLOT &&
 	    nvmf_ub_repost_recv(uqpair, recv_slot) != 0) {
 		spdk_nvmf_qpair_disconnect(&uqpair->qpair);
@@ -1922,14 +2059,19 @@ nvmf_ub_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 			for (i = 0; i < (uint32_t)npolled; i++) {
 				urma_cr_t *cr = &ugroup->crs[i];
 				struct spdk_nvmf_ub_request *completed_ub_req;
+				struct spdk_nvmf_ub_response *completed_ub_rsp;
 
 				if (cr->status != URMA_CR_SUCCESS) {
 					SPDK_ERRLOG("UB completion failed: qid=%u status=%d opcode=%d s_r=%d "
 						    "user_ctx=0x%" PRIx64 "\n", uqpair->qid, cr->status,
 						    cr->opcode, cr->flag.bs.s_r, cr->user_ctx);
 					if (cr->flag.bs.s_r == 0) {
+						completed_ub_rsp = (struct spdk_nvmf_ub_response *)(uintptr_t)cr->user_ctx;
 						completed_ub_req = (struct spdk_nvmf_ub_request *)(uintptr_t)cr->user_ctx;
-						if (nvmf_ub_req_is_valid(uqpair, completed_ub_req) &&
+						if (nvmf_ub_response_is_valid(uqpair, completed_ub_rsp) &&
+						    completed_ub_rsp->in_use) {
+							nvmf_ub_response_put(uqpair, completed_ub_rsp);
+						} else if (nvmf_ub_req_is_valid(uqpair, completed_ub_req) &&
 						    completed_ub_req->in_use) {
 							nvmf_ub_req_abort(completed_ub_req);
 						}
@@ -1957,46 +2099,60 @@ nvmf_ub_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 					nvmf_ub_handle_cmd(uqpair, (uint32_t)cr->user_ctx);
 
 				} else {
-					completed_ub_req = (struct spdk_nvmf_ub_request *)(uintptr_t)cr->user_ctx;
-					if (!nvmf_ub_req_is_valid(uqpair, completed_ub_req) ||
-					    !completed_ub_req->in_use) {
-						SPDK_ERRLOG("Invalid UB request completion: qid=%u req=%p opcode=%d\n",
-							    uqpair->qid, completed_ub_req, cr->opcode);
-						spdk_nvmf_qpair_disconnect(&uqpair->qpair);
-						qpair_failed = true;
-						break;
-					}
-					SPDK_DEBUGLOG(ub, "UB completion: qid=%u req=%p opcode=%d state=%d\n",
-						      uqpair->qid, completed_ub_req, cr->opcode,
-						      completed_ub_req->rdma_state);
+					completed_ub_rsp = (struct spdk_nvmf_ub_response *)(uintptr_t)cr->user_ctx;
+					if (nvmf_ub_response_is_valid(uqpair, completed_ub_rsp)) {
+						if (!completed_ub_rsp->in_use) {
+							SPDK_ERRLOG("Invalid UB response completion: qid=%u rsp=%p opcode=%d\n",
+								    uqpair->qid, completed_ub_rsp, cr->opcode);
+							spdk_nvmf_qpair_disconnect(&uqpair->qpair);
+							qpair_failed = true;
+							break;
+						}
+						completed_ub_req = nvmf_ub_pending_response_get(uqpair);
+						if (completed_ub_req == NULL) {
+							nvmf_ub_response_put(uqpair, completed_ub_rsp);
+						} else if (nvmf_ub_post_send_response_ctx(completed_ub_req,
+								   completed_ub_rsp) != 0) {
+							qpair_failed = true;
+							break;
+						}
+					} else {
+						completed_ub_req = (struct spdk_nvmf_ub_request *)(uintptr_t)cr->user_ctx;
+						if (!nvmf_ub_req_is_valid(uqpair, completed_ub_req) ||
+						    !completed_ub_req->in_use) {
+							SPDK_ERRLOG("Invalid UB request completion: qid=%u req=%p opcode=%d\n",
+								    uqpair->qid, completed_ub_req, cr->opcode);
+							spdk_nvmf_qpair_disconnect(&uqpair->qpair);
+							qpair_failed = true;
+							break;
+						}
+						SPDK_DEBUGLOG(ub, "UB completion: qid=%u req=%p opcode=%d state=%d\n",
+							      uqpair->qid, completed_ub_req, cr->opcode,
+							      completed_ub_req->rdma_state);
 
-					switch (completed_ub_req->rdma_state) {
-					case UB_REQ_RDMA_STATE_WAIT_READ:
-						/* RDMA READ completed - now execute the request */
-						completed_ub_req->awaiting_rdma_read_completion = false;
-						completed_ub_req->rdma_state = UB_REQ_RDMA_STATE_NONE;
-						spdk_nvmf_request_exec(&completed_ub_req->req);
-						break;
+						switch (completed_ub_req->rdma_state) {
+						case UB_REQ_RDMA_STATE_WAIT_READ:
+							/* RDMA READ completed - now execute the request */
+							completed_ub_req->awaiting_rdma_read_completion = false;
+							completed_ub_req->rdma_state = UB_REQ_RDMA_STATE_NONE;
+							spdk_nvmf_request_exec(&completed_ub_req->req);
+							break;
 
-					case UB_REQ_RDMA_STATE_WAIT_WRITE:
-						/* RDMA WRITE completed - now post SEND response */
-						completed_ub_req->awaiting_rdma_write_completion = false;
-						completed_ub_req->rdma_state = UB_REQ_RDMA_STATE_NONE;
-						nvmf_ub_post_send_response(completed_ub_req);
-						break;
+						case UB_REQ_RDMA_STATE_WAIT_WRITE:
+							/* RDMA WRITE completed - now post SEND response */
+							completed_ub_req->awaiting_rdma_write_completion = false;
+							completed_ub_req->rdma_state = UB_REQ_RDMA_STATE_NONE;
+							nvmf_ub_post_send_response(completed_ub_req);
+							break;
 
-					case UB_REQ_RDMA_STATE_WAIT_SEND:
-						/* Release both the request and its receive credit. */
-						nvmf_ub_req_put(completed_ub_req);
-						break;
-
-					default:
-						SPDK_ERRLOG("Unexpected completion for req %p in state %d\n",
-							    completed_ub_req, completed_ub_req->rdma_state);
-						nvmf_ub_req_abort(completed_ub_req);
-						spdk_nvmf_qpair_disconnect(&uqpair->qpair);
-						qpair_failed = true;
-						break;
+						default:
+							SPDK_ERRLOG("Unexpected completion for req %p in state %d\n",
+								    completed_ub_req, completed_ub_req->rdma_state);
+							nvmf_ub_req_abort(completed_ub_req);
+							spdk_nvmf_qpair_disconnect(&uqpair->qpair);
+							qpair_failed = true;
+							break;
+						}
 					}
 				}
 
@@ -2018,20 +2174,21 @@ nvmf_ub_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 	return total_completions;
 }
 
-/*
- * Post the SEND response capsule to the host.
- * Sets rdma_state to WAIT_SEND; the request is returned to the free
- * queue only after the SEND completion arrives in poll_group_poll().
- */
-static void
-nvmf_ub_post_send_response(struct spdk_nvmf_ub_request *ub_req)
+static int
+nvmf_ub_post_send_response_ctx(struct spdk_nvmf_ub_request *ub_req,
+			       struct spdk_nvmf_ub_response *ub_rsp)
 {
 	struct spdk_nvmf_request *req = &ub_req->req;
 	struct spdk_nvmf_ub_qpair *uqpair = SPDK_CONTAINEROF(req->qpair,
 		struct spdk_nvmf_ub_qpair, qpair);
+	void *resp;
 
-	void *resp = (uint8_t *)uqpair->va + uqpair->rsp_offset +
-		    (size_t)ub_req->buf_idx * sizeof(union nvmf_c2h_msg);
+	assert(ub_req->in_use);
+	assert(ub_req->rdma_state == UB_REQ_RDMA_STATE_NONE);
+	assert(ub_rsp->in_use);
+
+	resp = (uint8_t *)uqpair->va + uqpair->rsp_offset +
+	       (size_t)ub_rsp->buf_idx * sizeof(union nvmf_c2h_msg);
 	memcpy(resp, req->rsp, sizeof(union nvmf_c2h_msg));
 
 	urma_sge_t src_sge = {
@@ -2053,25 +2210,54 @@ nvmf_ub_post_send_response(struct spdk_nvmf_ub_request *ub_req)
 		.opcode = URMA_OPC_SEND,
 		.flag.bs.complete_enable = 1,
 		.tjetty = uqpair->target_jetty,
-		.user_ctx = (uint64_t)(uintptr_t)ub_req,
+		.user_ctx = (uint64_t)(uintptr_t)ub_rsp,
 		.send = send_wr,
 		.next = NULL
 	};
 	urma_jfs_wr_t *bad_wr = NULL;
 
-	/* Set the state before posting so even an immediately visible
-	 * completion observes the correct request state. */
-	ub_req->rdma_state = UB_REQ_RDMA_STATE_WAIT_SEND;
+	/* The completion has been copied to storage owned by ub_rsp.  Return the
+	 * request and receive credit before making the response visible. */
+	nvmf_ub_req_put(ub_req);
+	if (__atomic_load_n(&uqpair->qpair.disconnect_started, __ATOMIC_RELAXED)) {
+		nvmf_ub_response_put(uqpair, ub_rsp);
+		return -ENOTCONN;
+	}
+
 	if (urma_post_jetty_send_wr(uqpair->jetty, &jfs_wr, &bad_wr) != URMA_SUCCESS) {
 		SPDK_ERRLOG("Failed to post UB response SEND for qid %u, req=%p\n",
 			    uqpair->qid, req);
-		ub_req->rdma_state = UB_REQ_RDMA_STATE_NONE;
-		nvmf_ub_req_abort(ub_req);
+		nvmf_ub_response_put(uqpair, ub_rsp);
 		spdk_nvmf_qpair_disconnect(&uqpair->qpair);
+		return -EIO;
 	} else {
 		SPDK_DEBUGLOG(ub, "Posted UB response SEND for qid %u, req=%p\n",
 			      uqpair->qid, req);
 	}
+
+	return 0;
+}
+
+/* Post the SEND response capsule or queue it until a context is available. */
+static void
+nvmf_ub_post_send_response(struct spdk_nvmf_ub_request *ub_req)
+{
+	struct spdk_nvmf_ub_qpair *uqpair = SPDK_CONTAINEROF(ub_req->req.qpair,
+		struct spdk_nvmf_ub_qpair, qpair);
+	struct spdk_nvmf_ub_response *ub_rsp;
+
+	if (__atomic_load_n(&uqpair->qpair.disconnect_started, __ATOMIC_RELAXED)) {
+		nvmf_ub_req_abort(ub_req);
+		return;
+	}
+
+	ub_rsp = nvmf_ub_response_get(uqpair);
+	if (ub_rsp == NULL) {
+		nvmf_ub_queue_pending_response(ub_req);
+		return;
+	}
+
+	nvmf_ub_post_send_response_ctx(ub_req, ub_rsp);
 }
 
 static void
