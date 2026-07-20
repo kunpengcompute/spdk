@@ -154,20 +154,15 @@ struct spdk_nvmf_ub_transport {
 	urma_context_t				*urma_ctx;
 	urma_jfce_t 				*jfce;
 
-	/* Listen socket for accepting connections */
-	struct spdk_sock			*listen_sock;
-	struct spdk_poller			*accept_poller;
-
 	/* Pending connections sock_group for handling connect requests */
+	struct spdk_sock_group		*listen_sock_group;
+	struct spdk_poller			*accept_poller;
 	struct spdk_sock_group		*pending_sock_group;
 	struct spdk_poller			*pending_poller;
 
 	TAILQ_HEAD(, spdk_nvmf_ub_device)	devices;
 	/* List of ports */
 	TAILQ_HEAD(, spdk_nvmf_ub_port)	ports;
-
-	/* Cached listen transport ID - set during nvmf_ub_listen */
-	struct spdk_nvme_transport_id	listen_trid;
 };
 
 /* Assuming rdma_cm uses just one protection domain per ibv_context. */
@@ -270,6 +265,9 @@ struct spdk_nvmf_ub_qpair {
 	void					*fini_cb_arg;
 
 	TAILQ_ENTRY(spdk_nvmf_ub_qpair)		link;
+
+	/* Control-plane identity of the socket that accepted this qpair. */
+	struct spdk_nvme_transport_id		listen_trid;
 };
 
 /* UB transport resources - pre-allocated requests for a qpair */
@@ -292,6 +290,7 @@ struct spdk_nvmf_ub_port {
 	struct spdk_nvme_transport_id	*trid;
 	struct spdk_nvmf_transport		*transport;
 	struct spdk_nvmf_ub_device		*device;
+	struct spdk_sock			*listen_sock;
 	TAILQ_ENTRY(spdk_nvmf_ub_port)	link;
 };
 
@@ -1066,8 +1065,9 @@ static void
 nvmf_ub_pending_sock_cb(void *ctx, struct spdk_sock_group *group, struct spdk_sock *sock);
 
 static void
-nvmf_ub_handle_accept(struct spdk_nvmf_transport *transport, struct spdk_sock *sock)
+nvmf_ub_handle_accept(struct spdk_nvmf_ub_port *port, struct spdk_sock *sock)
 {
+	struct spdk_nvmf_transport *transport = port->transport;
 	struct spdk_nvmf_ub_transport *utransport;
 	struct spdk_nvmf_ub_pending_conn *pending;
 	int rc;
@@ -1093,6 +1093,7 @@ nvmf_ub_handle_accept(struct spdk_nvmf_transport *transport, struct spdk_sock *s
 	pending->uqpair->state = UB_QPAIR_STATE_CONNECTING;
 	pending->uqpair->qpair.state = SPDK_NVMF_QPAIR_CONNECTING;
 	pending->uqpair->qpair.transport = transport;
+	pending->uqpair->listen_trid = *port->trid;
 	TAILQ_INIT(&pending->uqpair->remote_segs);
 	pending->req_offset = 0;
 
@@ -1211,30 +1212,39 @@ cleanup:
 	spdk_sock_close(&sock);
 }
 
-static int
-nvmf_ub_accept(void *ctx)
+static void
+nvmf_ub_accept_cb(void *ctx, struct spdk_sock_group *group, struct spdk_sock *listen_sock)
 {
-	struct spdk_nvmf_transport *transport = ctx;
-	struct spdk_nvmf_ub_transport *utransport;
+	struct spdk_nvmf_ub_port *port = ctx;
 	struct spdk_sock *sock;
 	int i;
 
-	utransport = nvmf_ub_get_transport(transport);
-
-	if (utransport->listen_sock == NULL) {
-		return SPDK_POLLER_IDLE;
-	}
+	assert(port->listen_sock == listen_sock);
 
 	for (i = 0; i < SPDK_NVMF_UB_MAX_ACCEPT_SOCK_ONE_TIME; i++) {
-		sock = spdk_sock_accept(utransport->listen_sock);
+		sock = spdk_sock_accept(listen_sock);
 		if (sock == NULL) {
 			break;
 		}
 		SPDK_NOTICELOG("*** accept one ***\n");
-		nvmf_ub_handle_accept(transport, sock);
+		nvmf_ub_handle_accept(port, sock);
+	}
+}
+
+static int
+nvmf_ub_accept(void *ctx)
+{
+	struct spdk_nvmf_transport *transport = ctx;
+	struct spdk_nvmf_ub_transport *utransport = nvmf_ub_get_transport(transport);
+	int rc;
+
+	rc = spdk_sock_group_poll(utransport->listen_sock_group);
+	if (rc < 0) {
+		SPDK_ERRLOG("Failed to poll UB listen sock group: %d\n", rc);
+		return SPDK_POLLER_IDLE;
 	}
 
-	return SPDK_POLLER_IDLE;
+	return rc > 0 ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
 }
 
 static struct spdk_nvmf_ub_port *
@@ -1259,6 +1269,8 @@ nvmf_ub_listen(struct spdk_nvmf_transport *transport, const struct spdk_nvme_tra
 	struct spdk_nvmf_ub_transport *utransport;
 	struct spdk_nvmf_ub_port *port;
 	int trsvcid_int;
+	bool connection_infra_created = false;
+	int rc;
 
 	SPDK_NOTICELOG("*** nvmf_ub_listen ***\n");
 
@@ -1267,10 +1279,10 @@ nvmf_ub_listen(struct spdk_nvmf_transport *transport, const struct spdk_nvme_tra
 		return -1;
 	}
 
-	/* dont support multi listen sock */
-	/* port seems to be useless */
-
 	utransport = nvmf_ub_get_transport(transport);
+	if (nvmf_ub_find_port(utransport, trid) != NULL) {
+		return 0;
+	}
 
 	trsvcid_int = nvmf_ub_trsvcid_to_int(trid->trsvcid);
 	if (trsvcid_int < 0) {
@@ -1278,49 +1290,94 @@ nvmf_ub_listen(struct spdk_nvmf_transport *transport, const struct spdk_nvme_tra
 		return -1;
 	}
 
-	if (utransport->listen_sock == NULL) {
-		utransport->pending_sock_group = spdk_sock_group_create(NULL);
-		if (utransport->pending_sock_group == NULL) {
-			SPDK_ERRLOG("spdk_sock_group_create for pending failed\n");
+	if (utransport->pending_sock_group == NULL) {
+		utransport->listen_sock_group = spdk_sock_group_create(NULL);
+		if (utransport->listen_sock_group == NULL) {
+			SPDK_ERRLOG("spdk_sock_group_create for listeners failed\n");
 			return -1;
 		}
 
-		utransport->listen_sock = spdk_sock_listen(trid->traddr, trsvcid_int, NULL);
-		if (utransport->listen_sock == NULL) {
-			SPDK_ERRLOG("spdk_sock_listen(%s, %d) failed\n", trid->traddr, trsvcid_int);
-			spdk_sock_group_close(&utransport->pending_sock_group);
-			utransport->pending_sock_group = NULL;
+		utransport->pending_sock_group = spdk_sock_group_create(NULL);
+		if (utransport->pending_sock_group == NULL) {
+			SPDK_ERRLOG("spdk_sock_group_create for pending failed\n");
+			spdk_sock_group_close(&utransport->listen_sock_group);
+			utransport->listen_sock_group = NULL;
 			return -1;
 		}
 
 		utransport->accept_poller = SPDK_POLLER_REGISTER(nvmf_ub_accept, transport, 0);
+		if (utransport->accept_poller == NULL) {
+			SPDK_ERRLOG("Failed to register UB accept poller\n");
+			spdk_sock_group_close(&utransport->pending_sock_group);
+			spdk_sock_group_close(&utransport->listen_sock_group);
+			utransport->pending_sock_group = NULL;
+			utransport->listen_sock_group = NULL;
+			return -1;
+		}
+
 		utransport->pending_poller = SPDK_POLLER_REGISTER(nvmf_ub_pending_poll, transport, 0);
+		if (utransport->pending_poller == NULL) {
+			SPDK_ERRLOG("Failed to register UB pending connection poller\n");
+			spdk_poller_unregister(&utransport->accept_poller);
+			spdk_sock_group_close(&utransport->pending_sock_group);
+			spdk_sock_group_close(&utransport->listen_sock_group);
+			utransport->pending_sock_group = NULL;
+			utransport->listen_sock_group = NULL;
+			return -1;
+		}
+		connection_infra_created = true;
 	}
 
 	port = calloc(1, sizeof(*port));
 	if (!port) {
 		SPDK_ERRLOG("Port allocation failed\n");
-		return -1;
+		goto cleanup_connection_infra;
 	}
 
 	port->trid = malloc(sizeof(*port->trid));
 	if (port->trid == NULL) {
 		SPDK_ERRLOG("Failed to allocate trid copy\n");
 		free(port);
-		return -1;
+		goto cleanup_connection_infra;
 	}
 	*port->trid = *trid;
 	port->transport = transport;
+	port->listen_sock = spdk_sock_listen(trid->traddr, trsvcid_int, NULL);
+	if (port->listen_sock == NULL) {
+		SPDK_ERRLOG("spdk_sock_listen(%s, %d) failed\n", trid->traddr, trsvcid_int);
+		free(port->trid);
+		free(port);
+		goto cleanup_connection_infra;
+	}
+
+	rc = spdk_sock_group_add_sock(utransport->listen_sock_group, port->listen_sock,
+				      nvmf_ub_accept_cb, port);
+	if (rc != 0) {
+		SPDK_ERRLOG("Failed to add UB listen socket %s:%s to sock group: %d\n",
+			    trid->traddr, trid->trsvcid, rc);
+		spdk_sock_close(&port->listen_sock);
+		free(port->trid);
+		free(port);
+		goto cleanup_connection_infra;
+	}
 
 	TAILQ_INSERT_TAIL(&utransport->ports, port, link);
-
-	/* Cache the listen trid - used by qpair_get_listen_trid */
-	utransport->listen_trid = *trid;
 
 	SPDK_NOTICELOG("*** NVMe/UB Target Listening on %s port %s ***\n",
 		       trid->traddr, trid->trsvcid);
 
 	return 0;
+
+cleanup_connection_infra:
+	if (connection_infra_created) {
+		spdk_poller_unregister(&utransport->accept_poller);
+		spdk_poller_unregister(&utransport->pending_poller);
+		spdk_sock_group_close(&utransport->pending_sock_group);
+		spdk_sock_group_close(&utransport->listen_sock_group);
+		utransport->pending_sock_group = NULL;
+		utransport->listen_sock_group = NULL;
+	}
+	return -1;
 }
 
 static void
@@ -1329,6 +1386,7 @@ nvmf_ub_stop_listen(struct spdk_nvmf_transport *transport,
 {
 	struct spdk_nvmf_ub_transport *utransport;
 	struct spdk_nvmf_ub_port *port;
+	int rc;
 
 	SPDK_NOTICELOG("*** nvmf_ub_stop_listen ***\n");
 
@@ -1336,27 +1394,33 @@ nvmf_ub_stop_listen(struct spdk_nvmf_transport *transport,
 
 	port = nvmf_ub_find_port(utransport, trid);
 	if (port) {
+		rc = spdk_sock_group_remove_sock(utransport->listen_sock_group, port->listen_sock);
+		if (rc != 0) {
+			SPDK_ERRLOG("Failed to remove UB listen socket %s:%s from sock group: %d\n",
+				    trid->traddr, trid->trsvcid, rc);
+		}
+		spdk_sock_close(&port->listen_sock);
 		TAILQ_REMOVE(&utransport->ports, port, link);
 		free(port->trid);
 		free(port);
 	}
 
 	if (TAILQ_EMPTY(&utransport->ports)) {
-		if (utransport->pending_poller) {
-			spdk_poller_unregister(&utransport->pending_poller);
-			utransport->pending_poller = NULL;
-		}
 		if (utransport->accept_poller) {
 			spdk_poller_unregister(&utransport->accept_poller);
 			utransport->accept_poller = NULL;
 		}
-		if (utransport->listen_sock) {
-			spdk_sock_close(&utransport->listen_sock);
-			utransport->listen_sock = NULL;
+		if (utransport->pending_poller) {
+			spdk_poller_unregister(&utransport->pending_poller);
+			utransport->pending_poller = NULL;
 		}
 		if (utransport->pending_sock_group) {
 			spdk_sock_group_close(&utransport->pending_sock_group);
 			utransport->pending_sock_group = NULL;
+		}
+		if (utransport->listen_sock_group) {
+			spdk_sock_group_close(&utransport->listen_sock_group);
+			utransport->listen_sock_group = NULL;
 		}
 	}
 }
@@ -2118,12 +2182,9 @@ nvmf_ub_qpair_get_listen_trid(struct spdk_nvmf_qpair *qpair,
 			       struct spdk_nvme_transport_id *trid)
 {
 	struct spdk_nvmf_ub_qpair *uqpair;
-	struct spdk_nvmf_ub_transport *utransport;
 
 	uqpair = SPDK_CONTAINEROF(qpair, struct spdk_nvmf_ub_qpair, qpair);
-	utransport = nvmf_ub_get_transport(uqpair->qpair.transport);
-
-	memcpy(trid, &utransport->listen_trid, sizeof(struct spdk_nvme_transport_id));
+	memcpy(trid, &uqpair->listen_trid, sizeof(*trid));
 
 	return 0;
 }
