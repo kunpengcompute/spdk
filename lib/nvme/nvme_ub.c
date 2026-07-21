@@ -137,6 +137,12 @@ struct nvme_ub_qpair {
     uint16_t outstanding_requests;
     uint16_t current_num_sends;
 
+    /* Payload registration statistics. Updated by the qpair owner thread. */
+    uint64_t direct_payload_ios;
+    uint64_t direct_payload_bytes;
+    uint64_t staged_payload_ios;
+    uint64_t staged_payload_bytes;
+
     /* Remote target jetty for communication */
     urma_target_jetty_t *tjetty;
 
@@ -985,6 +991,12 @@ nvme_ub_ctrlr_delete_io_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qp
 
     assert(qpair->id != 0); /* Use admin qpair deletion for qid 0 */
 
+    NVME_UQPAIR_NOTICELOG(uqpair,
+                          "payload stats: direct_ios=%" PRIu64 " direct_bytes=%" PRIu64
+                          " staged_ios=%" PRIu64 " staged_bytes=%" PRIu64 "\n",
+                          uqpair->direct_payload_ios, uqpair->direct_payload_bytes,
+                          uqpair->staged_payload_ios, uqpair->staged_payload_bytes);
+
     /* Abort all outstanding requests */
     nvme_ub_qpair_abort_reqs(qpair, qpair->abort_dnr);
 
@@ -1586,6 +1598,16 @@ nvme_ub_qpair_submit_request(struct spdk_nvme_qpair *qpair, volatile struct nvme
         nvme_ub_remove_req(uqpair, ub_req);
         nvme_ub_req_put(uqpair, ub_req);
         return -EIO;
+    }
+
+    if (req->payload_size != 0) {
+        if (ub_req->payload_staged) {
+            uqpair->staged_payload_ios++;
+            uqpair->staged_payload_bytes += req->payload_size;
+        } else {
+            uqpair->direct_payload_ios++;
+            uqpair->direct_payload_bytes += req->payload_size;
+        }
     }
 
     uqpair->current_num_sends++;

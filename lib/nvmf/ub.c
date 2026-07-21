@@ -265,6 +265,10 @@ struct spdk_nvmf_ub_qpair {
 	size_t				data_offset;
 	size_t				seg_len;
 
+	/* Controller-to-host fallback copy statistics. */
+	uint64_t			read_copy_ios;
+	uint64_t			read_copy_bytes;
+
 	TAILQ_HEAD(, spdk_nvmf_request)	reqs;
 
 	/* Callback for qpair destruction */
@@ -1019,6 +1023,10 @@ nvmf_ub_resources_destroy(struct spdk_nvmf_ub_resources *resources)
 static int
 nvmf_ub_qpair_destroy(struct spdk_nvmf_ub_qpair *uqpair)
 {
+	SPDK_NOTICELOG("UB qpair %u payload stats: read_copy_ios=%" PRIu64
+		       " read_copy_bytes=%" PRIu64 "\n",
+		       uqpair->qid, uqpair->read_copy_ios, uqpair->read_copy_bytes);
+
 	nvmf_ub_unimport_remote_segs(uqpair);
 
 	if (uqpair->target_jetty) {
@@ -2309,6 +2317,8 @@ nvmf_ub_req_complete(struct spdk_nvmf_request *req)
 				 (size_t)ub_req->buf_idx * SPDK_NVMF_UB_DEFAULT_MAX_IO_SIZE;
 		if (req->iov[0].iov_base != data_buf) {
 			memcpy(data_buf, req->iov[0].iov_base, req->iov[0].iov_len);
+			uqpair->read_copy_ios++;
+			uqpair->read_copy_bytes += req->iov[0].iov_len;
 		}
 
 		urma_sg_t dst_sg = {
