@@ -76,7 +76,7 @@ enum spdk_nvmf_ub_qpair_state {
 };
 
 
-enum spdk_nvmf_ub_request_state { /* 暂时和RDMA相同 */
+enum spdk_nvmf_ub_request_state { /* UB request processing state */
 	/* The request is not currently in use */
 	UB_REQUEST_STATE_FREE = 0,
 
@@ -170,7 +170,7 @@ struct spdk_nvmf_ub_transport {
 	struct spdk_nvme_transport_id	listen_trid;
 };
 
-/* Assuming rdma_cm uses just one protection domain per ibv_context. */
+/* Device associated with the URMA transport context. */
 struct spdk_nvmf_ub_device {
 	urma_device_t *device;
 	struct spdk_interrupt			*async_intr;
@@ -189,11 +189,11 @@ nvmf_ub_get_poll_group(struct spdk_nvmf_transport_poll_group *group)
 	return SPDK_CONTAINEROF(group, struct spdk_nvmf_ub_poll_group, group);
 }
 
-enum spdk_nvmf_ub_req_rdma_state {
-	UB_REQ_RDMA_STATE_NONE = 0,
-	UB_REQ_RDMA_STATE_WAIT_READ,	/* Waiting for RDMA READ completion */
-	UB_REQ_RDMA_STATE_WAIT_WRITE,	/* Waiting for RDMA WRITE completion */
-	UB_REQ_RDMA_STATE_WAIT_SEND,	/* Waiting for SEND completion */
+enum spdk_nvmf_ub_req_ub_state {
+	UB_REQ_UB_STATE_NONE = 0,
+	UB_REQ_UB_STATE_WAIT_READ,	/* Waiting for UB READ completion */
+	UB_REQ_UB_STATE_WAIT_WRITE,	/* Waiting for UB WRITE completion */
+	UB_REQ_UB_STATE_WAIT_SEND,	/* Waiting for UB SEND completion */
 };
 
 struct spdk_nvmf_ub_request {
@@ -202,7 +202,7 @@ struct spdk_nvmf_ub_request {
 	/* Buffer index in the qpair's registered data region. */
 	uint32_t				buf_idx;
 
-	/* Remote address and key for RDMA operations */
+	/* Remote address and key for UB operations */
 	uint64_t				remote_addr;
 	uint32_t				remote_key;
 
@@ -212,11 +212,11 @@ struct spdk_nvmf_ub_request {
 	/* Flag indicating urma_read was issued and we're waiting for completion
 	 * before calling exec(). Only used for HOST_TO_CONTROLLER transfers.
 	 */
-	bool					awaiting_rdma_read_completion;
-	bool					awaiting_rdma_write_completion;
+	bool					awaiting_ub_read_completion;
+	bool					awaiting_ub_write_completion;
 
 	/* Async state machine: tracks which URMA completion we are waiting for */
-	enum spdk_nvmf_ub_req_rdma_state	rdma_state;
+	enum spdk_nvmf_ub_req_ub_state		ub_state;
 	uint32_t				recv_slot;
 	bool					in_use;
 	STAILQ_ENTRY(spdk_nvmf_ub_request)		link;
@@ -554,7 +554,7 @@ nvmf_ub_create_jetty(struct spdk_nvmf_ub_qpair *uqpair, bool is_admin_qpair)
 
 	/* Create a single shared JFC using transport's JFCE - 参考 urma_server/client */
 	urma_jfc_cfg_t jfc_cfg = {
-		/* Receive and send/RDMA completions share this JFC. */
+		/* Receive and send/UB completions share this JFC. */
 		.depth = uqpair->depth * 2,
 		.jfce  = utransport->jfce,
 	};
@@ -1504,9 +1504,9 @@ nvmf_ub_req_put(struct spdk_nvmf_ub_request *ub_req)
 	}
 
 	recv_slot = ub_req->recv_slot;
-	ub_req->rdma_state = UB_REQ_RDMA_STATE_NONE;
-	ub_req->awaiting_rdma_read_completion = false;
-	ub_req->awaiting_rdma_write_completion = false;
+	ub_req->ub_state = UB_REQ_UB_STATE_NONE;
+	ub_req->awaiting_ub_read_completion = false;
+	ub_req->awaiting_ub_write_completion = false;
 	ub_req->recv_slot = NVMF_UB_INVALID_RECV_SLOT;
 	ub_req->in_use = false;
 	req->cmd = NULL;
@@ -1600,12 +1600,12 @@ nvmf_ub_handle_cmd(struct spdk_nvmf_ub_qpair *uqpair, uint32_t recv_slot)
 	ub_req->buf_idx = ub_req - resources->reqs;
 	ub_req->recv_slot = recv_slot;
 	ub_req->in_use = true;
-	ub_req->rdma_state = UB_REQ_RDMA_STATE_NONE;
+	ub_req->ub_state = UB_REQ_UB_STATE_NONE;
 	ub_req->data_from_remote = false;
 	ub_req->remote_addr = 0;
 	ub_req->remote_key = 0;
-	ub_req->awaiting_rdma_read_completion = false;
-	ub_req->awaiting_rdma_write_completion = false;
+	ub_req->awaiting_ub_read_completion = false;
+	ub_req->awaiting_ub_write_completion = false;
 
 	/* Parse SGL to determine data buffer location */
 	sgl = &nvmf_req->cmd->nvme_cmd.dptr.sgl1;
@@ -1664,12 +1664,12 @@ nvmf_ub_handle_cmd(struct spdk_nvmf_ub_qpair *uqpair, uint32_t recv_slot)
 				return;
 			}
 
-			/* If this is a Host-to-Controller transfer, we need to RDMA READ the data
+			/* If this is a Host-to-Controller transfer, we need to UB READ the data
 			 * from client's remote memory before executing the command. */
 			if (nvmf_req->xfer == SPDK_NVME_DATA_HOST_TO_CONTROLLER) {
 				urma_target_seg_t *remote_tseg;
 
-				/* Post RDMA READ to fetch data from client */
+				/* Post UB READ to fetch data from client */
 				remote_tseg = nvmf_ub_get_remote_tseg(uqpair, sgl->address,
 								    sgl->keyed.length, sgl->keyed.key);
 				if (remote_tseg == NULL) {
@@ -1697,39 +1697,39 @@ nvmf_ub_handle_cmd(struct spdk_nvmf_ub_qpair *uqpair, uint32_t recv_slot)
 					.num_sge = 1
 				};
 
-				urma_rw_wr_t rdma_wr = {
+				urma_rw_wr_t ub_rw_wr = {
 					.src = dst_sg,
 					.dst = src_sg
 				};
 
-				ub_req->awaiting_rdma_read_completion = true;
-				ub_req->rdma_state = UB_REQ_RDMA_STATE_WAIT_READ;
+				ub_req->awaiting_ub_read_completion = true;
+				ub_req->ub_state = UB_REQ_UB_STATE_WAIT_READ;
 				urma_jfs_wr_t read_wr = {
 					.opcode = URMA_OPC_READ,
 					.flag.bs.complete_enable = 1,
 					.tjetty = uqpair->target_jetty,
 					.user_ctx = (uint64_t)(uintptr_t)ub_req,
-					.rw = rdma_wr,
+					.rw = ub_rw_wr,
 					.next = NULL
 				};
 				urma_jfs_wr_t *bad_wr = NULL;
 
-				SPDK_DEBUGLOG(ub, "Posting RDMA READ: remote_addr=0x%" PRIx64
+				SPDK_DEBUGLOG(ub, "Posting UB READ: remote_addr=0x%" PRIx64
 					      ", local_buf=0x%" PRIx64 ", len=%u, key=0x%x\n",
 					      sgl->address, src_sg.sge->addr, sgl->keyed.length,
 					      sgl->keyed.key);
 
 				if (urma_post_jetty_send_wr(uqpair->jetty, &read_wr, &bad_wr) != URMA_SUCCESS) {
-					SPDK_ERRLOG("Failed to post RDMA READ WR\n");
-					ub_req->awaiting_rdma_read_completion = false;
-					ub_req->rdma_state = UB_REQ_RDMA_STATE_NONE;
+					SPDK_ERRLOG("Failed to post UB READ WR\n");
+					ub_req->awaiting_ub_read_completion = false;
+					ub_req->ub_state = UB_REQ_UB_STATE_NONE;
 					nvmf_req->rsp->nvme_cpl.cid = nvmf_req->cmd->nvme_cmd.cid;
 					nvmf_req->rsp->nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 					nvmf_ub_post_send_response(ub_req);
 					return;
 				}
 
-				/* Don't execute request yet - wait for RDMA READ to complete */
+				/* Don't execute request yet - wait for UB READ to complete */
 				return;
 			}
 		}
@@ -1839,7 +1839,7 @@ nvmf_ub_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 
 				/*
 				 * Distinguish receive completions (s_r == 1) from
-				 * send/RDMA completions (s_r == 0).
+				 * send/UB completions (s_r == 0).
 				 */
 				if (cr->flag.bs.s_r == 1) {
 					/* Received a command capsule */
@@ -1866,31 +1866,31 @@ nvmf_ub_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 					}
 					SPDK_DEBUGLOG(ub, "UB completion: qid=%u req=%p opcode=%d state=%d\n",
 						      uqpair->qid, completed_ub_req, cr->opcode,
-						      completed_ub_req->rdma_state);
+						      completed_ub_req->ub_state);
 
-					switch (completed_ub_req->rdma_state) {
-					case UB_REQ_RDMA_STATE_WAIT_READ:
-						/* RDMA READ completed - now execute the request */
-						completed_ub_req->awaiting_rdma_read_completion = false;
-						completed_ub_req->rdma_state = UB_REQ_RDMA_STATE_NONE;
+					switch (completed_ub_req->ub_state) {
+					case UB_REQ_UB_STATE_WAIT_READ:
+						/* UB READ completed - now execute the request */
+						completed_ub_req->awaiting_ub_read_completion = false;
+						completed_ub_req->ub_state = UB_REQ_UB_STATE_NONE;
 						spdk_nvmf_request_exec(&completed_ub_req->req);
 						break;
 
-					case UB_REQ_RDMA_STATE_WAIT_WRITE:
-						/* RDMA WRITE completed - now post SEND response */
-						completed_ub_req->awaiting_rdma_write_completion = false;
-						completed_ub_req->rdma_state = UB_REQ_RDMA_STATE_NONE;
+					case UB_REQ_UB_STATE_WAIT_WRITE:
+						/* UB WRITE completed - now post SEND response */
+						completed_ub_req->awaiting_ub_write_completion = false;
+						completed_ub_req->ub_state = UB_REQ_UB_STATE_NONE;
 						nvmf_ub_post_send_response(completed_ub_req);
 						break;
 
-					case UB_REQ_RDMA_STATE_WAIT_SEND:
+					case UB_REQ_UB_STATE_WAIT_SEND:
 						/* Release both the request and its receive credit. */
 						nvmf_ub_req_put(completed_ub_req);
 						break;
 
 					default:
 						SPDK_ERRLOG("Unexpected completion for req %p in state %d\n",
-							    completed_ub_req, completed_ub_req->rdma_state);
+							    completed_ub_req, completed_ub_req->ub_state);
 						nvmf_ub_req_abort(completed_ub_req);
 						spdk_nvmf_qpair_disconnect(&uqpair->qpair);
 						qpair_failed = true;
@@ -1918,7 +1918,7 @@ nvmf_ub_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 
 /*
  * Post the SEND response capsule to the host.
- * Sets rdma_state to WAIT_SEND; the request is returned to the free
+ * Sets ub_state to WAIT_SEND; the request is returned to the free
  * queue only after the SEND completion arrives in poll_group_poll().
  */
 static void
@@ -1959,11 +1959,11 @@ nvmf_ub_post_send_response(struct spdk_nvmf_ub_request *ub_req)
 
 	/* Set the state before posting so even an immediately visible
 	 * completion observes the correct request state. */
-	ub_req->rdma_state = UB_REQ_RDMA_STATE_WAIT_SEND;
+	ub_req->ub_state = UB_REQ_UB_STATE_WAIT_SEND;
 	if (urma_post_jetty_send_wr(uqpair->jetty, &jfs_wr, &bad_wr) != URMA_SUCCESS) {
 		SPDK_ERRLOG("Failed to post UB response SEND for qid %u, req=%p\n",
 			    uqpair->qid, req);
-		ub_req->rdma_state = UB_REQ_RDMA_STATE_NONE;
+		ub_req->ub_state = UB_REQ_UB_STATE_NONE;
 		nvmf_ub_req_abort(ub_req);
 		spdk_nvmf_qpair_disconnect(&uqpair->qpair);
 	} else {
@@ -2003,7 +2003,7 @@ nvmf_ub_req_complete(struct spdk_nvmf_request *req)
 			return;
 		}
 
-		/* Post RDMA WRITE to push data to host.  The SEND response
+		/* Post UB WRITE to push data to host.  The SEND response
 		 * capsule will be posted after the WRITE completes, which
 		 * is handled in poll_group_poll().  No busy-waiting here. */
 		urma_target_seg_t *remote_tseg = nvmf_ub_get_remote_tseg(
@@ -2040,7 +2040,7 @@ nvmf_ub_req_complete(struct spdk_nvmf_request *req)
 			.num_sge = 1
 		};
 
-		urma_rw_wr_t rdma_wr = {
+		urma_rw_wr_t ub_rw_wr = {
 			.src = src_sg,
 			.dst = dst_sg
 		};
@@ -2050,17 +2050,17 @@ nvmf_ub_req_complete(struct spdk_nvmf_request *req)
 			.flag.bs.complete_enable = 1,
 			.tjetty = uqpair->target_jetty,
 			.user_ctx = (uint64_t)(uintptr_t)ub_req,
-			.rw = rdma_wr,
+			.rw = ub_rw_wr,
 			.next = NULL
 		};
 		urma_jfs_wr_t *bad_wr = NULL;
-		ub_req->awaiting_rdma_write_completion = true;
-		ub_req->rdma_state = UB_REQ_RDMA_STATE_WAIT_WRITE;
+		ub_req->awaiting_ub_write_completion = true;
+		ub_req->ub_state = UB_REQ_UB_STATE_WAIT_WRITE;
 
 		if (urma_post_jetty_send_wr(uqpair->jetty, &write_wr, &bad_wr) != URMA_SUCCESS) {
 			SPDK_ERRLOG("Failed to post UB WRITE for qid %u, req=%p\n", uqpair->qid, req);
-			ub_req->awaiting_rdma_write_completion = false;
-			ub_req->rdma_state = UB_REQ_RDMA_STATE_NONE;
+			ub_req->awaiting_ub_write_completion = false;
+			ub_req->ub_state = UB_REQ_UB_STATE_NONE;
 			req->rsp->nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 			nvmf_ub_post_send_response(ub_req);
 		} else {

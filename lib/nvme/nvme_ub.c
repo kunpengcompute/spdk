@@ -176,7 +176,7 @@ struct nvme_ub_request {
 
     /* URMA Work Request */
     urma_jfs_wr_t send_wr;
-    urma_rw_wr_t rdma_wr;
+    urma_rw_wr_t ub_rw_wr;
     urma_sge_t sge[2];    /* Command + Data SGEs */
     uint32_t num_sge;
 
