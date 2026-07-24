@@ -85,7 +85,6 @@ static void nvme_ub_remove_req(struct nvme_ub_qpair *uqpair, struct nvme_ub_requ
 static int nvme_ub_qpair_iterate_requests(struct spdk_nvme_qpair *qpair,
                    int (*iter_fn)(struct nvme_request *req, void *arg),
                    void *arg);
-static void nvme_ub_sock_connect_cb(void *cb_arg, int status);
 
 /* Info exchange structure for socket-based connection establishment */
 typedef struct nvme_ub_conn_info {
@@ -457,25 +456,6 @@ nvme_ub_register_segs(urma_context_t *urma_ctx, urma_token_t *token, uint32_t bu
     }
 
     return 0;
-}
-
-/* Helper function to unregister and free buffer segments */
-static void
-nvme_ub_unregister_segs(urma_target_seg_t *tseg1, urma_target_seg_t *tseg2,
-                        void *buf1, void *buf2)
-{
-    if (tseg1) {
-        urma_unregister_seg(tseg1);
-    }
-    if (tseg2) {
-        urma_unregister_seg(tseg2);
-    }
-    if (buf1) {
-        free(buf1);
-    }
-    if (buf2) {
-        free(buf2);
-    }
 }
 
 static int
@@ -1752,54 +1732,6 @@ nvme_ub_qpair_reset(struct spdk_nvme_qpair *qpair)
 }
 
 static void
-print_discovery_log(struct spdk_nvmf_discovery_log_page *log_page)
-{
-	uint64_t numrec;
-	char str[512];
-	uint32_t i;
-	fprintf(stderr, "==============================================================================================================\n");
-
-	fprintf(stderr, "Discovery Log Page\n");
-	fprintf(stderr, "==================\n");
-
-	numrec = from_le64(&log_page->numrec);
-
-	fprintf(stderr, "Generation Counter: %" PRIu64 "\n", from_le64(&log_page->genctr));
-	fprintf(stderr, "Number of Records:  %" PRIu64 "\n", numrec);
-	fprintf(stderr, "Record Format:      %" PRIu16 "\n", from_le16(&log_page->recfmt));
-	fprintf(stderr, "\n");
-
-	for (i = 0; i < numrec; i++) {
-		struct spdk_nvmf_discovery_log_page_entry *entry = &log_page->entries[i];
-
-		fprintf(stderr, "Discovery Log Entry %u\n", i);
-		fprintf(stderr, "----------------------\n");
-		fprintf(stderr, "Transport Type:                        %u (%s)\n",
-		       entry->trtype, spdk_nvme_transport_id_trtype_str(entry->trtype));
-		fprintf(stderr, "Address Family:                        %u (%s)\n",
-		       entry->adrfam, spdk_nvme_transport_id_adrfam_str(entry->adrfam));
-		fprintf(stderr, "Subsystem Type:                        %u (%s)\n",
-		       entry->subtype,
-		       entry->subtype == SPDK_NVMF_SUBTYPE_DISCOVERY ? "Referral to a discovery service" :
-		       entry->subtype == SPDK_NVMF_SUBTYPE_NVME ? "NVM Subsystem" :
-		       entry->subtype == SPDK_NVMF_SUBTYPE_DISCOVERY_CURRENT ? "Current Discovery Subsystem" :
-		       "Unknown");
-		fprintf(stderr, "Port ID:                               %" PRIu16 " (0x%04" PRIx16 ")\n",
-		       from_le16(&entry->portid), from_le16(&entry->portid));
-		fprintf(stderr, "Controller ID:                         %" PRIu16 " (0x%04" PRIx16 ")\n",
-		       from_le16(&entry->cntlid), from_le16(&entry->cntlid));
-		snprintf(str, sizeof(entry->trsvcid) + 1, "%s", entry->trsvcid);
-		fprintf(stderr, "Transport Service Identifier:          %s\n", str);
-		snprintf(str, sizeof(entry->subnqn) + 1, "%s", entry->subnqn);
-		fprintf(stderr, "NVM Subsystem Qualified Name:          %s\n", str);
-		snprintf(str, sizeof(entry->traddr) + 1, "%s", entry->traddr);
-		fprintf(stderr, "Transport Address:                     %s\n", str);
-	}
-
-    fprintf(stderr, "==============================================================================================================\n");
-}
-
-static void
 nvme_ub_dummy_disconnected_qpair_cb(struct spdk_nvme_qpair *qpair, void *poll_group_ctx)
 {
     (void)qpair;
@@ -2024,35 +1956,6 @@ nvme_ub_connect_established(struct nvme_ub_qpair *uqpair)
     fprintf(stderr, "Post recv wr successfully\n");
 
     return 0;
-}
-
-static void
-nvme_ub_sock_connect_cb(void *cb_arg, int status)
-{
-    fprintf(stderr, "DEBUG: [ENTER] %s (cb_arg=%p, status=%d, qid=%u)\n",
-            __func__, cb_arg, status, ((struct nvme_ub_qpair*)cb_arg)->qid);
-    struct nvme_ub_qpair *uqpair = cb_arg;
-    struct spdk_nvme_qpair *qpair = &uqpair->qpair;
-    int rc;
-
-    if (status < 0) {
-        NVME_UQPAIR_ERRLOG(uqpair, "Socket connection error %d (%s)\n", status, spdk_strerror(abs(status)));
-        nvme_qpair_set_state(qpair, NVME_QPAIR_DISCONNECTED);
-        return;
-    }
-
-    /* Complete the URMA connection establishment */
-    rc = nvme_ub_connect_established(uqpair);
-    if (rc != 0) {
-        NVME_UQPAIR_ERRLOG(uqpair, "Failed to establish URMA connection\n");
-        if (uqpair->sock) {
-            spdk_sock_close(&uqpair->sock);
-        }
-        nvme_qpair_set_state(qpair, NVME_QPAIR_DISCONNECTED);
-        return;
-    }
-
-    NVME_UQPAIR_DEBUGLOG(uqpair, "Socket connection completed and URMA established\n");
 }
 
 static int

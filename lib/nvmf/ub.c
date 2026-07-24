@@ -438,7 +438,7 @@ nvmf_ub_create_urma(struct spdk_nvmf_ub_transport *utransport)
 	SPDK_NOTICELOG("eid_index %d\n", eid_index);
 
 	/* Create URMA context with the device, eid_index 0 by default */
-	utransport->urma_ctx = urma_create_context(dev, 0);
+	utransport->urma_ctx = urma_create_context(dev, eid_index);
 	if (utransport->urma_ctx == NULL) {
 		SPDK_ERRLOG("Failed to create URMA context\n");
 		return -1;
@@ -614,37 +614,6 @@ nvmf_ub_create_jetty(struct spdk_nvmf_ub_qpair *uqpair, bool is_admin_qpair)
 
 	SPDK_NOTICELOG("Created jetty for qid %u, jetty_id=%u\n",
 		       uqpair->qid, uqpair->jetty->jetty_id.id);
-
-	return 0;
-}
-
-static int
-nvmf_ub_import_remote_jetty(struct spdk_nvmf_ub_qpair *uqpair)
-{
-	struct spdk_nvmf_ub_transport *utransport;
-	urma_rjetty_t rjetty = {0};
-	urma_token_t token = { .token = 0xABCD };
-
-	utransport = nvmf_ub_get_transport(uqpair->qpair.transport);
-
-	rjetty.jetty_id.id = uqpair->remote_jetty_id.id;
-	rjetty.jetty_id.uasid = uqpair->remote_uasid;
-	memcpy(rjetty.jetty_id.eid.raw, uqpair->remote_eid.raw, URMA_EID_SIZE);
-	rjetty.trans_mode = URMA_TM_RM;
-	rjetty.type = URMA_JETTY;
-	rjetty.tp_type = URMA_CTP;
-
-	uqpair->target_jetty = urma_import_jetty(utransport->urma_ctx, &rjetty, &token);
-	if (uqpair->target_jetty == NULL) {
-		SPDK_ERRLOG("urma_import_jetty failed for qid %u, remote_jetty_id=%u\n",
-			    uqpair->qid, uqpair->remote_jetty_id.id);
-		return -EIO;
-	}
-
-	SPDK_NOTICELOG("Imported remote jetty for qid %u, remote_jetty_id=%u, tpn=%u\n",
-		       uqpair->qid, uqpair->remote_jetty_id.id, uqpair->target_jetty->tp.tpn);
-
-	/* CTP mode does not require bind_jetty - library handles TP internally */
 
 	return 0;
 }
@@ -1413,13 +1382,6 @@ nvmf_ub_poll_group_create(struct spdk_nvmf_transport *transport,
 	TAILQ_INIT(&ugroup->qpairs);
 
 	return &ugroup->group;
-}
-
-static struct spdk_nvmf_transport_poll_group *
-nvmf_ub_get_optimal_poll_group(struct spdk_nvmf_qpair *qpair)
-{
-	SPDK_NOTICELOG("*** nvmf_ub_get_optimal_poll_group ***\n");
-	return NULL;
 }
 
 static void
