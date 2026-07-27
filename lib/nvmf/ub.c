@@ -7,6 +7,7 @@
 #include "spdk/stdinc.h"
 
 #include "spdk/config.h"
+#include "spdk/env.h"
 #include "spdk/thread.h"
 #include "spdk/likely.h"
 #include "spdk/nvmf_transport.h"
@@ -34,6 +35,7 @@
 #define MSG_SIZE 4096
 
 const struct spdk_nvmf_transport_ops spdk_nvmf_transport_ub;
+static const struct spdk_mem_map_ops g_nvmf_ub_mem_map_ops;
 
 bool g_nvmf_urma_initialized = false;
 
@@ -153,21 +155,17 @@ struct spdk_nvmf_ub_transport {
 	/* URMA context */
 	urma_context_t				*urma_ctx;
 	urma_jfce_t 				*jfce;
-
-	/* Listen socket for accepting connections */
-	struct spdk_sock			*listen_sock;
-	struct spdk_poller			*accept_poller;
+	struct spdk_mem_map			*mem_map;
 
 	/* Pending connections sock_group for handling connect requests */
+	struct spdk_sock_group		*listen_sock_group;
+	struct spdk_poller			*accept_poller;
 	struct spdk_sock_group		*pending_sock_group;
 	struct spdk_poller			*pending_poller;
 
 	TAILQ_HEAD(, spdk_nvmf_ub_device)	devices;
 	/* List of ports */
 	TAILQ_HEAD(, spdk_nvmf_ub_port)	ports;
-
-	/* Cached listen transport ID - set during nvmf_ub_listen */
-	struct spdk_nvme_transport_id	listen_trid;
 };
 
 /* Device associated with the URMA transport context. */
@@ -193,7 +191,7 @@ enum spdk_nvmf_ub_req_ub_state {
 	UB_REQ_UB_STATE_NONE = 0,
 	UB_REQ_UB_STATE_WAIT_READ,	/* Waiting for UB READ completion */
 	UB_REQ_UB_STATE_WAIT_WRITE,	/* Waiting for UB WRITE completion */
-	UB_REQ_UB_STATE_WAIT_SEND,	/* Waiting for UB SEND completion */
+	UB_REQ_UB_STATE_WAIT_RESPONSE,	/* Waiting for a response SEND context */
 };
 
 struct spdk_nvmf_ub_request {
@@ -219,7 +217,15 @@ struct spdk_nvmf_ub_request {
 	enum spdk_nvmf_ub_req_ub_state		ub_state;
 	uint32_t				recv_slot;
 	bool					in_use;
+	bool					zcopy_abort;
 	STAILQ_ENTRY(spdk_nvmf_ub_request)		link;
+};
+
+struct spdk_nvmf_ub_response {
+	/* SEND-owned completion storage remains stable after its request is free. */
+	uint32_t				buf_idx;
+	bool					in_use;
+	STAILQ_ENTRY(spdk_nvmf_ub_response)	link;
 };
 
 struct spdk_nvmf_ub_remote_seg {
@@ -263,6 +269,13 @@ struct spdk_nvmf_ub_qpair {
 	size_t				data_offset;
 	size_t				seg_len;
 
+	/* Controller-to-host fallback copy statistics. */
+	uint64_t			read_copy_ios;
+	uint64_t			read_copy_bytes;
+	uint64_t			zcopy_read_ios;
+	uint64_t			zcopy_write_ios;
+	uint64_t			zcopy_map_failures;
+
 	TAILQ_HEAD(, spdk_nvmf_request)	reqs;
 
 	/* Callback for qpair destruction */
@@ -270,12 +283,16 @@ struct spdk_nvmf_ub_qpair {
 	void					*fini_cb_arg;
 
 	TAILQ_ENTRY(spdk_nvmf_ub_qpair)		link;
+
+	/* Control-plane identity of the socket that accepted this qpair. */
+	struct spdk_nvme_transport_id		listen_trid;
 };
 
 /* UB transport resources - pre-allocated requests for a qpair */
 struct spdk_nvmf_ub_resources {
 	/* Array of size "max_queue_depth" containing UB requests. */
 	struct spdk_nvmf_ub_request		*reqs;
+	struct spdk_nvmf_ub_response		*responses;
 
 	/* Array of size "max_queue_depth" containing 16 byte completions
 	 * to be sent back to the user.
@@ -285,6 +302,12 @@ struct spdk_nvmf_ub_resources {
 
 	/* Queue to track free requests */
 	STAILQ_HEAD(, spdk_nvmf_ub_request)	free_queue;
+	/* Response SEND contexts are independent from request/receive credits. */
+	STAILQ_HEAD(, spdk_nvmf_ub_response)	free_response_queue;
+	/* Completed requests wait here only while every SEND context is busy. */
+	STAILQ_HEAD(, spdk_nvmf_ub_request)	pending_response_queue;
+	uint32_t				pending_response_count;
+	uint32_t				pending_response_high_watermark;
 
 };
 
@@ -292,6 +315,7 @@ struct spdk_nvmf_ub_port {
 	struct spdk_nvme_transport_id	*trid;
 	struct spdk_nvmf_transport		*transport;
 	struct spdk_nvmf_ub_device		*device;
+	struct spdk_sock			*listen_sock;
 	TAILQ_ENTRY(spdk_nvmf_ub_port)	link;
 };
 
@@ -361,6 +385,10 @@ nvmf_ub_destroy(struct spdk_nvmf_transport *transport,
 	struct spdk_nvmf_ub_transport	*utransport;
 
 	utransport = SPDK_CONTAINEROF(transport, struct spdk_nvmf_ub_transport, transport);
+
+	if (utransport->mem_map != NULL) {
+		spdk_mem_map_free(&utransport->mem_map);
+	}
 
 	free(utransport);
 
@@ -437,7 +465,7 @@ nvmf_ub_create_urma(struct spdk_nvmf_ub_transport *utransport)
     }
 	SPDK_NOTICELOG("eid_index %d\n", eid_index);
 
-	/* Create URMA context with the device, eid_index 0 by default */
+	/* Create the URMA context using the selected endpoint. */
 	utransport->urma_ctx = urma_create_context(dev, eid_index);
 	if (utransport->urma_ctx == NULL) {
 		SPDK_ERRLOG("Failed to create URMA context\n");
@@ -511,7 +539,18 @@ nvmf_ub_create(struct spdk_nvmf_transport_opts *opts)
 		return NULL;
 	}
 
-	nvmf_ub_create_urma(utransport);
+	if (nvmf_ub_create_urma(utransport) != 0) {
+		free(utransport);
+		return NULL;
+	}
+
+	if (opts->zcopy) {
+		utransport->mem_map = spdk_mem_map_alloc(0, &g_nvmf_ub_mem_map_ops, utransport);
+		if (utransport->mem_map == NULL) {
+			SPDK_WARNLOG("Unable to create UB zcopy memory map; disabling zcopy\n");
+			opts->zcopy = false;
+		}
+	}
 	SPDK_NOTICELOG("*** UB Transport Init over ***\n");
 	return &utransport->transport;
 }
@@ -554,8 +593,9 @@ nvmf_ub_create_jetty(struct spdk_nvmf_ub_qpair *uqpair, bool is_admin_qpair)
 
 	/* Create a single shared JFC using transport's JFCE - 参考 urma_server/client */
 	urma_jfc_cfg_t jfc_cfg = {
-		/* Receive and send/UB completions share this JFC. */
-		.depth = uqpair->depth * 2,
+		/* Up to depth receive completions and 2 * depth JFS completions
+		 * (response SENDs plus data READ/WRITEs) share this JFC. */
+		.depth = uqpair->depth * 3,
 		.jfce  = utransport->jfce,
 	};
 
@@ -587,7 +627,9 @@ nvmf_ub_create_jetty(struct spdk_nvmf_ub_qpair *uqpair, bool is_admin_qpair)
 
 	/* JFS configuration - 使用 URMA_TM_RM 模式 */
 	urma_jfs_cfg_t jfs_cfg = {
-		.depth           = uqpair->depth,
+		/* A response SEND may still await its local completion after the host
+		 * submits a replacement command that needs a data READ or WRITE. */
+		.depth           = uqpair->depth * 2,
 		.trans_mode      = URMA_TM_RM,
 		.priority        = URMA_MAX_PRIORITY,
 		.max_sge         = 1,
@@ -705,6 +747,7 @@ nvmf_ub_resources_create(struct spdk_nvmf_ub_qpair *uqpair, uint32_t max_queue_d
 {
 	struct spdk_nvmf_ub_resources *resources;
 	struct spdk_nvmf_ub_request *ub_req;
+	struct spdk_nvmf_ub_response *ub_rsp;
 	uint32_t i;
 
 	resources = calloc(1, sizeof(*resources));
@@ -715,18 +758,22 @@ nvmf_ub_resources_create(struct spdk_nvmf_ub_qpair *uqpair, uint32_t max_queue_d
 
 	resources->reqs = spdk_zmalloc(max_queue_depth * sizeof(*resources->reqs),
 				       0x1000, NULL, SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
+	resources->responses = calloc(max_queue_depth, sizeof(*resources->responses));
 	resources->cpls = spdk_zmalloc(max_queue_depth * sizeof(*resources->cpls),
 				       0x1000, NULL, SPDK_ENV_LCORE_ID_ANY, SPDK_MALLOC_DMA);
 
-	if (!resources->reqs || !resources->cpls) {
+	if (!resources->reqs || !resources->responses || !resources->cpls) {
 		SPDK_ERRLOG("Unable to allocate sufficient memory for UB qpair %u\n", uqpair->qid);
 		spdk_free(resources->reqs);
+		free(resources->responses);
 		spdk_free(resources->cpls);
 		free(resources);
 		return NULL;
 	}
 
 	STAILQ_INIT(&resources->free_queue);
+	STAILQ_INIT(&resources->free_response_queue);
+	STAILQ_INIT(&resources->pending_response_queue);
 	resources->depth = max_queue_depth;
 
 	for (i = 0; i < max_queue_depth; i++) {
@@ -744,6 +791,10 @@ nvmf_ub_resources_create(struct spdk_nvmf_ub_qpair *uqpair, uint32_t max_queue_d
 		ub_req->recv_slot = NVMF_UB_INVALID_RECV_SLOT;
 
 		STAILQ_INSERT_TAIL(&resources->free_queue, ub_req, link);
+
+		ub_rsp = &resources->responses[i];
+		ub_rsp->buf_idx = i;
+		STAILQ_INSERT_TAIL(&resources->free_response_queue, ub_rsp, link);
 	}
 
 	SPDK_DEBUGLOG(ub, "Created UB resources for qpair %u with %u requests\n",
@@ -808,6 +859,28 @@ nvmf_ub_get_remote_tseg(struct spdk_nvmf_ub_qpair *uqpair, uint64_t addr, uint32
 	entry->token_id = token_id;
 	entry->tseg = tseg;
 	TAILQ_INSERT_TAIL(&uqpair->remote_segs, entry, link);
+	return tseg;
+}
+
+static urma_target_seg_t *
+nvmf_ub_get_local_tseg(struct spdk_nvmf_ub_qpair *uqpair, void *addr, size_t length)
+{
+	struct spdk_nvmf_ub_transport *utransport;
+	uint64_t translated_length = length;
+	urma_target_seg_t *tseg;
+
+	utransport = nvmf_ub_get_transport(uqpair->qpair.transport);
+	if (utransport->mem_map == NULL || addr == NULL || length == 0) {
+		return NULL;
+	}
+
+	tseg = (urma_target_seg_t *)(uintptr_t)
+		spdk_mem_map_translate(utransport->mem_map, (uint64_t)(uintptr_t)addr,
+				       &translated_length);
+	if (tseg == NULL || translated_length < length) {
+		return NULL;
+	}
+
 	return tseg;
 }
 
@@ -950,7 +1023,12 @@ nvmf_ub_resources_destroy(struct spdk_nvmf_ub_resources *resources)
 		return;
 	}
 
+	SPDK_DEBUGLOG(ub, "Destroying UB resources: pending responses=%u, high watermark=%u\n",
+		      resources->pending_response_count,
+		      resources->pending_response_high_watermark);
+
 	spdk_free(resources->cpls);
+	free(resources->responses);
 	spdk_free(resources->reqs);
 	free(resources);
 }
@@ -958,6 +1036,13 @@ nvmf_ub_resources_destroy(struct spdk_nvmf_ub_resources *resources)
 static int
 nvmf_ub_qpair_destroy(struct spdk_nvmf_ub_qpair *uqpair)
 {
+	SPDK_NOTICELOG("UB qpair %u payload stats: read_copy_ios=%" PRIu64
+		       " read_copy_bytes=%" PRIu64 " zcopy_read_ios=%" PRIu64
+		       " zcopy_write_ios=%" PRIu64 " zcopy_map_failures=%" PRIu64 "\n",
+		       uqpair->qid, uqpair->read_copy_ios, uqpair->read_copy_bytes,
+		       uqpair->zcopy_read_ios, uqpair->zcopy_write_ios,
+		       uqpair->zcopy_map_failures);
+
 	nvmf_ub_unimport_remote_segs(uqpair);
 
 	if (uqpair->target_jetty) {
@@ -1035,8 +1120,9 @@ static void
 nvmf_ub_pending_sock_cb(void *ctx, struct spdk_sock_group *group, struct spdk_sock *sock);
 
 static void
-nvmf_ub_handle_accept(struct spdk_nvmf_transport *transport, struct spdk_sock *sock)
+nvmf_ub_handle_accept(struct spdk_nvmf_ub_port *port, struct spdk_sock *sock)
 {
+	struct spdk_nvmf_transport *transport = port->transport;
 	struct spdk_nvmf_ub_transport *utransport;
 	struct spdk_nvmf_ub_pending_conn *pending;
 	int rc;
@@ -1062,6 +1148,7 @@ nvmf_ub_handle_accept(struct spdk_nvmf_transport *transport, struct spdk_sock *s
 	pending->uqpair->state = UB_QPAIR_STATE_CONNECTING;
 	pending->uqpair->qpair.state = SPDK_NVMF_QPAIR_CONNECTING;
 	pending->uqpair->qpair.transport = transport;
+	pending->uqpair->listen_trid = *port->trid;
 	TAILQ_INIT(&pending->uqpair->remote_segs);
 	pending->req_offset = 0;
 
@@ -1180,30 +1267,103 @@ cleanup:
 	spdk_sock_close(&sock);
 }
 
-static int
-nvmf_ub_accept(void *ctx)
+static void
+nvmf_ub_accept_cb(void *ctx, struct spdk_sock_group *group, struct spdk_sock *listen_sock)
 {
-	struct spdk_nvmf_transport *transport = ctx;
-	struct spdk_nvmf_ub_transport *utransport;
+	struct spdk_nvmf_ub_port *port = ctx;
 	struct spdk_sock *sock;
 	int i;
 
-	utransport = nvmf_ub_get_transport(transport);
-
-	if (utransport->listen_sock == NULL) {
-		return SPDK_POLLER_IDLE;
-	}
+	assert(port->listen_sock == listen_sock);
 
 	for (i = 0; i < SPDK_NVMF_UB_MAX_ACCEPT_SOCK_ONE_TIME; i++) {
-		sock = spdk_sock_accept(utransport->listen_sock);
+		sock = spdk_sock_accept(listen_sock);
 		if (sock == NULL) {
 			break;
 		}
 		SPDK_NOTICELOG("*** accept one ***\n");
-		nvmf_ub_handle_accept(transport, sock);
+		nvmf_ub_handle_accept(port, sock);
+	}
+}
+
+static int
+nvmf_ub_mem_map_notify(void *cb_ctx, struct spdk_mem_map *map,
+		       enum spdk_mem_map_notify_action action, void *vaddr, size_t size)
+{
+	struct spdk_nvmf_ub_transport *utransport = cb_ctx;
+	urma_target_seg_t *tseg;
+	int rc;
+
+	switch (action) {
+	case SPDK_MEM_MAP_NOTIFY_REGISTER: {
+		urma_token_t token = { .token = 0xABCD };
+		urma_reg_seg_flag_t flag = {
+			.bs.token_policy = URMA_TOKEN_NONE,
+			.bs.cacheable = URMA_NON_CACHEABLE,
+			.bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE | URMA_ACCESS_ATOMIC,
+			.bs.token_id_valid = 0,
+		};
+		urma_seg_cfg_t seg_cfg = {
+			.va = (uint64_t)(uintptr_t)vaddr,
+			.len = size,
+			.token_value = token,
+			.flag = flag,
+		};
+
+		tseg = urma_register_seg(utransport->urma_ctx, &seg_cfg);
+		if (tseg == NULL) {
+			SPDK_WARNLOG("Unable to register zcopy memory %p/%zu with URMA\n",
+				     vaddr, size);
+			return -EFAULT;
+		}
+
+		rc = spdk_mem_map_set_translation(map, (uint64_t)(uintptr_t)vaddr, size,
+					  (uint64_t)(uintptr_t)tseg);
+		if (rc != 0) {
+			urma_unregister_seg(tseg);
+		}
+		return rc;
+	}
+	case SPDK_MEM_MAP_NOTIFY_UNREGISTER:
+		tseg = (urma_target_seg_t *)(uintptr_t)
+			spdk_mem_map_translate(map, (uint64_t)(uintptr_t)vaddr, NULL);
+		if (tseg != NULL && urma_unregister_seg(tseg) != URMA_SUCCESS) {
+			SPDK_WARNLOG("Unable to unregister zcopy memory %p/%zu from URMA\n",
+				     vaddr, size);
+		}
+		return spdk_mem_map_clear_translation(map, (uint64_t)(uintptr_t)vaddr, size);
+	default:
+		SPDK_UNREACHABLE();
 	}
 
-	return SPDK_POLLER_IDLE;
+	return -EINVAL;
+}
+
+static int
+nvmf_ub_mem_map_are_contiguous(uint64_t addr_1, uint64_t addr_2)
+{
+	return addr_1 == addr_2;
+}
+
+static const struct spdk_mem_map_ops g_nvmf_ub_mem_map_ops = {
+	.notify_cb = nvmf_ub_mem_map_notify,
+	.are_contiguous = nvmf_ub_mem_map_are_contiguous,
+};
+
+static int
+nvmf_ub_accept(void *ctx)
+{
+	struct spdk_nvmf_transport *transport = ctx;
+	struct spdk_nvmf_ub_transport *utransport = nvmf_ub_get_transport(transport);
+	int rc;
+
+	rc = spdk_sock_group_poll(utransport->listen_sock_group);
+	if (rc < 0) {
+		SPDK_ERRLOG("Failed to poll UB listen sock group: %d\n", rc);
+		return SPDK_POLLER_IDLE;
+	}
+
+	return rc > 0 ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
 }
 
 static struct spdk_nvmf_ub_port *
@@ -1228,6 +1388,8 @@ nvmf_ub_listen(struct spdk_nvmf_transport *transport, const struct spdk_nvme_tra
 	struct spdk_nvmf_ub_transport *utransport;
 	struct spdk_nvmf_ub_port *port;
 	int trsvcid_int;
+	bool connection_infra_created = false;
+	int rc;
 
 	SPDK_NOTICELOG("*** nvmf_ub_listen ***\n");
 
@@ -1236,10 +1398,10 @@ nvmf_ub_listen(struct spdk_nvmf_transport *transport, const struct spdk_nvme_tra
 		return -1;
 	}
 
-	/* dont support multi listen sock */
-	/* port seems to be useless */
-
 	utransport = nvmf_ub_get_transport(transport);
+	if (nvmf_ub_find_port(utransport, trid) != NULL) {
+		return 0;
+	}
 
 	trsvcid_int = nvmf_ub_trsvcid_to_int(trid->trsvcid);
 	if (trsvcid_int < 0) {
@@ -1247,49 +1409,94 @@ nvmf_ub_listen(struct spdk_nvmf_transport *transport, const struct spdk_nvme_tra
 		return -1;
 	}
 
-	if (utransport->listen_sock == NULL) {
-		utransport->pending_sock_group = spdk_sock_group_create(NULL);
-		if (utransport->pending_sock_group == NULL) {
-			SPDK_ERRLOG("spdk_sock_group_create for pending failed\n");
+	if (utransport->pending_sock_group == NULL) {
+		utransport->listen_sock_group = spdk_sock_group_create(NULL);
+		if (utransport->listen_sock_group == NULL) {
+			SPDK_ERRLOG("spdk_sock_group_create for listeners failed\n");
 			return -1;
 		}
 
-		utransport->listen_sock = spdk_sock_listen(trid->traddr, trsvcid_int, NULL);
-		if (utransport->listen_sock == NULL) {
-			SPDK_ERRLOG("spdk_sock_listen(%s, %d) failed\n", trid->traddr, trsvcid_int);
-			spdk_sock_group_close(&utransport->pending_sock_group);
-			utransport->pending_sock_group = NULL;
+		utransport->pending_sock_group = spdk_sock_group_create(NULL);
+		if (utransport->pending_sock_group == NULL) {
+			SPDK_ERRLOG("spdk_sock_group_create for pending failed\n");
+			spdk_sock_group_close(&utransport->listen_sock_group);
+			utransport->listen_sock_group = NULL;
 			return -1;
 		}
 
 		utransport->accept_poller = SPDK_POLLER_REGISTER(nvmf_ub_accept, transport, 0);
+		if (utransport->accept_poller == NULL) {
+			SPDK_ERRLOG("Failed to register UB accept poller\n");
+			spdk_sock_group_close(&utransport->pending_sock_group);
+			spdk_sock_group_close(&utransport->listen_sock_group);
+			utransport->pending_sock_group = NULL;
+			utransport->listen_sock_group = NULL;
+			return -1;
+		}
+
 		utransport->pending_poller = SPDK_POLLER_REGISTER(nvmf_ub_pending_poll, transport, 0);
+		if (utransport->pending_poller == NULL) {
+			SPDK_ERRLOG("Failed to register UB pending connection poller\n");
+			spdk_poller_unregister(&utransport->accept_poller);
+			spdk_sock_group_close(&utransport->pending_sock_group);
+			spdk_sock_group_close(&utransport->listen_sock_group);
+			utransport->pending_sock_group = NULL;
+			utransport->listen_sock_group = NULL;
+			return -1;
+		}
+		connection_infra_created = true;
 	}
 
 	port = calloc(1, sizeof(*port));
 	if (!port) {
 		SPDK_ERRLOG("Port allocation failed\n");
-		return -1;
+		goto cleanup_connection_infra;
 	}
 
 	port->trid = malloc(sizeof(*port->trid));
 	if (port->trid == NULL) {
 		SPDK_ERRLOG("Failed to allocate trid copy\n");
 		free(port);
-		return -1;
+		goto cleanup_connection_infra;
 	}
 	*port->trid = *trid;
 	port->transport = transport;
+	port->listen_sock = spdk_sock_listen(trid->traddr, trsvcid_int, NULL);
+	if (port->listen_sock == NULL) {
+		SPDK_ERRLOG("spdk_sock_listen(%s, %d) failed\n", trid->traddr, trsvcid_int);
+		free(port->trid);
+		free(port);
+		goto cleanup_connection_infra;
+	}
+
+	rc = spdk_sock_group_add_sock(utransport->listen_sock_group, port->listen_sock,
+				      nvmf_ub_accept_cb, port);
+	if (rc != 0) {
+		SPDK_ERRLOG("Failed to add UB listen socket %s:%s to sock group: %d\n",
+			    trid->traddr, trid->trsvcid, rc);
+		spdk_sock_close(&port->listen_sock);
+		free(port->trid);
+		free(port);
+		goto cleanup_connection_infra;
+	}
 
 	TAILQ_INSERT_TAIL(&utransport->ports, port, link);
-
-	/* Cache the listen trid - used by qpair_get_listen_trid */
-	utransport->listen_trid = *trid;
 
 	SPDK_NOTICELOG("*** NVMe/UB Target Listening on %s port %s ***\n",
 		       trid->traddr, trid->trsvcid);
 
 	return 0;
+
+cleanup_connection_infra:
+	if (connection_infra_created) {
+		spdk_poller_unregister(&utransport->accept_poller);
+		spdk_poller_unregister(&utransport->pending_poller);
+		spdk_sock_group_close(&utransport->pending_sock_group);
+		spdk_sock_group_close(&utransport->listen_sock_group);
+		utransport->pending_sock_group = NULL;
+		utransport->listen_sock_group = NULL;
+	}
+	return -1;
 }
 
 static void
@@ -1298,6 +1505,7 @@ nvmf_ub_stop_listen(struct spdk_nvmf_transport *transport,
 {
 	struct spdk_nvmf_ub_transport *utransport;
 	struct spdk_nvmf_ub_port *port;
+	int rc;
 
 	SPDK_NOTICELOG("*** nvmf_ub_stop_listen ***\n");
 
@@ -1305,27 +1513,33 @@ nvmf_ub_stop_listen(struct spdk_nvmf_transport *transport,
 
 	port = nvmf_ub_find_port(utransport, trid);
 	if (port) {
+		rc = spdk_sock_group_remove_sock(utransport->listen_sock_group, port->listen_sock);
+		if (rc != 0) {
+			SPDK_ERRLOG("Failed to remove UB listen socket %s:%s from sock group: %d\n",
+				    trid->traddr, trid->trsvcid, rc);
+		}
+		spdk_sock_close(&port->listen_sock);
 		TAILQ_REMOVE(&utransport->ports, port, link);
 		free(port->trid);
 		free(port);
 	}
 
 	if (TAILQ_EMPTY(&utransport->ports)) {
-		if (utransport->pending_poller) {
-			spdk_poller_unregister(&utransport->pending_poller);
-			utransport->pending_poller = NULL;
-		}
 		if (utransport->accept_poller) {
 			spdk_poller_unregister(&utransport->accept_poller);
 			utransport->accept_poller = NULL;
 		}
-		if (utransport->listen_sock) {
-			spdk_sock_close(&utransport->listen_sock);
-			utransport->listen_sock = NULL;
+		if (utransport->pending_poller) {
+			spdk_poller_unregister(&utransport->pending_poller);
+			utransport->pending_poller = NULL;
 		}
 		if (utransport->pending_sock_group) {
 			spdk_sock_group_close(&utransport->pending_sock_group);
 			utransport->pending_sock_group = NULL;
+		}
+		if (utransport->listen_sock_group) {
+			spdk_sock_group_close(&utransport->listen_sock_group);
+			utransport->listen_sock_group = NULL;
 		}
 	}
 }
@@ -1440,6 +1654,108 @@ nvmf_ub_poll_group_remove(struct spdk_nvmf_transport_poll_group *group,
 }
 
 static void nvmf_ub_post_send_response(struct spdk_nvmf_ub_request *ub_req);
+static int nvmf_ub_post_send_response_ctx(struct spdk_nvmf_ub_request *ub_req,
+		struct spdk_nvmf_ub_response *ub_rsp);
+
+static int
+nvmf_ub_post_ub_read(struct spdk_nvmf_ub_request *ub_req, void *local_buf,
+		     urma_target_seg_t *local_tseg)
+{
+	struct spdk_nvmf_ub_qpair *uqpair = SPDK_CONTAINEROF(ub_req->req.qpair,
+		struct spdk_nvmf_ub_qpair, qpair);
+	urma_target_seg_t *remote_tseg;
+	urma_sge_t remote_sge, local_sge;
+	urma_sg_t remote_sg, local_sg;
+	urma_rw_wr_t ub_rw_wr;
+	urma_jfs_wr_t read_wr = {0};
+	urma_jfs_wr_t *bad_wr = NULL;
+
+	remote_tseg = nvmf_ub_get_remote_tseg(uqpair, ub_req->remote_addr,
+			ub_req->req.length, ub_req->remote_key);
+	if (remote_tseg == NULL) {
+		return -EFAULT;
+	}
+
+	remote_sge.addr = ub_req->remote_addr;
+	remote_sge.len = ub_req->req.length;
+	remote_sge.tseg = remote_tseg;
+	remote_sg.sge = &remote_sge;
+	remote_sg.num_sge = 1;
+
+	local_sge.addr = (uint64_t)(uintptr_t)local_buf;
+	local_sge.len = ub_req->req.length;
+	local_sge.tseg = local_tseg;
+	local_sg.sge = &local_sge;
+	local_sg.num_sge = 1;
+
+	ub_rw_wr.src = remote_sg;
+	ub_rw_wr.dst = local_sg;
+	read_wr.opcode = URMA_OPC_READ;
+	read_wr.flag.bs.complete_enable = 1;
+	read_wr.tjetty = uqpair->target_jetty;
+	read_wr.user_ctx = (uint64_t)(uintptr_t)ub_req;
+	read_wr.rw = ub_rw_wr;
+
+	ub_req->awaiting_ub_read_completion = true;
+	ub_req->ub_state = UB_REQ_UB_STATE_WAIT_READ;
+	if (urma_post_jetty_send_wr(uqpair->jetty, &read_wr, &bad_wr) != URMA_SUCCESS) {
+		ub_req->awaiting_ub_read_completion = false;
+		ub_req->ub_state = UB_REQ_UB_STATE_NONE;
+		return -EIO;
+	}
+
+	return 0;
+}
+
+static int
+nvmf_ub_post_ub_write(struct spdk_nvmf_ub_request *ub_req, void *local_buf,
+		      urma_target_seg_t *local_tseg)
+{
+	struct spdk_nvmf_ub_qpair *uqpair = SPDK_CONTAINEROF(ub_req->req.qpair,
+		struct spdk_nvmf_ub_qpair, qpair);
+	urma_target_seg_t *remote_tseg;
+	urma_sge_t remote_sge, local_sge;
+	urma_sg_t remote_sg, local_sg;
+	urma_rw_wr_t ub_rw_wr;
+	urma_jfs_wr_t write_wr = {0};
+	urma_jfs_wr_t *bad_wr = NULL;
+
+	remote_tseg = nvmf_ub_get_remote_tseg(uqpair, ub_req->remote_addr,
+			ub_req->req.length, ub_req->remote_key);
+	if (remote_tseg == NULL) {
+		return -EFAULT;
+	}
+
+	remote_sge.addr = ub_req->remote_addr;
+	remote_sge.len = ub_req->req.length;
+	remote_sge.tseg = remote_tseg;
+	remote_sg.sge = &remote_sge;
+	remote_sg.num_sge = 1;
+
+	local_sge.addr = (uint64_t)(uintptr_t)local_buf;
+	local_sge.len = ub_req->req.length;
+	local_sge.tseg = local_tseg;
+	local_sg.sge = &local_sge;
+	local_sg.num_sge = 1;
+
+	ub_rw_wr.src = local_sg;
+	ub_rw_wr.dst = remote_sg;
+	write_wr.opcode = URMA_OPC_WRITE;
+	write_wr.flag.bs.complete_enable = 1;
+	write_wr.tjetty = uqpair->target_jetty;
+	write_wr.user_ctx = (uint64_t)(uintptr_t)ub_req;
+	write_wr.rw = ub_rw_wr;
+
+	ub_req->awaiting_ub_write_completion = true;
+	ub_req->ub_state = UB_REQ_UB_STATE_WAIT_WRITE;
+	if (urma_post_jetty_send_wr(uqpair->jetty, &write_wr, &bad_wr) != URMA_SUCCESS) {
+		ub_req->awaiting_ub_write_completion = false;
+		ub_req->ub_state = UB_REQ_UB_STATE_NONE;
+		return -EIO;
+	}
+
+	return 0;
+}
 
 static int
 nvmf_ub_repost_recv(struct spdk_nvmf_ub_qpair *uqpair, uint32_t recv_slot)
@@ -1488,6 +1804,108 @@ nvmf_ub_req_is_valid(struct spdk_nvmf_ub_qpair *uqpair,
 	       (req_addr - reqs_begin) % sizeof(*resources->reqs) == 0;
 }
 
+static bool
+nvmf_ub_response_is_valid(struct spdk_nvmf_ub_qpair *uqpair,
+			  struct spdk_nvmf_ub_response *ub_rsp)
+{
+	struct spdk_nvmf_ub_resources *resources = uqpair->resources;
+	uintptr_t rsp_addr = (uintptr_t)ub_rsp;
+	uintptr_t responses_begin;
+	uintptr_t responses_end;
+
+	if (resources == NULL) {
+		return false;
+	}
+
+	responses_begin = (uintptr_t)resources->responses;
+	responses_end = (uintptr_t)(resources->responses + resources->depth);
+	return rsp_addr >= responses_begin && rsp_addr < responses_end &&
+	       (rsp_addr - responses_begin) % sizeof(*resources->responses) == 0;
+}
+
+static void
+nvmf_ub_response_put(struct spdk_nvmf_ub_qpair *uqpair,
+		     struct spdk_nvmf_ub_response *ub_rsp)
+{
+	if (!ub_rsp->in_use) {
+		SPDK_ERRLOG("Attempted to release free UB response %p on qid %u\n",
+			    ub_rsp, uqpair->qid);
+		return;
+	}
+
+	ub_rsp->in_use = false;
+	STAILQ_INSERT_TAIL(&uqpair->resources->free_response_queue, ub_rsp, link);
+}
+
+static struct spdk_nvmf_ub_response *
+nvmf_ub_response_get(struct spdk_nvmf_ub_qpair *uqpair)
+{
+	struct spdk_nvmf_ub_resources *resources = uqpair->resources;
+	struct spdk_nvmf_ub_response *ub_rsp;
+
+	ub_rsp = STAILQ_FIRST(&resources->free_response_queue);
+	if (ub_rsp == NULL) {
+		return NULL;
+	}
+
+	STAILQ_REMOVE_HEAD(&resources->free_response_queue, link);
+	assert(!ub_rsp->in_use);
+	ub_rsp->in_use = true;
+	return ub_rsp;
+}
+
+static void
+nvmf_ub_queue_pending_response(struct spdk_nvmf_ub_request *ub_req)
+{
+	struct spdk_nvmf_ub_qpair *uqpair = SPDK_CONTAINEROF(ub_req->req.qpair,
+		struct spdk_nvmf_ub_qpair, qpair);
+	struct spdk_nvmf_ub_resources *resources = uqpair->resources;
+
+	assert(ub_req->in_use);
+	assert(ub_req->ub_state == UB_REQ_UB_STATE_NONE);
+	assert(resources->pending_response_count < resources->depth);
+	ub_req->ub_state = UB_REQ_UB_STATE_WAIT_RESPONSE;
+	STAILQ_INSERT_TAIL(&resources->pending_response_queue, ub_req, link);
+	resources->pending_response_count++;
+	resources->pending_response_high_watermark = spdk_max(
+			resources->pending_response_high_watermark,
+			resources->pending_response_count);
+}
+
+static struct spdk_nvmf_ub_request *
+nvmf_ub_pending_response_get(struct spdk_nvmf_ub_qpair *uqpair)
+{
+	struct spdk_nvmf_ub_resources *resources = uqpair->resources;
+	struct spdk_nvmf_ub_request *ub_req;
+
+	ub_req = STAILQ_FIRST(&resources->pending_response_queue);
+	if (ub_req == NULL) {
+		return NULL;
+	}
+
+	STAILQ_REMOVE_HEAD(&resources->pending_response_queue, link);
+	assert(resources->pending_response_count > 0);
+	resources->pending_response_count--;
+	assert(ub_req->ub_state == UB_REQ_UB_STATE_WAIT_RESPONSE);
+	ub_req->ub_state = UB_REQ_UB_STATE_NONE;
+	return ub_req;
+}
+
+static void
+nvmf_ub_pending_response_remove(struct spdk_nvmf_ub_request *ub_req)
+{
+	struct spdk_nvmf_ub_qpair *uqpair = SPDK_CONTAINEROF(ub_req->req.qpair,
+		struct spdk_nvmf_ub_qpair, qpair);
+	struct spdk_nvmf_ub_resources *resources = uqpair->resources;
+
+	assert(ub_req->ub_state == UB_REQ_UB_STATE_WAIT_RESPONSE);
+	STAILQ_REMOVE(&resources->pending_response_queue, ub_req,
+			spdk_nvmf_ub_request, link);
+	assert(resources->pending_response_count > 0);
+	resources->pending_response_count--;
+	ub_req->ub_state = UB_REQ_UB_STATE_NONE;
+}
+
 static void
 nvmf_ub_req_put(struct spdk_nvmf_ub_request *ub_req)
 {
@@ -1502,21 +1920,26 @@ nvmf_ub_req_put(struct spdk_nvmf_ub_request *ub_req)
 			    ub_req, uqpair->qid);
 		return;
 	}
+	if (ub_req->ub_state == UB_REQ_UB_STATE_WAIT_RESPONSE) {
+		nvmf_ub_pending_response_remove(ub_req);
+	}
 
 	recv_slot = ub_req->recv_slot;
 	ub_req->ub_state = UB_REQ_UB_STATE_NONE;
 	ub_req->awaiting_ub_read_completion = false;
 	ub_req->awaiting_ub_write_completion = false;
+	ub_req->zcopy_abort = false;
 	ub_req->recv_slot = NVMF_UB_INVALID_RECV_SLOT;
 	ub_req->in_use = false;
 	req->cmd = NULL;
 	req->iovcnt = 0;
 	req->length = 0;
+	req->zcopy_bdev_io = NULL;
+	req->zcopy_phase = NVMF_ZCOPY_PHASE_NONE;
 
 	STAILQ_INSERT_TAIL(&resources->free_queue, ub_req, link);
 
-	/* A receive slot and a request are one credit.  Do not repost the
-	 * receive until the response SEND has completed and the request is free. */
+	/* Return the request and its receive credit together. */
 	if (recv_slot != NVMF_UB_INVALID_RECV_SLOT &&
 	    nvmf_ub_repost_recv(uqpair, recv_slot) != 0) {
 		spdk_nvmf_qpair_disconnect(&uqpair->qpair);
@@ -1529,6 +1952,21 @@ nvmf_ub_req_abort(struct spdk_nvmf_ub_request *ub_req)
 	/* The qpair is being disconnected, so do not expose another receive
 	 * credit while releasing local request resources. */
 	ub_req->recv_slot = NVMF_UB_INVALID_RECV_SLOT;
+	ub_req->zcopy_abort = true;
+	if (ub_req->req.zcopy_phase == NVMF_ZCOPY_PHASE_EXECUTE &&
+	    ub_req->req.zcopy_bdev_io != NULL) {
+		/* An outstanding UB operation still owns this buffer.  Its completion
+		 * will release the zcopy I/O after the device no longer references it. */
+		if (ub_req->ub_state != UB_REQ_UB_STATE_NONE) {
+			return;
+		}
+		spdk_nvmf_request_zcopy_end(&ub_req->req, false);
+		return;
+	}
+	if (ub_req->req.zcopy_phase == NVMF_ZCOPY_PHASE_INIT ||
+	    ub_req->req.zcopy_phase == NVMF_ZCOPY_PHASE_END_PENDING) {
+		return;
+	}
 	nvmf_ub_req_put(ub_req);
 }
 
@@ -1539,6 +1977,20 @@ nvmf_ub_req_free(struct spdk_nvmf_request *req)
 
 	ub_req = SPDK_CONTAINEROF(req, struct spdk_nvmf_ub_request, req);
 	if (ub_req->in_use) {
+		if (req->zcopy_phase == NVMF_ZCOPY_PHASE_INIT ||
+		    req->zcopy_phase == NVMF_ZCOPY_PHASE_EXECUTE ||
+		    req->zcopy_phase == NVMF_ZCOPY_PHASE_END_PENDING) {
+			ub_req->zcopy_abort = true;
+			if (req->qpair->state != SPDK_NVMF_QPAIR_ENABLED) {
+				ub_req->recv_slot = NVMF_UB_INVALID_RECV_SLOT;
+			}
+			if (req->zcopy_phase == NVMF_ZCOPY_PHASE_EXECUTE &&
+			    req->zcopy_bdev_io != NULL &&
+			    ub_req->ub_state == UB_REQ_UB_STATE_NONE) {
+				spdk_nvmf_request_zcopy_end(req, false);
+			}
+			return;
+		}
 		if (req->qpair->state == SPDK_NVMF_QPAIR_ENABLED) {
 			nvmf_ub_req_put(ub_req);
 		} else {
@@ -1606,6 +2058,7 @@ nvmf_ub_handle_cmd(struct spdk_nvmf_ub_qpair *uqpair, uint32_t recv_slot)
 	ub_req->remote_key = 0;
 	ub_req->awaiting_ub_read_completion = false;
 	ub_req->awaiting_ub_write_completion = false;
+	ub_req->zcopy_abort = false;
 
 	/* Parse SGL to determine data buffer location */
 	sgl = &nvmf_req->cmd->nvme_cmd.dptr.sgl1;
@@ -1659,6 +2112,14 @@ nvmf_ub_handle_cmd(struct spdk_nvmf_ub_qpair *uqpair, uint32_t recv_slot)
 				      local_buf, sgl->address, sgl->keyed.length, sgl->keyed.key,
 				      nvmf_req->xfer);
 
+			if ((nvmf_req->xfer == SPDK_NVME_DATA_HOST_TO_CONTROLLER ||
+			     nvmf_req->xfer == SPDK_NVME_DATA_CONTROLLER_TO_HOST) &&
+			    nvmf_ctrlr_use_zcopy(nvmf_req)) {
+				nvmf_req->data_from_pool = false;
+				spdk_nvmf_request_zcopy_start(nvmf_req);
+				return;
+			}
+
 			if (nvmf_req->xfer == SPDK_NVME_DATA_CONTROLLER_TO_HOST) {
 				spdk_nvmf_request_exec(nvmf_req);
 				return;
@@ -1667,69 +2128,14 @@ nvmf_ub_handle_cmd(struct spdk_nvmf_ub_qpair *uqpair, uint32_t recv_slot)
 			/* If this is a Host-to-Controller transfer, we need to UB READ the data
 			 * from client's remote memory before executing the command. */
 			if (nvmf_req->xfer == SPDK_NVME_DATA_HOST_TO_CONTROLLER) {
-				urma_target_seg_t *remote_tseg;
-
-				/* Post UB READ to fetch data from client */
-				remote_tseg = nvmf_ub_get_remote_tseg(uqpair, sgl->address,
-								    sgl->keyed.length, sgl->keyed.key);
-				if (remote_tseg == NULL) {
-					SPDK_ERRLOG("Failed to import remote segment for qid %u\n", uqpair->qid);
-					nvmf_req->rsp->nvme_cpl.cid = nvmf_req->cmd->nvme_cmd.cid;
-					nvmf_req->rsp->nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
-					nvmf_ub_post_send_response(ub_req);
-					return;
-				}
-
-				urma_sg_t dst_sg = {
-					.sge = &(urma_sge_t){
-						.addr = sgl->address,
-						.len = sgl->keyed.length,
-						.tseg = remote_tseg
-					},
-					.num_sge = 1
-				};
-				urma_sg_t src_sg = {
-					.sge = &(urma_sge_t){
-						.addr = (uint64_t)(uintptr_t)local_buf,
-						.len = sgl->keyed.length,
-						.tseg = uqpair->local_tseg
-					},
-					.num_sge = 1
-				};
-
-				urma_rw_wr_t ub_rw_wr = {
-					.src = dst_sg,
-					.dst = src_sg
-				};
-
-				ub_req->awaiting_ub_read_completion = true;
-				ub_req->ub_state = UB_REQ_UB_STATE_WAIT_READ;
-				urma_jfs_wr_t read_wr = {
-					.opcode = URMA_OPC_READ,
-					.flag.bs.complete_enable = 1,
-					.tjetty = uqpair->target_jetty,
-					.user_ctx = (uint64_t)(uintptr_t)ub_req,
-					.rw = ub_rw_wr,
-					.next = NULL
-				};
-				urma_jfs_wr_t *bad_wr = NULL;
-
-				SPDK_DEBUGLOG(ub, "Posting UB READ: remote_addr=0x%" PRIx64
-					      ", local_buf=0x%" PRIx64 ", len=%u, key=0x%x\n",
-					      sgl->address, src_sg.sge->addr, sgl->keyed.length,
-					      sgl->keyed.key);
-
-				if (urma_post_jetty_send_wr(uqpair->jetty, &read_wr, &bad_wr) != URMA_SUCCESS) {
+				if (nvmf_ub_post_ub_read(ub_req, local_buf,
+							  uqpair->local_tseg) != 0) {
 					SPDK_ERRLOG("Failed to post UB READ WR\n");
-					ub_req->awaiting_ub_read_completion = false;
-					ub_req->ub_state = UB_REQ_UB_STATE_NONE;
 					nvmf_req->rsp->nvme_cpl.cid = nvmf_req->cmd->nvme_cmd.cid;
 					nvmf_req->rsp->nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 					nvmf_ub_post_send_response(ub_req);
 					return;
 				}
-
-				/* Don't execute request yet - wait for UB READ to complete */
 				return;
 			}
 		}
@@ -1820,15 +2226,23 @@ nvmf_ub_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 			for (i = 0; i < (uint32_t)npolled; i++) {
 				urma_cr_t *cr = &ugroup->crs[i];
 				struct spdk_nvmf_ub_request *completed_ub_req;
+				struct spdk_nvmf_ub_response *completed_ub_rsp;
 
 				if (cr->status != URMA_CR_SUCCESS) {
 					SPDK_ERRLOG("UB completion failed: qid=%u status=%d opcode=%d s_r=%d "
 						    "user_ctx=0x%" PRIx64 "\n", uqpair->qid, cr->status,
 						    cr->opcode, cr->flag.bs.s_r, cr->user_ctx);
 					if (cr->flag.bs.s_r == 0) {
+						completed_ub_rsp = (struct spdk_nvmf_ub_response *)(uintptr_t)cr->user_ctx;
 						completed_ub_req = (struct spdk_nvmf_ub_request *)(uintptr_t)cr->user_ctx;
-						if (nvmf_ub_req_is_valid(uqpair, completed_ub_req) &&
+						if (nvmf_ub_response_is_valid(uqpair, completed_ub_rsp) &&
+						    completed_ub_rsp->in_use) {
+							nvmf_ub_response_put(uqpair, completed_ub_rsp);
+						} else if (nvmf_ub_req_is_valid(uqpair, completed_ub_req) &&
 						    completed_ub_req->in_use) {
+							completed_ub_req->ub_state = UB_REQ_UB_STATE_NONE;
+							completed_ub_req->awaiting_ub_read_completion = false;
+							completed_ub_req->awaiting_ub_write_completion = false;
 							nvmf_ub_req_abort(completed_ub_req);
 						}
 					}
@@ -1855,46 +2269,86 @@ nvmf_ub_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 					nvmf_ub_handle_cmd(uqpair, (uint32_t)cr->user_ctx);
 
 				} else {
-					completed_ub_req = (struct spdk_nvmf_ub_request *)(uintptr_t)cr->user_ctx;
-					if (!nvmf_ub_req_is_valid(uqpair, completed_ub_req) ||
-					    !completed_ub_req->in_use) {
-						SPDK_ERRLOG("Invalid UB request completion: qid=%u req=%p opcode=%d\n",
-							    uqpair->qid, completed_ub_req, cr->opcode);
-						spdk_nvmf_qpair_disconnect(&uqpair->qpair);
-						qpair_failed = true;
-						break;
-					}
-					SPDK_DEBUGLOG(ub, "UB completion: qid=%u req=%p opcode=%d state=%d\n",
-						      uqpair->qid, completed_ub_req, cr->opcode,
-						      completed_ub_req->ub_state);
+					completed_ub_rsp = (struct spdk_nvmf_ub_response *)(uintptr_t)cr->user_ctx;
+					if (nvmf_ub_response_is_valid(uqpair, completed_ub_rsp)) {
+						if (!completed_ub_rsp->in_use) {
+							SPDK_ERRLOG("Invalid UB response completion: qid=%u rsp=%p opcode=%d\n",
+								    uqpair->qid, completed_ub_rsp, cr->opcode);
+							spdk_nvmf_qpair_disconnect(&uqpair->qpair);
+							qpair_failed = true;
+							break;
+						}
+						completed_ub_req = nvmf_ub_pending_response_get(uqpair);
+						if (completed_ub_req == NULL) {
+							nvmf_ub_response_put(uqpair, completed_ub_rsp);
+						} else if (nvmf_ub_post_send_response_ctx(completed_ub_req,
+								   completed_ub_rsp) != 0) {
+							qpair_failed = true;
+							break;
+						}
+					} else {
+						completed_ub_req = (struct spdk_nvmf_ub_request *)(uintptr_t)cr->user_ctx;
+						if (!nvmf_ub_req_is_valid(uqpair, completed_ub_req) ||
+						    !completed_ub_req->in_use) {
+							SPDK_ERRLOG("Invalid UB request completion: qid=%u req=%p opcode=%d\n",
+								    uqpair->qid, completed_ub_req, cr->opcode);
+							spdk_nvmf_qpair_disconnect(&uqpair->qpair);
+							qpair_failed = true;
+							break;
+						}
+						SPDK_DEBUGLOG(ub, "UB completion: qid=%u req=%p opcode=%d state=%d\n",
+							      uqpair->qid, completed_ub_req, cr->opcode,
+							      completed_ub_req->ub_state);
 
-					switch (completed_ub_req->ub_state) {
-					case UB_REQ_UB_STATE_WAIT_READ:
-						/* UB READ completed - now execute the request */
-						completed_ub_req->awaiting_ub_read_completion = false;
-						completed_ub_req->ub_state = UB_REQ_UB_STATE_NONE;
-						spdk_nvmf_request_exec(&completed_ub_req->req);
-						break;
+						switch (completed_ub_req->ub_state) {
+						case UB_REQ_UB_STATE_WAIT_READ:
+							completed_ub_req->awaiting_ub_read_completion = false;
+							completed_ub_req->ub_state = UB_REQ_UB_STATE_NONE;
+							if (completed_ub_req->zcopy_abort ||
+							    __atomic_load_n(&uqpair->qpair.disconnect_started,
+									    __ATOMIC_RELAXED)) {
+								if (completed_ub_req->req.zcopy_phase ==
+								    NVMF_ZCOPY_PHASE_EXECUTE) {
+									spdk_nvmf_request_zcopy_end(&completed_ub_req->req, false);
+								} else {
+									nvmf_ub_req_abort(completed_ub_req);
+								}
+							} else if (completed_ub_req->req.zcopy_phase ==
+								   NVMF_ZCOPY_PHASE_EXECUTE) {
+								spdk_nvmf_request_zcopy_end(&completed_ub_req->req, true);
+							} else {
+								spdk_nvmf_request_exec(&completed_ub_req->req);
+							}
+							break;
 
-					case UB_REQ_UB_STATE_WAIT_WRITE:
-						/* UB WRITE completed - now post SEND response */
-						completed_ub_req->awaiting_ub_write_completion = false;
-						completed_ub_req->ub_state = UB_REQ_UB_STATE_NONE;
-						nvmf_ub_post_send_response(completed_ub_req);
-						break;
+						case UB_REQ_UB_STATE_WAIT_WRITE:
+							completed_ub_req->awaiting_ub_write_completion = false;
+							completed_ub_req->ub_state = UB_REQ_UB_STATE_NONE;
+							if (completed_ub_req->zcopy_abort ||
+							    __atomic_load_n(&uqpair->qpair.disconnect_started,
+									    __ATOMIC_RELAXED)) {
+								if (completed_ub_req->req.zcopy_phase ==
+								    NVMF_ZCOPY_PHASE_EXECUTE) {
+									spdk_nvmf_request_zcopy_end(&completed_ub_req->req, false);
+								} else {
+									nvmf_ub_req_abort(completed_ub_req);
+								}
+							} else if (completed_ub_req->req.zcopy_phase ==
+								   NVMF_ZCOPY_PHASE_EXECUTE) {
+								spdk_nvmf_request_zcopy_end(&completed_ub_req->req, false);
+							} else {
+								nvmf_ub_post_send_response(completed_ub_req);
+							}
+							break;
 
-					case UB_REQ_UB_STATE_WAIT_SEND:
-						/* Release both the request and its receive credit. */
-						nvmf_ub_req_put(completed_ub_req);
-						break;
-
-					default:
-						SPDK_ERRLOG("Unexpected completion for req %p in state %d\n",
-							    completed_ub_req, completed_ub_req->ub_state);
-						nvmf_ub_req_abort(completed_ub_req);
-						spdk_nvmf_qpair_disconnect(&uqpair->qpair);
-						qpair_failed = true;
-						break;
+						default:
+							SPDK_ERRLOG("Unexpected completion for req %p in state %d\n",
+								    completed_ub_req, completed_ub_req->ub_state);
+							nvmf_ub_req_abort(completed_ub_req);
+							spdk_nvmf_qpair_disconnect(&uqpair->qpair);
+							qpair_failed = true;
+							break;
+						}
 					}
 				}
 
@@ -1916,20 +2370,21 @@ nvmf_ub_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 	return total_completions;
 }
 
-/*
- * Post the SEND response capsule to the host.
- * Sets ub_state to WAIT_SEND; the request is returned to the free
- * queue only after the SEND completion arrives in poll_group_poll().
- */
-static void
-nvmf_ub_post_send_response(struct spdk_nvmf_ub_request *ub_req)
+static int
+nvmf_ub_post_send_response_ctx(struct spdk_nvmf_ub_request *ub_req,
+			       struct spdk_nvmf_ub_response *ub_rsp)
 {
 	struct spdk_nvmf_request *req = &ub_req->req;
 	struct spdk_nvmf_ub_qpair *uqpair = SPDK_CONTAINEROF(req->qpair,
 		struct spdk_nvmf_ub_qpair, qpair);
+	void *resp;
 
-	void *resp = (uint8_t *)uqpair->va + uqpair->rsp_offset +
-		    (size_t)ub_req->buf_idx * sizeof(union nvmf_c2h_msg);
+	assert(ub_req->in_use);
+	assert(ub_req->ub_state == UB_REQ_UB_STATE_NONE);
+	assert(ub_rsp->in_use);
+
+	resp = (uint8_t *)uqpair->va + uqpair->rsp_offset +
+	       (size_t)ub_rsp->buf_idx * sizeof(union nvmf_c2h_msg);
 	memcpy(resp, req->rsp, sizeof(union nvmf_c2h_msg));
 
 	urma_sge_t src_sge = {
@@ -1951,25 +2406,54 @@ nvmf_ub_post_send_response(struct spdk_nvmf_ub_request *ub_req)
 		.opcode = URMA_OPC_SEND,
 		.flag.bs.complete_enable = 1,
 		.tjetty = uqpair->target_jetty,
-		.user_ctx = (uint64_t)(uintptr_t)ub_req,
+		.user_ctx = (uint64_t)(uintptr_t)ub_rsp,
 		.send = send_wr,
 		.next = NULL
 	};
 	urma_jfs_wr_t *bad_wr = NULL;
 
-	/* Set the state before posting so even an immediately visible
-	 * completion observes the correct request state. */
-	ub_req->ub_state = UB_REQ_UB_STATE_WAIT_SEND;
+	/* The completion has been copied to storage owned by ub_rsp.  Return the
+	 * request and receive credit before making the response visible. */
+	nvmf_ub_req_put(ub_req);
+	if (__atomic_load_n(&uqpair->qpair.disconnect_started, __ATOMIC_RELAXED)) {
+		nvmf_ub_response_put(uqpair, ub_rsp);
+		return -ENOTCONN;
+	}
+
 	if (urma_post_jetty_send_wr(uqpair->jetty, &jfs_wr, &bad_wr) != URMA_SUCCESS) {
 		SPDK_ERRLOG("Failed to post UB response SEND for qid %u, req=%p\n",
 			    uqpair->qid, req);
-		ub_req->ub_state = UB_REQ_UB_STATE_NONE;
-		nvmf_ub_req_abort(ub_req);
+		nvmf_ub_response_put(uqpair, ub_rsp);
 		spdk_nvmf_qpair_disconnect(&uqpair->qpair);
+		return -EIO;
 	} else {
 		SPDK_DEBUGLOG(ub, "Posted UB response SEND for qid %u, req=%p\n",
 			      uqpair->qid, req);
 	}
+
+	return 0;
+}
+
+/* Post the SEND response capsule or queue it until a context is available. */
+static void
+nvmf_ub_post_send_response(struct spdk_nvmf_ub_request *ub_req)
+{
+	struct spdk_nvmf_ub_qpair *uqpair = SPDK_CONTAINEROF(ub_req->req.qpair,
+		struct spdk_nvmf_ub_qpair, qpair);
+	struct spdk_nvmf_ub_response *ub_rsp;
+
+	if (__atomic_load_n(&uqpair->qpair.disconnect_started, __ATOMIC_RELAXED)) {
+		nvmf_ub_req_abort(ub_req);
+		return;
+	}
+
+	ub_rsp = nvmf_ub_response_get(uqpair);
+	if (ub_rsp == NULL) {
+		nvmf_ub_queue_pending_response(ub_req);
+		return;
+	}
+
+	nvmf_ub_post_send_response_ctx(ub_req, ub_rsp);
 }
 
 static void
@@ -1977,101 +2461,140 @@ nvmf_ub_req_complete(struct spdk_nvmf_request *req)
 {
 	struct spdk_nvmf_ub_request	*ub_req = SPDK_CONTAINEROF(req,
 		struct spdk_nvmf_ub_request, req);
-
-	struct spdk_nvmf_ub_qpair     *uqpair = SPDK_CONTAINEROF(ub_req->req.qpair,
+	struct spdk_nvmf_ub_qpair	*uqpair = SPDK_CONTAINEROF(req->qpair,
 		struct spdk_nvmf_ub_qpair, qpair);
-
-	SPDK_DEBUGLOG(ub, "UB req_complete: qid=%u, xfer=%d, iovcnt=%u, length=%u\n",
-		      uqpair->qid, req->xfer, req->iovcnt, req->length);
-
 	struct spdk_nvmf_ub_resources *resources = uqpair->resources;
+	urma_target_seg_t *local_tseg;
+	void *data_buf;
+	int rc;
+
+	SPDK_DEBUGLOG(ub, "UB req_complete: qid=%u, xfer=%d, iovcnt=%u, length=%u, zcopy=%u\n",
+		      uqpair->qid, req->xfer, req->iovcnt, req->length, req->zcopy_phase);
+
 	ub_req->buf_idx = ub_req - resources->reqs;
 
-	if (req->xfer == SPDK_NVME_DATA_CONTROLLER_TO_HOST) {
-		if (req->rsp->nvme_cpl.status.sct != SPDK_NVME_SCT_GENERIC ||
-		    req->rsp->nvme_cpl.status.sc != SPDK_NVME_SC_SUCCESS) {
-			nvmf_ub_post_send_response(ub_req);
+	if (__atomic_load_n(&uqpair->qpair.disconnect_started, __ATOMIC_RELAXED)) {
+		nvmf_ub_req_abort(ub_req);
+		return;
+	}
+	if (ub_req->zcopy_abort) {
+		if (req->zcopy_phase == NVMF_ZCOPY_PHASE_EXECUTE &&
+		    req->zcopy_bdev_io != NULL) {
+			if (ub_req->ub_state == UB_REQ_UB_STATE_NONE) {
+				spdk_nvmf_request_zcopy_end(req, false);
+			}
 			return;
 		}
-
-		if (req->iovcnt != 1 || req->iov[0].iov_len > SPDK_NVMF_UB_DEFAULT_MAX_IO_SIZE) {
-			SPDK_ERRLOG("Invalid C2H buffer for qid %u: iovcnt=%u len=%zu\n",
-				    uqpair->qid, req->iovcnt,
-				    req->iovcnt == 0 ? 0 : req->iov[0].iov_len);
-			req->rsp->nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
-			nvmf_ub_post_send_response(ub_req);
+		if (req->zcopy_phase == NVMF_ZCOPY_PHASE_INIT ||
+		    req->zcopy_phase == NVMF_ZCOPY_PHASE_END_PENDING) {
 			return;
 		}
-
-		/* Post UB WRITE to push data to host.  The SEND response
-		 * capsule will be posted after the WRITE completes, which
-		 * is handled in poll_group_poll().  No busy-waiting here. */
-		urma_target_seg_t *remote_tseg = nvmf_ub_get_remote_tseg(
-			uqpair, req->cmd->nvme_cmd.dptr.sgl1.address,
-			req->cmd->nvme_cmd.dptr.sgl1.keyed.length,
-			req->cmd->nvme_cmd.dptr.sgl1.keyed.key);
-		if (remote_tseg == NULL) {
-			SPDK_ERRLOG("Failed to import remote segment for qid %u\n", uqpair->qid);
-			req->rsp->nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
-			nvmf_ub_post_send_response(ub_req);
-			return;
-		}
-
-		void *data_buf = (uint8_t *)uqpair->va + uqpair->data_offset +
-				 (size_t)ub_req->buf_idx * SPDK_NVMF_UB_DEFAULT_MAX_IO_SIZE;
-		if (req->iov[0].iov_base != data_buf) {
-			memcpy(data_buf, req->iov[0].iov_base, req->iov[0].iov_len);
-		}
-
-		urma_sg_t dst_sg = {
-			.sge = &(urma_sge_t){
-				.addr = req->cmd->nvme_cmd.dptr.sgl1.address,
-				.len = req->cmd->nvme_cmd.dptr.sgl1.keyed.length,
-				.tseg = remote_tseg
-			},
-			.num_sge = 1
-		};
-		urma_sg_t src_sg = {
-			.sge = &(urma_sge_t){
-				.addr = (uint64_t)(uintptr_t)data_buf,
-				.len = req->cmd->nvme_cmd.dptr.sgl1.keyed.length,
-				.tseg = uqpair->local_tseg
-			},
-			.num_sge = 1
-		};
-
-		urma_rw_wr_t ub_rw_wr = {
-			.src = src_sg,
-			.dst = dst_sg
-		};
-
-		urma_jfs_wr_t write_wr = {
-			.opcode = URMA_OPC_WRITE,
-			.flag.bs.complete_enable = 1,
-			.tjetty = uqpair->target_jetty,
-			.user_ctx = (uint64_t)(uintptr_t)ub_req,
-			.rw = ub_rw_wr,
-			.next = NULL
-		};
-		urma_jfs_wr_t *bad_wr = NULL;
-		ub_req->awaiting_ub_write_completion = true;
-		ub_req->ub_state = UB_REQ_UB_STATE_WAIT_WRITE;
-
-		if (urma_post_jetty_send_wr(uqpair->jetty, &write_wr, &bad_wr) != URMA_SUCCESS) {
-			SPDK_ERRLOG("Failed to post UB WRITE for qid %u, req=%p\n", uqpair->qid, req);
-			ub_req->awaiting_ub_write_completion = false;
-			ub_req->ub_state = UB_REQ_UB_STATE_NONE;
-			req->rsp->nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
-			nvmf_ub_post_send_response(ub_req);
-		} else {
-			SPDK_DEBUGLOG(ub, "Posted UB WRITE for qid %u, req=%p\n", uqpair->qid, req);
-		}
-		/* Return now; SEND will be posted after WRITE completion
-		 * arrives in poll_group_poll(). */
+		nvmf_ub_req_put(ub_req);
 		return;
 	}
 
-	/* Non-C2H: just post the SEND response capsule. */
+	switch (req->zcopy_phase) {
+	case NVMF_ZCOPY_PHASE_INIT_FAILED:
+	case NVMF_ZCOPY_PHASE_COMPLETE:
+		nvmf_ub_post_send_response(ub_req);
+		return;
+	case NVMF_ZCOPY_PHASE_EXECUTE:
+		if (spdk_nvme_cpl_is_error(&req->rsp->nvme_cpl)) {
+			spdk_nvmf_request_zcopy_end(req, false);
+			return;
+		}
+
+		if (req->iovcnt != 1 || req->iov[0].iov_base == NULL ||
+		    req->iov[0].iov_len < req->length) {
+			SPDK_ERRLOG("Unsupported UB zcopy buffer for qid %u: iovcnt=%u len=%zu request=%u\n",
+				    uqpair->qid, req->iovcnt,
+				    req->iovcnt == 0 ? 0 : req->iov[0].iov_len, req->length);
+			req->rsp->nvme_cpl.status.sct = SPDK_NVME_SCT_GENERIC;
+			req->rsp->nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+			spdk_nvmf_request_zcopy_end(req, false);
+			return;
+		}
+
+		local_tseg = nvmf_ub_get_local_tseg(uqpair, req->iov[0].iov_base,
+						   req->length);
+		if (local_tseg == NULL) {
+			uqpair->zcopy_map_failures++;
+			SPDK_ERRLOG("UB zcopy buffer %p/%u is not registered on qid %u\n",
+				    req->iov[0].iov_base, req->length, uqpair->qid);
+			req->rsp->nvme_cpl.status.sct = SPDK_NVME_SCT_GENERIC;
+			req->rsp->nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+			spdk_nvmf_request_zcopy_end(req, false);
+			return;
+		}
+
+		if (req->xfer == SPDK_NVME_DATA_HOST_TO_CONTROLLER) {
+			rc = nvmf_ub_post_ub_read(ub_req, req->iov[0].iov_base, local_tseg);
+			if (rc == 0) {
+				uqpair->zcopy_write_ios++;
+				return;
+			}
+		} else if (req->xfer == SPDK_NVME_DATA_CONTROLLER_TO_HOST) {
+			rc = nvmf_ub_post_ub_write(ub_req, req->iov[0].iov_base, local_tseg);
+			if (rc == 0) {
+				uqpair->zcopy_read_ios++;
+				return;
+			}
+		} else {
+			rc = -EINVAL;
+		}
+
+		SPDK_ERRLOG("Failed to post UB zcopy data transfer for qid %u: %s\n",
+			    uqpair->qid, spdk_strerror(-rc));
+		req->rsp->nvme_cpl.status.sct = SPDK_NVME_SCT_GENERIC;
+		req->rsp->nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+		spdk_nvmf_request_zcopy_end(req, false);
+		return;
+	case NVMF_ZCOPY_PHASE_INIT:
+	case NVMF_ZCOPY_PHASE_END_PENDING:
+		SPDK_ERRLOG("Unexpected UB zcopy completion phase %u on qid %u\n",
+			    req->zcopy_phase, uqpair->qid);
+		spdk_nvmf_qpair_disconnect(&uqpair->qpair);
+		return;
+	case NVMF_ZCOPY_PHASE_NONE:
+		break;
+	default:
+		SPDK_UNREACHABLE();
+	}
+
+	if (req->xfer == SPDK_NVME_DATA_CONTROLLER_TO_HOST) {
+		if (spdk_nvme_cpl_is_error(&req->rsp->nvme_cpl)) {
+			nvmf_ub_post_send_response(ub_req);
+			return;
+		}
+
+		if (req->iovcnt != 1 || req->iov[0].iov_len < req->length ||
+		    req->length > SPDK_NVMF_UB_DEFAULT_MAX_IO_SIZE) {
+			SPDK_ERRLOG("Invalid C2H buffer for qid %u: iovcnt=%u len=%zu\n",
+				    uqpair->qid, req->iovcnt,
+				    req->iovcnt == 0 ? 0 : req->iov[0].iov_len);
+			req->rsp->nvme_cpl.status.sct = SPDK_NVME_SCT_GENERIC;
+			req->rsp->nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+			nvmf_ub_post_send_response(ub_req);
+			return;
+		}
+
+		data_buf = (uint8_t *)uqpair->va + uqpair->data_offset +
+			   (size_t)ub_req->buf_idx * SPDK_NVMF_UB_DEFAULT_MAX_IO_SIZE;
+		if (req->iov[0].iov_base != data_buf) {
+			memcpy(data_buf, req->iov[0].iov_base, req->length);
+			uqpair->read_copy_ios++;
+			uqpair->read_copy_bytes += req->length;
+		}
+
+		if (nvmf_ub_post_ub_write(ub_req, data_buf, uqpair->local_tseg) != 0) {
+			SPDK_ERRLOG("Failed to post UB WRITE for qid %u, req=%p\n", uqpair->qid, req);
+			req->rsp->nvme_cpl.status.sct = SPDK_NVME_SCT_GENERIC;
+			req->rsp->nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+			nvmf_ub_post_send_response(ub_req);
+		}
+		return;
+	}
+
 	nvmf_ub_post_send_response(ub_req);
 }
 
@@ -2080,12 +2603,9 @@ nvmf_ub_qpair_get_listen_trid(struct spdk_nvmf_qpair *qpair,
 			       struct spdk_nvme_transport_id *trid)
 {
 	struct spdk_nvmf_ub_qpair *uqpair;
-	struct spdk_nvmf_ub_transport *utransport;
 
 	uqpair = SPDK_CONTAINEROF(qpair, struct spdk_nvmf_ub_qpair, qpair);
-	utransport = nvmf_ub_get_transport(uqpair->qpair.transport);
-
-	memcpy(trid, &utransport->listen_trid, sizeof(struct spdk_nvme_transport_id));
+	memcpy(trid, &uqpair->listen_trid, sizeof(*trid));
 
 	return 0;
 }

@@ -46,6 +46,7 @@
 #define MAX_IO_SIZE  (128 * 1024)
 #define NVME_UB_MAX_COMPLETIONS_PER_POLL 128
 #define NVME_UB_COMPLETION_BATCH_SIZE 32
+#define NVME_UB_MAX_SEND_SIGNAL_INTERVAL 16
 
 #define NVME_UQPAIR_ERRLOG(uqpair, format, ...) NVME_QPAIR_ERRLOG((uqpair) ? &(uqpair)->qpair : NULL, format, ##__VA_ARGS__)
 #define NVME_UQPAIR_WARNLOG(uqpair, format, ...) NVME_QPAIR_WARNLOG((uqpair) ? &(uqpair)->qpair : NULL, format, ##__VA_ARGS__)
@@ -134,7 +135,19 @@ struct nvme_ub_qpair {
     TAILQ_HEAD(, nvme_ub_request) free_reqs;
     TAILQ_HEAD(, nvme_ub_request) outstanding_reqs;
     uint16_t outstanding_requests;
-    uint16_t current_num_sends;
+
+    /* Periodically request command SEND completions to reclaim JFS entries
+     * without generating one completion for every I/O. */
+    uint16_t sends_since_signal;
+    uint16_t send_signal_interval;
+    uint64_t command_send_wrs;
+    uint64_t command_send_cqes;
+
+    /* Payload registration statistics. Updated by the qpair owner thread. */
+    uint64_t direct_payload_ios;
+    uint64_t direct_payload_bytes;
+    uint64_t staged_payload_ios;
+    uint64_t staged_payload_bytes;
 
     /* Remote target jetty for communication */
     urma_target_jetty_t *tjetty;
@@ -747,6 +760,8 @@ nvme_ub_ctrlr_create_io_qpair(struct spdk_nvme_ctrlr *ctrlr, uint16_t qid,
     uqpair->qid = qid;
     uqpair->sq_depth = opts->io_queue_size;
     uqpair->cq_depth = opts->io_queue_size;
+    uqpair->send_signal_interval = spdk_min((uint32_t)NVME_UB_MAX_SEND_SIGNAL_INTERVAL,
+                                            spdk_max(1u, (uint32_t)uqpair->num_entries / 4));
     /* A large application I/O can be split into multiple NVMe commands.  Size
      * the response receive queue for the full SQ, not the application's queue
      * depth, so every command that can be outstanding has a response credit. */
@@ -964,6 +979,16 @@ nvme_ub_ctrlr_delete_io_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qp
     struct nvme_ub_qpair *uqpair = nvme_ub_qpair(qpair);
 
     assert(qpair->id != 0); /* Use admin qpair deletion for qid 0 */
+
+    NVME_UQPAIR_NOTICELOG(uqpair,
+                          "payload stats: direct_ios=%" PRIu64 " direct_bytes=%" PRIu64
+                          " staged_ios=%" PRIu64 " staged_bytes=%" PRIu64
+                          " send_wrs=%" PRIu64 " send_cqes=%" PRIu64
+                          " signal_interval=%u\n",
+                          uqpair->direct_payload_ios, uqpair->direct_payload_bytes,
+                          uqpair->staged_payload_ios, uqpair->staged_payload_bytes,
+                          uqpair->command_send_wrs, uqpair->command_send_cqes,
+                          uqpair->send_signal_interval);
 
     /* Abort all outstanding requests */
     nvme_ub_qpair_abort_reqs(qpair, qpair->abort_dnr);
@@ -1419,22 +1444,19 @@ nvme_ub_process_cr(struct nvme_ub_qpair *poll_uqpair, const urma_cr_t *cr)
         return 1;
     }
 
-    ub_req = (struct nvme_ub_request *)(uintptr_t)cr->user_ctx;
-    if (spdk_unlikely(ub_req == NULL || ub_req->uqpair == NULL ||
-                      ub_req->uqpair != poll_uqpair)) {
-        NVME_UQPAIR_ERRLOG(poll_uqpair, "invalid SEND completion context %p\n", (void *)ub_req);
+    uqpair = (struct nvme_ub_qpair *)(uintptr_t)cr->user_ctx;
+    if (spdk_unlikely(uqpair == NULL || uqpair != poll_uqpair)) {
+        NVME_UQPAIR_ERRLOG(poll_uqpair, "invalid SEND completion context %p\n",
+                           (void *)(uintptr_t)cr->user_ctx);
         return -EPROTO;
     }
 
-    uqpair = ub_req->uqpair;
     if (spdk_unlikely(cr->opcode != URMA_CR_OPC_SEND)) {
         NVME_UQPAIR_WARNLOG(uqpair, "unexpected initiator completion opcode %d\n", cr->opcode);
         return 0;
     }
 
-    if (uqpair->current_num_sends > 0) {
-        uqpair->current_num_sends--;
-    }
+    uqpair->command_send_cqes++;
 
     return 0;
 }
@@ -1465,6 +1487,7 @@ nvme_ub_qpair_submit_request(struct spdk_nvme_qpair *qpair, volatile struct nvme
     struct nvme_ub_ctrlr *uctrlr = uqpair->uctrlr;
     struct nvme_ub_request *ub_req;
     urma_jfs_wr_t *bad_wr = NULL;
+    bool send_signaled;
     int rc;
 
     assert(uqpair != NULL);
@@ -1517,11 +1540,13 @@ nvme_ub_qpair_submit_request(struct spdk_nvme_qpair *qpair, volatile struct nvme
     /* fprintf(stderr, "DEBUG: %s nvme_opc=0x%02x -> urma_opc=%d\n", __func__, nvme_opc, urma_opc); */
 
     /* Build the URMA work request based on opcode - 参考 urma_sample.c */
+    send_signaled = uqpair->qid == 0 ||
+                    uqpair->sends_since_signal + 1 >= uqpair->send_signal_interval;
     ub_req->send_wr.opcode = urma_opc;
-    ub_req->send_wr.flag.bs.complete_enable = 1;
+    ub_req->send_wr.flag.bs.complete_enable = send_signaled;
     ub_req->send_wr.flag.bs.inline_flag = 0;
     ub_req->send_wr.tjetty = uqpair->tjetty;
-    ub_req->send_wr.user_ctx = (uint64_t)(uintptr_t)ub_req;
+    ub_req->send_wr.user_ctx = (uint64_t)(uintptr_t)uqpair;
     ub_req->send_wr.next = NULL;
 
     /* Each I/O qpair owns its registered command/payload staging buffer. */
@@ -1568,9 +1593,22 @@ nvme_ub_qpair_submit_request(struct spdk_nvme_qpair *qpair, volatile struct nvme
         return -EIO;
     }
 
-    uqpair->current_num_sends++;
-    /* fprintf(stderr, "DEBUG: %s posted successfully, urma_opc=%d, current_num_sends=%u\n",
-            __func__, urma_opc, uqpair->current_num_sends); */
+    if (req->payload_size != 0) {
+        if (ub_req->payload_staged) {
+            uqpair->staged_payload_ios++;
+            uqpair->staged_payload_bytes += req->payload_size;
+        } else {
+            uqpair->direct_payload_ios++;
+            uqpair->direct_payload_bytes += req->payload_size;
+        }
+    }
+
+    uqpair->command_send_wrs++;
+    if (send_signaled) {
+        uqpair->sends_since_signal = 0;
+    } else {
+        uqpair->sends_since_signal++;
+    }
     uctrlr->requests_sent++;
 
     return 0;
@@ -2620,6 +2658,7 @@ nvme_ub_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
     admin_uqpair->qid = 0;
     admin_uqpair->sq_depth = admin_queue_size;
     admin_uqpair->cq_depth = admin_queue_size;
+    admin_uqpair->send_signal_interval = 1;
     admin_uqpair->recv_depth = admin_uqpair->num_entries;
     admin_uqpair->payload_buffer_offset = 256 * PAGE_SIZE;
     admin_uqpair->state = NVME_UB_JETTY_STATE_RESET;
