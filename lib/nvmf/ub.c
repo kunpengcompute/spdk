@@ -676,9 +676,7 @@ nvmf_ub_register_seg(struct spdk_nvmf_ub_qpair *uqpair)
 	urma_sge_t src_sge = {0};
 	urma_sg_t src_sg = {0};
 	urma_jfr_wr_t *bad_wr = NULL;
-	void *tmp_va;
 	uint32_t i;
-	int rc;
 
 	utransport = nvmf_ub_get_transport(uqpair->qpair.transport);
 	if (utransport == NULL || utransport->urma_ctx == NULL) {
@@ -694,14 +692,17 @@ nvmf_ub_register_seg(struct spdk_nvmf_ub_qpair *uqpair)
 	uqpair->seg_len = uqpair->data_offset +
 			   (size_t)uqpair->depth * SPDK_NVMF_UB_DEFAULT_MAX_IO_SIZE;
 
-	/* Use posix_memalign instead of memalign for better portability */
-	rc = posix_memalign(&tmp_va, PAGE_SIZE, uqpair->seg_len);
-	if (rc != 0) {
-		SPDK_NOTICELOG("Failed to alloc buffer, rc=%d\n", rc);
+	/*
+	 * This segment is used both by URMA and as the payload for requests
+	 * submitted to backend devices.  Allocate it from SPDK DMA memory so
+	 * PCIe backends can translate it with spdk_vtophys().
+	 */
+	uqpair->va = spdk_dma_zmalloc(uqpair->seg_len, PAGE_SIZE, NULL);
+	if (uqpair->va == NULL) {
+		SPDK_ERRLOG("Failed to allocate DMA buffer for qid %u, len=%zu\n",
+			    uqpair->qid, uqpair->seg_len);
 		return -1;
 	}
-	uqpair->va = tmp_va;
-	memset(uqpair->va, 0, uqpair->seg_len);
 
 	seg_cfg.va = (uint64_t)(uintptr_t)uqpair->va;
 	seg_cfg.len = uqpair->seg_len;
@@ -714,7 +715,7 @@ nvmf_ub_register_seg(struct spdk_nvmf_ub_qpair *uqpair)
 	uqpair->local_tseg = urma_register_seg(utransport->urma_ctx, &seg_cfg);
 	if (uqpair->local_tseg == NULL) {
 		SPDK_ERRLOG("Failed to register UB segment for qid %u\n", uqpair->qid);
-		free(uqpair->va);
+		spdk_dma_free(uqpair->va);
 		uqpair->va = NULL;
 		return -1;
 	}
@@ -733,7 +734,7 @@ nvmf_ub_register_seg(struct spdk_nvmf_ub_qpair *uqpair)
 			SPDK_ERRLOG("Failed to post initial recv WR %u for qid %u\n", i, uqpair->qid);
 			urma_unregister_seg(uqpair->local_tseg);
 			uqpair->local_tseg = NULL;
-			free(uqpair->va);
+			spdk_dma_free(uqpair->va);
 			uqpair->va = NULL;
 			return -1;
 		}
@@ -1070,7 +1071,7 @@ nvmf_ub_qpair_destroy(struct spdk_nvmf_ub_qpair *uqpair)
 		uqpair->local_tseg = NULL;
 	}
 
-	free(uqpair->va);
+	spdk_dma_free(uqpair->va);
 	uqpair->va = NULL;
 
 	if (uqpair->resources) {
