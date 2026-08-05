@@ -110,6 +110,30 @@ Example:
 
 See NVMe Multi-Process documentation for detailed configuration.
 
+## GPUDirect RDMA payloads
+
+When SPDK is configured with both RDMA and CUDA support, `spdk_nvme_perf`
+can use CUDA device memory as the data payload for an NVMe-oF/RDMA workload:
+
+```sh
+./configure --with-rdma --with-cuda=/usr/local/cuda
+make -j
+
+sudo ./build/bin/spdk_nvme_perf \
+  -q 128 -o 131072 -w randread -t 60 -a 10 -c 0x2 \
+  --gdr --gpu-id 0 \
+  -r 'trtype:RDMA adrfam:IPv4 traddr:192.168.100.8 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1'
+```
+
+The warmup interval is recommended because CUDA allocation and dma-buf MR
+registration occur while the initial queue depth is populated. GDR mode only
+supports NVMe-oF/RDMA namespaces without metadata; PCIe, TCP, AIO and io_uring
+inputs are rejected. Remove `--gdr --gpu-id 0` to run the host-memory baseline
+with otherwise identical parameters.
+
+See `doc/gdr_perf_guide.md` for the complete Chinese setup, command and
+troubleshooting guide.
+
 ## Compiling perf on FreeBSD
 
 To use spdk_nvme_perf on FreeBSD over NVMe-oF, explicitly link userspace library of HBA. For example, on a setup with Mellanox HBA,

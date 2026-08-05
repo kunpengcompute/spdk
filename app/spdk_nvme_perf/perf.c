@@ -7,7 +7,6 @@
  */
 
 #include "spdk/stdinc.h"
-
 #include "spdk/config.h"
 #include "spdk/env.h"
 #include "spdk/fd.h"
@@ -20,6 +19,7 @@
 #include "spdk/histogram_data.h"
 #include "spdk/endian.h"
 #include "spdk/dif.h"
+#include "spdk/dma.h"
 #include "spdk/util.h"
 #include "spdk/log.h"
 #include "spdk/likely.h"
@@ -30,6 +30,11 @@
 #include "spdk/module/keyring/file.h"
 #include "spdk/event.h"
 #include "spdk/trace.h"
+
+#if defined(SPDK_CONFIG_CUDA) && defined(SPDK_CONFIG_RDMA)
+#include "spdk/gpu_dmabuf.h"
+#include <cuda.h>
+#endif
 
 #ifdef SPDK_CONFIG_URING
 #include <liburing.h>
@@ -68,6 +73,7 @@ struct ns_entry {
 		struct {
 			struct spdk_nvme_ctrlr	*ctrlr;
 			struct spdk_nvme_ns	*ns;
+			struct spdk_memory_domain *rdma_domain;
 		} nvme;
 #ifdef SPDK_CONFIG_URING
 		struct {
@@ -180,6 +186,11 @@ struct perf_task {
 	uint64_t		submit_tsc;
 	bool			is_read;
 	struct spdk_dif_ctx	dif_ctx;
+#if defined(SPDK_CONFIG_CUDA) && defined(SPDK_CONFIG_RDMA)
+	bool			gpu_buffer;
+	size_t			gpu_buffer_len;
+	struct spdk_nvme_ns_cmd_ext_io_opts ext_opts;
+#endif
 #if HAVE_LIBAIO
 	struct iocb		iocb;
 #endif
@@ -280,6 +291,16 @@ static uint8_t g_transport_tos = 0;
 static uint32_t g_rdma_srq_size;
 static struct spdk_key *g_psk = NULL, *g_dhchap = NULL, *g_dhchap_ctrlr = NULL;
 static char *g_vf_token = NULL;
+
+static bool g_gdr;
+static int g_gpu_device_id;
+static bool g_gpu_device_id_specified;
+static bool g_metadata_specified;
+
+#if defined(SPDK_CONFIG_CUDA) && defined(SPDK_CONFIG_RDMA)
+static CUcontext g_cuda_context;
+static struct spdk_memory_domain *g_gpu_memory_domain;
+#endif
 
 /* When user specifies -Q, some error messages are rate limited.  When rate
  * limited, we only print the error message every g_quiet_count times the
@@ -431,6 +452,130 @@ nvme_perf_allocate_iovs(struct perf_task *task, void *buf, uint32_t length)
 
 	return 0;
 }
+
+#if defined(SPDK_CONFIG_CUDA) && defined(SPDK_CONFIG_RDMA)
+static const char *
+perf_cuda_error_string(CUresult result)
+{
+	const char *error_string = NULL;
+
+	if (cuGetErrorString(result, &error_string) == CUDA_SUCCESS && error_string != NULL) {
+		return error_string;
+	}
+
+	return "unknown CUDA error";
+}
+
+static int
+perf_gdr_set_cuda_context(void)
+{
+	CUresult result;
+
+	result = cuCtxSetCurrent(g_cuda_context);
+	if (result != CUDA_SUCCESS) {
+		fprintf(stderr, "cuCtxSetCurrent() failed: %d (%s)\n", result,
+			perf_cuda_error_string(result));
+		return -EFAULT;
+	}
+
+	return 0;
+}
+
+static int
+perf_gdr_init(void)
+{
+	struct spdk_gpu_dmabuf_memory_domain_opts opts;
+	CUdevice device;
+	CUresult result;
+	int rc;
+
+	result = cuInit(0);
+	if (result != CUDA_SUCCESS) {
+		fprintf(stderr, "cuInit() failed: %d (%s)\n", result, perf_cuda_error_string(result));
+		return -ENODEV;
+	}
+
+	result = cuDeviceGet(&device, g_gpu_device_id);
+	if (result != CUDA_SUCCESS) {
+		fprintf(stderr, "cuDeviceGet(%d) failed: %d (%s)\n", g_gpu_device_id, result,
+			perf_cuda_error_string(result));
+		return -ENODEV;
+	}
+
+	result = cuDevicePrimaryCtxRetain(&g_cuda_context, device);
+	if (result != CUDA_SUCCESS) {
+		fprintf(stderr, "cuDevicePrimaryCtxRetain(%d) failed: %d (%s)\n", g_gpu_device_id,
+			result, perf_cuda_error_string(result));
+		return -ENODEV;
+	}
+
+	rc = perf_gdr_set_cuda_context();
+	if (rc != 0) {
+		cuDevicePrimaryCtxRelease(g_gpu_device_id);
+		g_cuda_context = NULL;
+		return rc;
+	}
+
+	spdk_gpu_dmabuf_memory_domain_get_opts(&opts);
+	opts.cuda_device_id = g_gpu_device_id;
+	opts.cuda_context = g_cuda_context;
+	rc = spdk_gpu_dmabuf_memory_domain_create(&g_gpu_memory_domain, &opts);
+	if (rc != 0) {
+		fprintf(stderr, "Failed to create GPU dma-buf memory domain: %s\n", spdk_strerror(-rc));
+		cuDevicePrimaryCtxRelease(g_gpu_device_id);
+		g_cuda_context = NULL;
+		return rc;
+	}
+
+	printf("GDR mode enabled on CUDA device %d\n", g_gpu_device_id);
+	return 0;
+}
+
+static void
+perf_gdr_fini(void)
+{
+	if (g_gpu_memory_domain != NULL) {
+		spdk_gpu_dmabuf_memory_domain_destroy(g_gpu_memory_domain);
+		g_gpu_memory_domain = NULL;
+	}
+
+	if (g_cuda_context != NULL) {
+		cuDevicePrimaryCtxRelease(g_gpu_device_id);
+		g_cuda_context = NULL;
+	}
+}
+
+static void
+nvme_free_payload(struct perf_task *task)
+{
+	CUresult result;
+
+	if (task->gpu_buffer) {
+		spdk_gpu_dmabuf_memory_domain_invalidate(g_gpu_memory_domain,
+				task->iovs[0].iov_base, task->gpu_buffer_len);
+		if (perf_gdr_set_cuda_context() == 0) {
+			result = cuMemFree((CUdeviceptr)task->iovs[0].iov_base);
+			if (result != CUDA_SUCCESS) {
+				fprintf(stderr, "cuMemFree() failed: %d (%s)\n", result,
+					perf_cuda_error_string(result));
+			}
+		}
+	} else {
+		spdk_dma_free(task->iovs[0].iov_base);
+	}
+
+	free(task->iovs);
+	spdk_dma_free(task->md_iov.iov_base);
+}
+#else
+static void
+nvme_free_payload(struct perf_task *task)
+{
+	spdk_dma_free(task->iovs[0].iov_base);
+	free(task->iovs);
+	spdk_dma_free(task->md_iov.iov_base);
+}
+#endif
 
 #ifdef SPDK_CONFIG_URING
 
@@ -821,6 +966,10 @@ nvme_setup_payload(struct perf_task *task, uint8_t pattern)
 	int32_t numa_id;
 	void *buf;
 	int rc;
+#if defined(SPDK_CONFIG_CUDA) && defined(SPDK_CONFIG_RDMA)
+	CUdeviceptr gpu_buf;
+	CUresult cuda_result;
+#endif
 
 	ctrlr = task->ns_ctx->entry->u.nvme.ctrlr;
 	numa_id = spdk_nvme_ctrlr_get_numa_id(ctrlr);
@@ -829,19 +978,65 @@ nvme_setup_payload(struct perf_task *task, uint8_t pattern)
 	 * it's same with g_io_size_bytes for namespace without metadata.
 	 */
 	max_io_size_bytes = g_io_size_bytes + g_max_io_md_size * g_max_io_size_blocks;
-	buf = spdk_dma_zmalloc_socket(max_io_size_bytes, g_io_align, NULL, numa_id);
-	if (buf == NULL) {
-		fprintf(stderr, "task->buf spdk_dma_zmalloc failed\n");
-		exit(1);
+#if defined(SPDK_CONFIG_CUDA) && defined(SPDK_CONFIG_RDMA)
+	if (g_gdr) {
+		if (perf_gdr_set_cuda_context() != 0) {
+			exit(1);
+		}
+		cuda_result = cuMemAlloc(&gpu_buf, max_io_size_bytes);
+		if (cuda_result != CUDA_SUCCESS) {
+			fprintf(stderr, "cuMemAlloc(%u) failed: %d (%s)\n", max_io_size_bytes,
+				cuda_result, perf_cuda_error_string(cuda_result));
+			exit(1);
+		}
+		buf = (void *)gpu_buf;
+		cuda_result = cuMemsetD8(gpu_buf, pattern, max_io_size_bytes);
+		if (cuda_result != CUDA_SUCCESS) {
+			fprintf(stderr, "cuMemsetD8() failed: %d (%s)\n", cuda_result,
+				perf_cuda_error_string(cuda_result));
+			cuMemFree(gpu_buf);
+			exit(1);
+		}
+		task->gpu_buffer = true;
+		task->gpu_buffer_len = max_io_size_bytes;
+	} else
+#endif
+	{
+		buf = spdk_dma_zmalloc_socket(max_io_size_bytes, g_io_align, NULL, numa_id);
+		if (buf == NULL) {
+			fprintf(stderr, "task->buf spdk_dma_zmalloc failed\n");
+			exit(1);
+		}
+		memset(buf, pattern, max_io_size_bytes);
 	}
-	memset(buf, pattern, max_io_size_bytes);
 
 	rc = nvme_perf_allocate_iovs(task, buf, max_io_size_bytes);
 	if (rc < 0) {
 		fprintf(stderr, "perf task failed to allocate iovs\n");
-		spdk_dma_free(buf);
+#if defined(SPDK_CONFIG_CUDA) && defined(SPDK_CONFIG_RDMA)
+		if (g_gdr) {
+			cuMemFree((CUdeviceptr)buf);
+		} else
+#endif
+		{
+			spdk_dma_free(buf);
+		}
 		exit(1);
 	}
+
+#if defined(SPDK_CONFIG_CUDA) && defined(SPDK_CONFIG_RDMA)
+	if (g_gdr) {
+		rc = spdk_gpu_dmabuf_memory_domain_register(g_gpu_memory_domain,
+				task->ns_ctx->entry->u.nvme.rdma_domain, buf, max_io_size_bytes);
+		if (rc != 0) {
+			fprintf(stderr, "Failed to register GPU buffer %p (%u bytes): %s\n", buf,
+				max_io_size_bytes, spdk_strerror(-rc));
+			free(task->iovs);
+			cuMemFree((CUdeviceptr)buf);
+			exit(1);
+		}
+	}
+#endif
 
 	max_io_md_size = g_max_io_md_size * g_max_io_size_blocks;
 	if (max_io_md_size != 0) {
@@ -849,8 +1044,7 @@ nvme_setup_payload(struct perf_task *task, uint8_t pattern)
 		task->md_iov.iov_len = max_io_md_size;
 		if (task->md_iov.iov_base == NULL) {
 			fprintf(stderr, "task->md_buf spdk_dma_zmalloc failed\n");
-			spdk_dma_free(task->iovs[0].iov_base);
-			free(task->iovs);
+			nvme_free_payload(task);
 			exit(1);
 		}
 	}
@@ -899,6 +1093,30 @@ nvme_submit_io(struct perf_task *task, struct ns_worker_ctx *ns_ctx,
 			exit(1);
 		}
 	}
+
+#if defined(SPDK_CONFIG_CUDA) && defined(SPDK_CONFIG_RDMA)
+	if (g_gdr) {
+		memset(&task->ext_opts, 0, sizeof(task->ext_opts));
+		task->ext_opts.size = sizeof(task->ext_opts);
+		task->ext_opts.memory_domain = g_gpu_memory_domain;
+		task->ext_opts.io_flags = entry->io_flags;
+		task->ext_opts.metadata = task->md_iov.iov_base;
+		task->ext_opts.apptag_mask = task->dif_ctx.apptag_mask;
+		task->ext_opts.apptag = task->dif_ctx.app_tag;
+
+		if (task->is_read) {
+			return spdk_nvme_ns_cmd_readv_ext(entry->u.nvme.ns,
+					ns_ctx->u.nvme.qpair[qp_num], lba, entry->io_size_blocks,
+					io_complete, task, nvme_perf_reset_sgl, nvme_perf_next_sge,
+					&task->ext_opts);
+		}
+
+		return spdk_nvme_ns_cmd_writev_ext(entry->u.nvme.ns,
+				ns_ctx->u.nvme.qpair[qp_num], lba, entry->io_size_blocks,
+				io_complete, task, nvme_perf_reset_sgl, nvme_perf_next_sge,
+				&task->ext_opts);
+	}
+#endif
 
 	if (task->is_read) {
 		if (task->iovcnt == 1) {
@@ -1231,6 +1449,8 @@ register_ns(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns)
 	uint32_t max_xfer_size, entries, sector_size;
 	uint64_t ns_size;
 	struct spdk_nvme_io_qpair_opts opts;
+	struct spdk_memory_domain *rdma_domain = NULL;
+	int rc;
 
 	cdata = spdk_nvme_ctrlr_get_data(ctrlr);
 
@@ -1240,6 +1460,22 @@ register_ns(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns)
 		       spdk_nvme_ns_get_id(ns));
 		g_warn = true;
 		return;
+	}
+
+	if (g_gdr) {
+		rc = spdk_nvme_ctrlr_get_memory_domains(ctrlr, &rdma_domain, 1);
+		if (rc != 1 || rdma_domain == NULL ||
+		    spdk_memory_domain_get_dma_device_type(rdma_domain) != SPDK_DMA_DEVICE_TYPE_RDMA) {
+			fprintf(stderr, "GDR requires an NVMe-oF/RDMA controller memory domain\n");
+			g_warn = true;
+			return;
+		}
+
+		if (spdk_nvme_ns_get_md_size(ns) != 0) {
+			fprintf(stderr, "GDR mode does not currently support namespaces with metadata\n");
+			g_warn = true;
+			return;
+		}
 	}
 
 	ns_size = spdk_nvme_ns_get_size(ns);
@@ -1282,6 +1518,7 @@ register_ns(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns)
 	entry->fn_table = &nvme_fn_table;
 	entry->u.nvme.ctrlr = ctrlr;
 	entry->u.nvme.ns = ns;
+	entry->u.nvme.rdma_domain = rdma_domain;
 	entry->num_io_requests = entries * spdk_divide_round_up(g_queue_depth, g_nr_io_queues_per_ns);
 
 	entry->size_in_ios = ns_size / g_io_size_bytes;
@@ -1485,9 +1722,7 @@ submit_single_io(struct perf_task *task)
 			TAILQ_INSERT_TAIL(&ns_ctx->queued_tasks, task, link);
 		} else {
 			RATELIMIT_LOG("starting I/O failed: %d\n", rc);
-			spdk_dma_free(task->iovs[0].iov_base);
-			free(task->iovs);
-			spdk_dma_free(task->md_iov.iov_base);
+			nvme_free_payload(task);
 			task->ns_ctx->status = 1;
 			free(task);
 		}
@@ -1536,9 +1771,7 @@ task_complete(struct perf_task *task)
 	 * replace the one just completed.
 	 */
 	if (spdk_unlikely(ns_ctx->is_draining)) {
-		spdk_dma_free(task->iovs[0].iov_base);
-		free(task->iovs);
-		spdk_dma_free(task->md_iov.iov_base);
+		nvme_free_payload(task);
 		free(task);
 	} else {
 		submit_single_io(task);
@@ -1972,6 +2205,8 @@ usage(char *program_name)
 	printf("\t-G, --enable-debug enable debug logging (flag disabled, must reconfigure with --enable-debug)\n");
 #endif
 	printf("\t--transport-stats dump transport statistics\n");
+	printf("\t--gdr use CUDA GPU memory as the NVMe-oF/RDMA data payload\n");
+	printf("\t--gpu-id <id> CUDA device ordinal for --gdr. Default: 0\n");
 	printf("\n\n");
 }
 
@@ -2453,6 +2688,10 @@ static const struct option g_perf_cmdline_opts[] = {
 	{"log-level", required_argument, NULL, PERF_LOG_LEVEL},
 #define PERF_ENFORCE_NUMA   275
 	{"enforce-numa",			no_argument,	NULL, PERF_ENFORCE_NUMA},
+#define PERF_GDR		276
+	{"gdr", no_argument, NULL, PERF_GDR},
+#define PERF_GPU_DEVICE_ID	277
+	{"gpu-id", required_argument, NULL, PERF_GPU_DEVICE_ID},
 #define PERF_HELP_FULL 'v'
 	{"help-full", no_argument, NULL, PERF_HELP_FULL},
 	/* Should be the last element */
@@ -2499,6 +2738,7 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 		case PERF_NUM_UNUSED_IO_QPAIRS:
 		case PERF_CONTINUE_ON_ERROR:
 		case PERF_RDMA_SRQ_SIZE:
+		case PERF_GPU_DEVICE_ID:
 			val = spdk_strtol(optarg, 10);
 			if (val < 0) {
 				fprintf(stderr, "Converting a string to integer failed\n");
@@ -2593,6 +2833,10 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 			case PERF_NUMBER_IOS:
 				g_number_ios = val_u64;
 				break;
+			case PERF_GPU_DEVICE_ID:
+				g_gpu_device_id = val;
+				g_gpu_device_id_specified = true;
+				break;
 			}
 			break;
 		case PERF_ZIPF:
@@ -2613,6 +2857,7 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 			env_opts->core_mask = optarg;
 			break;
 		case PERF_METADATA:
+			g_metadata_specified = true;
 			if (parse_metadata(optarg)) {
 				usage(argv[0]);
 				return 1;
@@ -2814,6 +3059,14 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 		case PERF_HELP_FULL:
 			usage(argv[0]);
 			return HELP_RETURN_CODE;
+		case PERF_GDR:
+#if defined(SPDK_CONFIG_CUDA) && defined(SPDK_CONFIG_RDMA)
+			g_gdr = true;
+#else
+			fprintf(stderr, "--gdr requires a build configured with --with-rdma --with-cuda\n");
+			return 1;
+#endif
+			break;
 		default:
 			usage(argv[0]);
 			return 1;
@@ -2918,6 +3171,34 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 		if (rc != 0) {
 			fprintf(stderr, "Failed to set NVMe transport options.\n");
 			return 1;
+		}
+	}
+
+	if (g_gpu_device_id_specified && !g_gdr) {
+		fprintf(stderr, "--gpu-id is only valid together with --gdr\n");
+		return 1;
+	}
+
+	if (g_gdr) {
+		struct _trid_entry *trid_entry;
+
+		if (g_metadata_specified) {
+			fprintf(stderr, "--gdr does not currently support metadata/DIF options\n");
+			return 1;
+		}
+		if (optind < argc) {
+			fprintf(stderr, "--gdr does not support AIO or io_uring file arguments\n");
+			return 1;
+		}
+		if (TAILQ_EMPTY(&g_trid_list)) {
+			fprintf(stderr, "--gdr requires an explicit -r trtype:RDMA transport\n");
+			return 1;
+		}
+		TAILQ_FOREACH(trid_entry, &g_trid_list, tailq) {
+			if (trid_entry->entry.trid.trtype != SPDK_NVME_TRANSPORT_RDMA) {
+				fprintf(stderr, "--gdr only supports NVMe-oF/RDMA transports\n");
+				return 1;
+			}
 		}
 	}
 
@@ -3338,6 +3619,12 @@ main(int argc, char **argv)
 	spdk_log_open(NULL);
 	spdk_log_set_print_level(g_log_level);
 	spdk_log_set_level(g_log_level);
+#if defined(SPDK_CONFIG_CUDA) && defined(SPDK_CONFIG_RDMA)
+	if (g_gdr && perf_gdr_init() != 0) {
+		rc = -1;
+		goto cleanup;
+	}
+#endif
 
 	rc = setup_sig_handlers();
 	if (rc != 0) {
@@ -3455,6 +3742,11 @@ cleanup:
 	}
 
 	unregister_namespaces();
+#if defined(SPDK_CONFIG_CUDA) && defined(SPDK_CONFIG_RDMA)
+	if (g_gdr) {
+		perf_gdr_fini();
+	}
+#endif
 	unregister_controllers();
 	unregister_workers();
 
