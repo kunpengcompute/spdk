@@ -129,6 +129,10 @@ CONFIG_VIRTIO=y
 CONFIG_VFIO_USER=n
 CONFIG_VFIO_USER_DIR=
 
+# Enable UB support for the NVMf target.
+# Requires umdk development libraries.
+CONFIG_UB=y
+
 # Build with xNVMe
 CONFIG_XNVME=n
 

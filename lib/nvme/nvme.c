@@ -1031,6 +1031,9 @@ spdk_nvme_trid_populate_transport(struct spdk_nvme_transport_id *trid,
 	case SPDK_NVME_TRANSPORT_TCP:
 		trstring = SPDK_NVME_TRANSPORT_NAME_TCP;
 		break;
+	case SPDK_NVME_TRANSPORT_UB:
+		trstring = SPDK_NVME_TRANSPORT_NAME_UB;
+		break;
 	case SPDK_NVME_TRANSPORT_VFIOUSER:
 		trstring = SPDK_NVME_TRANSPORT_NAME_VFIOUSER;
 		break;
@@ -1087,6 +1090,8 @@ spdk_nvme_transport_id_parse_trtype(enum spdk_nvme_transport_type *trtype, const
 		*trtype = SPDK_NVME_TRANSPORT_FC;
 	} else if (strcasecmp(str, "TCP") == 0) {
 		*trtype = SPDK_NVME_TRANSPORT_TCP;
+	} else if (strcasecmp(str, "UB") == 0) {
+		*trtype = SPDK_NVME_TRANSPORT_UB;
 	} else if (strcasecmp(str, "VFIOUSER") == 0) {
 		*trtype = SPDK_NVME_TRANSPORT_VFIOUSER;
 	} else {
@@ -1107,6 +1112,8 @@ spdk_nvme_transport_id_trtype_str(enum spdk_nvme_transport_type trtype)
 		return "FC";
 	case SPDK_NVME_TRANSPORT_TCP:
 		return "TCP";
+	case SPDK_NVME_TRANSPORT_UB:
+		return "UB";
 	case SPDK_NVME_TRANSPORT_VFIOUSER:
 		return "VFIOUSER";
 	case SPDK_NVME_TRANSPORT_CUSTOM:

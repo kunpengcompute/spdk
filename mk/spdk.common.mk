@@ -165,6 +165,11 @@ ifeq ($(CONFIG_RDMA),y)
 SYS_LIBS += -libverbs -lrdmacm
 endif
 
+ifeq ($(CONFIG_UB),y)
+SYS_LIBS += -lurma -lurma_common
+COMMON_CFLAGS += -I/usr/include/ub/umdk/urma
+endif
+
 ifeq ($(CONFIG_URING),y)
 SYS_LIBS += -luring
 ifneq ($(strip $(CONFIG_URING_PATH)),)

@@ -6,7 +6,7 @@
 SPDK_ROOT_DIR := $(abspath $(CURDIR)/../..)
 include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 
-SO_VER := 17
+SO_VER := 18
 SO_MINOR := 0
 
 C_SRCS = nvme_ctrlr_cmd.c nvme_ctrlr.c nvme_fabric.c nvme_ns_cmd.c \
@@ -18,9 +18,15 @@ C_SRCS = nvme_ctrlr_cmd.c nvme_ctrlr.c nvme_fabric.c nvme_ns_cmd.c \
 C_SRCS-$(CONFIG_NVME_CUSE) += nvme_cuse.c
 C_SRCS-$(CONFIG_VFIO_USER) += nvme_vfio_user.c
 C_SRCS-$(CONFIG_RDMA) += nvme_rdma.c
+C_SRCS-$(CONFIG_UB) += nvme_ub.c
 
 LIBNAME = nvme
 LOCAL_SYS_LIBS =
+ifeq ($(CONFIG_UB),y)
+CFLAGS += -I/usr/include/ub/umdk
+LOCAL_SYS_LIBS += -lurma -lurma_common
+endif
+#Attach only if UB is specified with configure
 ifeq ($(CONFIG_RDMA),y)
 LOCAL_SYS_LIBS += -libverbs -lrdmacm
 #Attach only if FreeBSD and RDMA is specified with configure
