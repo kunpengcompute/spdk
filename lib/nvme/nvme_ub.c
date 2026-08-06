@@ -155,7 +155,6 @@ struct nvme_ub_qpair {
     /* Memory Registration */
     urma_target_seg_t *cmd_tseg;
     urma_target_seg_t *resp_tseg;
-    urma_target_seg_t *remote_tseg;
     void *cmd_buffer;
     void *resp_buffer;
     uint64_t cmd_buffer_size;
@@ -607,9 +606,6 @@ nvme_ub_ctrlr_destruct(struct spdk_nvme_ctrlr *ctrlr)
         if (uqpair->tjetty) {
             urma_unimport_jetty(uqpair->tjetty);
         }
-        if (uqpair->remote_tseg) {
-            urma_unimport_seg(uqpair->remote_tseg);
-        }
         if (uqpair->jetty) {
             urma_delete_jetty(uqpair->jetty);
         }
@@ -642,9 +638,6 @@ nvme_ub_ctrlr_destruct(struct spdk_nvme_ctrlr *ctrlr)
         }
         if (admin_uqpair->tjetty) {
             urma_unimport_jetty(admin_uqpair->tjetty);
-        }
-        if (admin_uqpair->remote_tseg) {
-            urma_unimport_seg(admin_uqpair->remote_tseg);
         }
         if (admin_uqpair->jetty) {
             urma_delete_jetty(admin_uqpair->jetty);
@@ -1005,9 +998,6 @@ nvme_ub_ctrlr_delete_io_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qp
     /* Free URMA resources */
     if (uqpair->tjetty) {
         urma_unimport_jetty(uqpair->tjetty);
-    }
-    if (uqpair->remote_tseg) {
-        urma_unimport_seg(uqpair->remote_tseg);
     }
     if (uqpair->jetty) {
         urma_delete_jetty(uqpair->jetty);
@@ -1651,11 +1641,6 @@ nvme_ub_ctrlr_disconnect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_q
         uqpair->tjetty = NULL;
     }
 
-    if (uqpair->remote_tseg) {
-        urma_unimport_seg(uqpair->remote_tseg);
-        uqpair->remote_tseg = NULL;
-    }
-
     if (uqpair->jetty) {
         urma_delete_jetty(uqpair->jetty);
         uqpair->jetty = NULL;
@@ -1946,33 +1931,6 @@ nvme_ub_connect_established(struct nvme_ub_qpair *uqpair)
     }
 
     fprintf(stderr, "DEBUG: %s URMA link up, tpn=%u\n", __func__, uqpair->tjetty->tp.tpn);
-
-    /* Import remote segment - 参考 urma_sample.c 的 prepare_client 函数 */
-    urma_seg_t remote_seg = {
-        .ubva.eid = remote_info.eid,
-        .ubva.uasid = remote_info.uasid,
-        .ubva.va = remote_info.seg_va,
-        .len = remote_info.seg_len,
-        .attr.value = remote_info.seg_flag,
-        .token_id = remote_info.seg_token_id
-    };
-
-    urma_import_seg_flag_t seg_flag = {
-        .bs.cacheable = URMA_NON_CACHEABLE,
-        .bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE | URMA_ACCESS_ATOMIC,
-        .bs.mapping = URMA_SEG_NOMAP,
-        .bs.reserved = 0
-    };
-
-    uqpair->remote_tseg = urma_import_seg(uctrlr->urma_ctx, &remote_seg, &uctrlr->token, 0,
-                                         seg_flag);
-    if (uqpair->remote_tseg == NULL) {
-        NVME_UQPAIR_ERRLOG(uqpair, "Failed to import remote segment\n");
-        urma_unimport_jetty(uqpair->tjetty);
-        uqpair->tjetty = NULL;
-        return -1;
-    }
-    fprintf(stderr, "DEBUG: %s Remote segment imported successfully\n", __func__);
 
     uqpair->is_connected = true;
     uqpair->state = NVME_UB_JETTY_STATE_READY;
