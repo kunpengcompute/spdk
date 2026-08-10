@@ -33,6 +33,8 @@
 #endif
 
 #define MSG_SIZE 4096
+#define URMA_DEVICE_NAME_ENV "URMA_DEVICE_NAME"
+#define URMA_DEFAULT_DEVICE_NAME "bonding_dev_0"
 
 const struct spdk_nvmf_transport_ops spdk_nvmf_transport_ub;
 static const struct spdk_mem_map_ops g_nvmf_ub_mem_map_ops;
@@ -443,10 +445,14 @@ nvmf_ub_create_urma(struct spdk_nvmf_ub_transport *utransport)
 	g_nvmf_urma_initialized = true;
 	SPDK_NOTICELOG("URMA library initialized successfully\n");
 
-	char *dev_name = "udmac0d1e2";
+	const char *dev_name = getenv(URMA_DEVICE_NAME_ENV);
+	if (dev_name == NULL || dev_name[0] == '\0') {
+		dev_name = URMA_DEFAULT_DEVICE_NAME;
+	}
+
 	urma_device_t *dev = urma_get_device_by_name(dev_name);
 	if (dev == NULL) {
-		SPDK_ERRLOG("urma get device by name failed!\n");
+		SPDK_ERRLOG("Failed to get URMA device %s.\n", dev_name);
 		return -1;
 	}
 

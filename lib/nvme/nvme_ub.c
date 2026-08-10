@@ -47,6 +47,48 @@
 #define NVME_UB_MAX_COMPLETIONS_PER_POLL 128
 #define NVME_UB_COMPLETION_BATCH_SIZE 32
 #define NVME_UB_MAX_SEND_SIGNAL_INTERVAL 16
+#define URMA_DEVICE_NAME_ENV "URMA_DEVICE_NAME"
+#define URMA_DEFAULT_DEVICE_NAME "bonding_dev_0"
+
+static pthread_once_t g_nvme_ub_urma_once = PTHREAD_ONCE_INIT;
+static int g_nvme_ub_urma_init_rc = -EIO;
+static bool g_nvme_ub_urma_initialized;
+
+static void
+nvme_ub_urma_init_once(void)
+{
+    urma_init_attr_t init_attr = {
+        .uasid = 0,
+    };
+
+    g_nvme_ub_urma_init_rc = urma_init(&init_attr);
+    if (g_nvme_ub_urma_init_rc == URMA_SUCCESS) {
+        g_nvme_ub_urma_initialized = true;
+    }
+}
+
+static int
+nvme_ub_urma_init(void)
+{
+    int rc;
+
+    rc = pthread_once(&g_nvme_ub_urma_once, nvme_ub_urma_init_once);
+    if (rc != 0) {
+        SPDK_ERRLOG("pthread_once failed while initializing URMA: %s\n", strerror(rc));
+        return -rc;
+    }
+
+    return g_nvme_ub_urma_init_rc;
+}
+
+__attribute__((destructor)) static void
+nvme_ub_urma_fini(void)
+{
+    if (g_nvme_ub_urma_initialized) {
+        urma_uninit();
+        g_nvme_ub_urma_initialized = false;
+    }
+}
 
 #define NVME_UQPAIR_ERRLOG(uqpair, format, ...) NVME_QPAIR_ERRLOG((uqpair) ? &(uqpair)->qpair : NULL, format, ##__VA_ARGS__)
 #define NVME_UQPAIR_WARNLOG(uqpair, format, ...) NVME_QPAIR_WARNLOG((uqpair) ? &(uqpair)->qpair : NULL, format, ##__VA_ARGS__)
@@ -155,7 +197,6 @@ struct nvme_ub_qpair {
     /* Memory Registration */
     urma_target_seg_t *cmd_tseg;
     urma_target_seg_t *resp_tseg;
-    urma_target_seg_t *remote_tseg;
     void *cmd_buffer;
     void *resp_buffer;
     uint64_t cmd_buffer_size;
@@ -607,9 +648,6 @@ nvme_ub_ctrlr_destruct(struct spdk_nvme_ctrlr *ctrlr)
         if (uqpair->tjetty) {
             urma_unimport_jetty(uqpair->tjetty);
         }
-        if (uqpair->remote_tseg) {
-            urma_unimport_seg(uqpair->remote_tseg);
-        }
         if (uqpair->jetty) {
             urma_delete_jetty(uqpair->jetty);
         }
@@ -642,9 +680,6 @@ nvme_ub_ctrlr_destruct(struct spdk_nvme_ctrlr *ctrlr)
         }
         if (admin_uqpair->tjetty) {
             urma_unimport_jetty(admin_uqpair->tjetty);
-        }
-        if (admin_uqpair->remote_tseg) {
-            urma_unimport_seg(admin_uqpair->remote_tseg);
         }
         if (admin_uqpair->jetty) {
             urma_delete_jetty(admin_uqpair->jetty);
@@ -683,8 +718,6 @@ nvme_ub_ctrlr_destruct(struct spdk_nvme_ctrlr *ctrlr)
     if (uctrlr->urma_ctx) {
         urma_delete_context(uctrlr->urma_ctx);
     }
-    urma_uninit();
-
     nvme_ctrlr_destruct_finish(ctrlr);
     spdk_free(uctrlr);
     return 0;
@@ -1005,9 +1038,6 @@ nvme_ub_ctrlr_delete_io_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qp
     /* Free URMA resources */
     if (uqpair->tjetty) {
         urma_unimport_jetty(uqpair->tjetty);
-    }
-    if (uqpair->remote_tseg) {
-        urma_unimport_seg(uqpair->remote_tseg);
     }
     if (uqpair->jetty) {
         urma_delete_jetty(uqpair->jetty);
@@ -1651,11 +1681,6 @@ nvme_ub_ctrlr_disconnect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_q
         uqpair->tjetty = NULL;
     }
 
-    if (uqpair->remote_tseg) {
-        urma_unimport_seg(uqpair->remote_tseg);
-        uqpair->remote_tseg = NULL;
-    }
-
     if (uqpair->jetty) {
         urma_delete_jetty(uqpair->jetty);
         uqpair->jetty = NULL;
@@ -1946,33 +1971,6 @@ nvme_ub_connect_established(struct nvme_ub_qpair *uqpair)
     }
 
     fprintf(stderr, "DEBUG: %s URMA link up, tpn=%u\n", __func__, uqpair->tjetty->tp.tpn);
-
-    /* Import remote segment - 参考 urma_sample.c 的 prepare_client 函数 */
-    urma_seg_t remote_seg = {
-        .ubva.eid = remote_info.eid,
-        .ubva.uasid = remote_info.uasid,
-        .ubva.va = remote_info.seg_va,
-        .len = remote_info.seg_len,
-        .attr.value = remote_info.seg_flag,
-        .token_id = remote_info.seg_token_id
-    };
-
-    urma_import_seg_flag_t seg_flag = {
-        .bs.cacheable = URMA_NON_CACHEABLE,
-        .bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE | URMA_ACCESS_ATOMIC,
-        .bs.mapping = URMA_SEG_NOMAP,
-        .bs.reserved = 0
-    };
-
-    uqpair->remote_tseg = urma_import_seg(uctrlr->urma_ctx, &remote_seg, &uctrlr->token, 0,
-                                         seg_flag);
-    if (uqpair->remote_tseg == NULL) {
-        NVME_UQPAIR_ERRLOG(uqpair, "Failed to import remote segment\n");
-        urma_unimport_jetty(uqpair->tjetty);
-        uqpair->tjetty = NULL;
-        return -1;
-    }
-    fprintf(stderr, "DEBUG: %s Remote segment imported successfully\n", __func__);
 
     uqpair->is_connected = true;
     uqpair->state = NVME_UB_JETTY_STATE_READY;
@@ -2374,7 +2372,6 @@ nvme_ub_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
     int eid_index = -1;
     int i, rc;
     int num_devices = 0;
-    char dev_name[URMA_MAX_DEV_NAME] = {0};
     struct nvme_ub_qpair *admin_uqpair;
     urma_jfc_cfg_t jfc_cfg;
     urma_jfr_cfg_t jfr_cfg;
@@ -2385,13 +2382,10 @@ nvme_ub_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
     uint32_t admin_queue_size;
     uint32_t admin_jfc_depth;
 
-    /* Initialize urma lib */
-    urma_init_attr_t init_attr = {
-        .uasid = 0,
-    };
-
-    if (urma_init(&init_attr) != URMA_SUCCESS) {
-        SPDK_ERRLOG("Failed to urma init\n");
+    /* Initialize the process-wide URMA library instance. */
+    rc = nvme_ub_urma_init();
+    if (rc != URMA_SUCCESS) {
+        SPDK_ERRLOG("Failed to initialize URMA library: %d\n", rc);
         return NULL;
     }
 
@@ -2399,7 +2393,6 @@ nvme_ub_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
                   SPDK_MALLOC_DMA);
     if (uctrlr == NULL) {
         SPDK_ERRLOG("could not allocate ctrlr\n");
-        urma_uninit();
         return NULL;
     }
     fprintf(stderr, "DEBUG: uctrlr allocated at %p\n", (void*)uctrlr);
@@ -2416,7 +2409,6 @@ nvme_ub_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
         NVME_CTRLR_ERRLOG(&uctrlr->ctrlr, "ub_get_devices() failed: %s (%d)\n", spdk_strerror(errno),
                   errno);
         spdk_free(uctrlr);
-        urma_uninit();
         return NULL;
     }
     NVME_CTRLR_ERRLOG(&uctrlr->ctrlr, "urma_get_device_list returned %d devices\n", num_devices);
@@ -2430,10 +2422,14 @@ nvme_ub_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
     }
     urma_free_device_list(urma_devs);
 
-    char *tmp_dev_name = "udmac0d1e2";
-    urma_dev = urma_get_device_by_name(tmp_dev_name);
+    const char *dev_name = getenv(URMA_DEVICE_NAME_ENV);
+    if (dev_name == NULL || dev_name[0] == '\0') {
+        dev_name = URMA_DEFAULT_DEVICE_NAME;
+    }
+
+    urma_dev = urma_get_device_by_name(dev_name);
     if (urma_dev == NULL) {
-        NVME_CTRLR_ERRLOG(&uctrlr->ctrlr, "urma get device by name failed!\n");
+        NVME_CTRLR_ERRLOG(&uctrlr->ctrlr, "Failed to get URMA device %s.\n", dev_name);
         return NULL;
     }
 
@@ -2441,7 +2437,6 @@ nvme_ub_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
     if (rc < 0) {
         NVME_CTRLR_ERRLOG(&uctrlr->ctrlr, "Failed to query UB device attributes.\n");
         spdk_free(uctrlr);
-        urma_uninit();
         return NULL;
     }
     NVME_CTRLR_ERRLOG(&uctrlr->ctrlr, "name=%s, max_jfc_depth=%u, max_jfs_sge=%u\n",
@@ -2453,7 +2448,6 @@ nvme_ub_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
     if (urma_dev == NULL) {
         NVME_CTRLR_ERRLOG(&uctrlr->ctrlr, "No URMA device found.\n");
         spdk_free(uctrlr);
-        urma_uninit();
         return NULL;
     }
     NVME_CTRLR_DEBUGLOG(&uctrlr->ctrlr, "Using device: %s\n", uctrlr->dev_name);
@@ -2463,7 +2457,6 @@ nvme_ub_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
     if (eid_list == NULL || eid_cnt == 0) {
         NVME_CTRLR_ERRLOG(&uctrlr->ctrlr, "Failed to get EID list.\n");
         spdk_free(uctrlr);
-        urma_uninit();
         return NULL;
     }
     fprintf(stderr, "DEBUG: eid_cnt=%d\n",eid_cnt);
@@ -2479,7 +2472,6 @@ nvme_ub_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
     if (uctrlr->urma_ctx == NULL) {
         NVME_CTRLR_ERRLOG(&uctrlr->ctrlr, "Failed to create URMA context, errno=%d.\n", errno);
         spdk_free(uctrlr);
-        urma_uninit();
         return NULL;
     }
     NVME_CTRLR_ERRLOG(&uctrlr->ctrlr, "URMA context created successfully, eid="EID_FMT"\n",
@@ -2495,7 +2487,6 @@ nvme_ub_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
         NVME_CTRLR_ERRLOG(&uctrlr->ctrlr, "Failed to create JFCE, errno=%d.\n", errno);
         urma_delete_context(uctrlr->urma_ctx);
         spdk_free(uctrlr);
-        urma_uninit();
         return NULL;
     }
     NVME_CTRLR_DEBUGLOG(&uctrlr->ctrlr, "JFCE created successfully.\n");
@@ -2528,7 +2519,6 @@ nvme_ub_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
         urma_delete_jfce(uctrlr->jfce);
         urma_delete_context(uctrlr->urma_ctx);
         spdk_free(uctrlr);
-        urma_uninit();
         return NULL;
     }
     NVME_CTRLR_DEBUGLOG(&uctrlr->ctrlr, "JFC created successfully.\n");
@@ -2554,7 +2544,6 @@ nvme_ub_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
         urma_delete_jfce(uctrlr->jfce);
         urma_delete_context(uctrlr->urma_ctx);
         spdk_free(uctrlr);
-        urma_uninit();
         return NULL;
     }
     fprintf(stderr, "DEBUG: Admin JFR created successfully, jfr=%p\n", (void*)admin_jfr);
@@ -2591,7 +2580,6 @@ nvme_ub_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
         urma_delete_jfce(uctrlr->jfce);
         urma_delete_context(uctrlr->urma_ctx);
         spdk_free(uctrlr);
-        urma_uninit();
         return NULL;
     }
     fprintf(stderr, "DEBUG: Creating admin jetty =%d\n", uctrlr->admin_jetty);
@@ -2609,7 +2597,6 @@ nvme_ub_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
         urma_delete_jfce(uctrlr->jfce);
         urma_delete_context(uctrlr->urma_ctx);
         spdk_free(uctrlr);
-        urma_uninit();
         return NULL;
     }
     fprintf(stderr, "DEBUG: Admin segments registered: send_tseg=%p, recv_tseg=%p\n",
@@ -2626,7 +2613,6 @@ nvme_ub_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
         urma_delete_jfce(uctrlr->jfce);
         urma_delete_context(uctrlr->urma_ctx);
         spdk_free(uctrlr);
-        urma_uninit();
         return NULL;
     }
     fprintf(stderr, "DEBUG: nvme_ctrlr_construct succeeded\n");
@@ -2643,7 +2629,6 @@ nvme_ub_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
         urma_delete_jfce(uctrlr->jfce);
         urma_delete_context(uctrlr->urma_ctx);
         spdk_free(uctrlr);
-        urma_uninit();
         return NULL;
     }
     fprintf(stderr, "DEBUG: admin_uqpair allocated at %p\n", (void*)admin_uqpair);
@@ -2681,7 +2666,6 @@ nvme_ub_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
         urma_delete_jfce(uctrlr->jfce);
         urma_delete_context(uctrlr->urma_ctx);
         spdk_free(uctrlr);
-        urma_uninit();
         return NULL;
     }
 
@@ -2696,7 +2680,6 @@ nvme_ub_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
         urma_delete_jfce(uctrlr->jfce);
         urma_delete_context(uctrlr->urma_ctx);
         spdk_free(uctrlr);
-        urma_uninit();
         return NULL;
     }
 
@@ -2714,7 +2697,6 @@ nvme_ub_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
         urma_delete_jfce(uctrlr->jfce);
         urma_delete_context(uctrlr->urma_ctx);
         spdk_free(uctrlr);
-        urma_uninit();
         return NULL;
     }
 
@@ -2734,7 +2716,6 @@ nvme_ub_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
         urma_delete_jfce(uctrlr->jfce);
         urma_delete_context(uctrlr->urma_ctx);
         spdk_free(uctrlr);
-        urma_uninit();
         return NULL;
     }
 
