@@ -47,6 +47,8 @@
 #define NVME_UB_MAX_COMPLETIONS_PER_POLL 128
 #define NVME_UB_COMPLETION_BATCH_SIZE 32
 #define NVME_UB_MAX_SEND_SIGNAL_INTERVAL 16
+#define URMA_DEVICE_NAME_ENV "URMA_DEVICE_NAME"
+#define URMA_DEFAULT_DEVICE_NAME "bonding_dev_0"
 
 static pthread_once_t g_nvme_ub_urma_once = PTHREAD_ONCE_INIT;
 static int g_nvme_ub_urma_init_rc = -EIO;
@@ -2370,7 +2372,6 @@ nvme_ub_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
     int eid_index = -1;
     int i, rc;
     int num_devices = 0;
-    char dev_name[URMA_MAX_DEV_NAME] = {0};
     struct nvme_ub_qpair *admin_uqpair;
     urma_jfc_cfg_t jfc_cfg;
     urma_jfr_cfg_t jfr_cfg;
@@ -2421,10 +2422,14 @@ nvme_ub_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
     }
     urma_free_device_list(urma_devs);
 
-    char *tmp_dev_name = "udmac0d1e2";
-    urma_dev = urma_get_device_by_name(tmp_dev_name);
+    const char *dev_name = getenv(URMA_DEVICE_NAME_ENV);
+    if (dev_name == NULL || dev_name[0] == '\0') {
+        dev_name = URMA_DEFAULT_DEVICE_NAME;
+    }
+
+    urma_dev = urma_get_device_by_name(dev_name);
     if (urma_dev == NULL) {
-        NVME_CTRLR_ERRLOG(&uctrlr->ctrlr, "urma get device by name failed!\n");
+        NVME_CTRLR_ERRLOG(&uctrlr->ctrlr, "Failed to get URMA device %s.\n", dev_name);
         return NULL;
     }
 
