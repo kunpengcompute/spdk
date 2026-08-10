@@ -23,6 +23,11 @@
 	spdk_memory_domain_get_first;
 	spdk_memory_domain_get_next;
 	spdk_memory_domain_get_system_domain;
+	spdk_gpu_dmabuf_memory_domain_get_opts;
+	spdk_gpu_dmabuf_memory_domain_create;
+	spdk_gpu_dmabuf_memory_domain_register;
+	spdk_gpu_dmabuf_memory_domain_invalidate;
+	spdk_gpu_dmabuf_memory_domain_destroy;
 
 	local: *;
 };

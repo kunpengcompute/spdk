@@ -261,5 +261,7 @@ CONFIG_HAVE_LZ4=n
 # libaio has the RW flags (version >= 0.3.111)
 CONFIG_AIO_HAVE_RW_FLAGS=n
 
-# Build with cuda and related modules
+# Build with CUDA and related modules. When RDMA is also enabled, build the
+# CUDA GPUDirect RDMA memory-domain helpers.
 CONFIG_CUDA=n
+CONFIG_CUDA_PATH=

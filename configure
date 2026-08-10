@@ -66,7 +66,8 @@ function usage() {
 	echo " --without-crypto          Disable isa-l-crypto and vbdev crypto module."
 	echo " --with-fio[=DIR]          Build fio_plugin."
 	echo " --without-fio             default: /usr/src/fio"
-	echo " --with-cuda               Enable the CUDA accel module."
+	echo " --with-cuda[=DIR]         Enable CUDA modules and GPUDirect RDMA helpers."
+	echo " --without-cuda            DIR defaults to /usr/local/cuda when present."
 	echo " --with-xnvme              Build xNVMe bdev module."
 	echo " --without-xnvme           No path required."
 	echo " --with-vhost              Build vhost target. Enabled by default."
@@ -481,6 +482,21 @@ for i in "$@"; do
 		--without-rdma)
 			CONFIG[RDMA]=n
 			;;
+		--with-cuda=*)
+			check_dir "$i"
+			CONFIG[CUDA]=y
+			CONFIG[CUDA_PATH]=$(readlink -f ${i#*=})
+			;;
+		--with-cuda)
+			CONFIG[CUDA]=y
+			if [[ -d /usr/local/cuda ]]; then
+				CONFIG[CUDA_PATH]=/usr/local/cuda
+			fi
+			;;
+		--without-cuda)
+			CONFIG[CUDA]=n
+			CONFIG[CUDA_PATH]=
+			;;
 		--with-fc=*)
 			CONFIG[FC]=y
 			CONFIG[FC_PATH]=$(readlink -f ${i#*=})
@@ -564,12 +580,6 @@ for i in "$@"; do
 			;;
 		--without-xnvme)
 			CONFIG[XNVME]=n
-			;;
-		--with-cuda)
-			CONFIG[CUDA]=y
-			;;
-		--without-cuda)
-			CONFIG[CUDA]=n
 			;;
 		--with-fio) ;&
 		--with-fio=*)
@@ -942,6 +952,26 @@ than or equal to 4.14 will see significantly reduced performance.
 	fi
 
 	echo "Using '${CONFIG[RDMA_PROV]}' RDMA provider"
+fi
+
+if [[ "${CONFIG[CUDA]}" = "y" && "${CONFIG[RDMA]}" = "y" ]]; then
+	cuda_cflags=()
+	cuda_ldflags=()
+	if [[ -n "${CONFIG[CUDA_PATH]}" ]]; then
+		cuda_cflags+=("-I${CONFIG[CUDA_PATH]}/include")
+		if [[ -d "${CONFIG[CUDA_PATH]}/lib64/stubs" ]]; then
+			cuda_ldflags+=("-L${CONFIG[CUDA_PATH]}/lib64/stubs")
+		fi
+	fi
+
+	if ! echo -e '#include <cuda.h>\n#include <infiniband/verbs.h>\n' \
+		'int main(void) { (void)cuMemGetHandleForAddressRange; (void)ibv_reg_dmabuf_mr;\n' \
+		'return CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD == 0; }\n' \
+		| "${BUILD_CMD[@]}" "${cuda_cflags[@]}" "${cuda_ldflags[@]}" -lcuda -libverbs - 2> /dev/null; then
+		echo "--with-cuda requires cuda.h, libcuda and ibv_reg_dmabuf_mr support."
+		echo "Use --with-cuda=/path/to/cuda when CUDA is not installed in /usr/local/cuda."
+		exit 1
+	fi
 fi
 
 if [[ "${CONFIG[FC]}" = "y" ]]; then

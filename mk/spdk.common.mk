@@ -170,6 +170,16 @@ SYS_LIBS += -lurma -lurma_common
 COMMON_CFLAGS += -I/usr/include/ub/umdk/urma
 endif
 
+ifeq ($(CONFIG_CUDA),y)
+SYS_LIBS += -lcuda
+ifneq ($(strip $(CONFIG_CUDA_PATH)),)
+COMMON_CFLAGS += -I$(CONFIG_CUDA_PATH)/include
+ifneq ($(wildcard $(CONFIG_CUDA_PATH)/lib64/stubs),)
+LDFLAGS += -L$(CONFIG_CUDA_PATH)/lib64/stubs
+endif
+endif
+endif
+
 ifeq ($(CONFIG_URING),y)
 SYS_LIBS += -luring
 ifneq ($(strip $(CONFIG_URING_PATH)),)
