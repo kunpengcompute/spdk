@@ -35,6 +35,15 @@
 #define MSG_SIZE 4096
 #define URMA_DEVICE_NAME_ENV "URMA_DEVICE_NAME"
 #define URMA_DEFAULT_DEVICE_NAME "bonding_dev_0"
+#define URMA_BONDING_DEVICE_PREFIX "bonding_dev_"
+
+static bool
+nvmf_ub_device_uses_multipath(const char *dev_name)
+{
+	return dev_name != NULL &&
+	       strncmp(dev_name, URMA_BONDING_DEVICE_PREFIX,
+	               sizeof(URMA_BONDING_DEVICE_PREFIX) - 1) == 0;
+}
 
 const struct spdk_nvmf_transport_ops spdk_nvmf_transport_ub;
 static const struct spdk_mem_map_ops g_nvmf_ub_mem_map_ops;
@@ -158,6 +167,7 @@ struct spdk_nvmf_ub_transport {
 	urma_context_t				*urma_ctx;
 	urma_jfce_t 				*jfce;
 	struct spdk_mem_map			*mem_map;
+	bool					multi_path;
 
 	/* Pending connections sock_group for handling connect requests */
 	struct spdk_sock_group		*listen_sock_group;
@@ -455,6 +465,7 @@ nvmf_ub_create_urma(struct spdk_nvmf_ub_transport *utransport)
 		SPDK_ERRLOG("Failed to get URMA device %s.\n", dev_name);
 		return -1;
 	}
+	utransport->multi_path = nvmf_ub_device_uses_multipath(dev->name);
 
 	urma_device_attr_t dev_attr;
 	if (urma_query_device(dev, &dev_attr) != URMA_SUCCESS) {
@@ -462,7 +473,8 @@ nvmf_ub_create_urma(struct spdk_nvmf_ub_transport *utransport)
 		return -1;
 	}
 
-	SPDK_NOTICELOG("Got URMA device by eid successfully\n");
+	SPDK_NOTICELOG("Using URMA device %s, multi_path=%d\n",
+		       dev->name, utransport->multi_path);
 
     int eid_index = get_eid_index(dev);
     if (eid_index < 0) {
@@ -643,6 +655,7 @@ nvmf_ub_create_jetty(struct spdk_nvmf_ub_qpair *uqpair, bool is_admin_qpair)
 		.err_timeout     = URMA_TYPICAL_ERR_TIMEOUT,
 		.jfc             = uqpair->send_jfc,
 	};
+	jfs_cfg.flag.bs.multi_path = utransport->multi_path;
 
 	urma_jetty_cfg_t jetty_cfg = {
 		.flag.bs.share_jfr = 1,
