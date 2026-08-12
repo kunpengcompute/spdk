@@ -124,12 +124,10 @@ if python3 -c 'import sys; exit(0 if sys.version_info >= (3,9) else 1)'; then
 else
 	# --upgrade-deps was introduced only in Python 3.9.0 (October 5, 2020).
 	python3 -m venv --system-site-packages "$virtdir"
-	# pip3, which is shipped with centos8 and rocky8, is currently providing faulty ninja binary
-	# which segfaults at each run. To workaround it, upgrade pip itself and then use it for each
-	# package - new pip will provide ninja at the same version but with the actually working
-	# binary.
-	"$virtdir"/bin/pip install --upgrade pip setuptools
 fi
+# pip 26.2 is incompatible with pip-tools 7.6.0, so use the last compatible pip release.
+# This also works around the faulty ninja binary provided by pip3 on CentOS 8 and Rocky 8.
+"$virtdir"/bin/pip install --upgrade "pip==26.1.2" setuptools
 source "$virtdir/bin/activate"
 python -m pip install pip-tools
 pip-compile --extra dev --strip-extras -o "$rootdir/scripts/pkgdep/requirements.txt" "${rootdir}/python/pyproject.toml"
