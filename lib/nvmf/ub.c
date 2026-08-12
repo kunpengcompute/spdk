@@ -350,10 +350,10 @@ nvmf_ub_dump_req_rsp(struct ub_connect_req_rsp *req)
     SPDK_NOTICELOG("=== UB Connect Req/Rsp ===\n");
     SPDK_NOTICELOG("msg_type: 0x%02x\n", req->msg_type);
     SPDK_NOTICELOG("qid: %u\n", req->qid);
-    SPDK_NOTICELOG("jetty_id: uasid=%u, id=%u\n",
-                   req->jetty_id.uasid, req->jetty_id.id);
+    SPDK_NOTICELOG("jetty_id: eid="EID_FMT", uasid=%u, id=%u\n",
+                   EID_ARGS(req->jetty_id.eid), req->jetty_id.uasid, req->jetty_id.id);
     SPDK_NOTICELOG("uasid: %u\n", req->uasid);
-    SPDK_NOTICELOG("eid: %s\n", req->eid.raw);
+    SPDK_NOTICELOG("segment eid: "EID_FMT"\n", EID_ARGS(req->eid));
     SPDK_NOTICELOG("seg_va: 0x%016lx\n", req->seg_va);
     SPDK_NOTICELOG("seg_len: %lu\n", req->seg_len);
     SPDK_NOTICELOG("seg_flag: 0x%08x\n", req->seg_flag);
@@ -954,18 +954,20 @@ nvmf_ub_handle_connect(struct spdk_nvmf_ub_qpair *uqpair, struct ub_connect_req_
 		goto error;
 	}
 
-	/* Build remote jetty info */
-	rjetty.jetty_id.id = uqpair->remote_jetty_id.id;
-	rjetty.jetty_id.uasid = uqpair->remote_uasid;
-	memcpy(rjetty.jetty_id.eid.raw, uqpair->remote_eid.raw, URMA_EID_SIZE);
+	/* The Jetty ID is an independent URMA identifier.  In particular, a
+	 * bonding Jetty's EID must not be replaced with the segment/context EID. */
+	rjetty.jetty_id = uqpair->remote_jetty_id;
 	rjetty.trans_mode = URMA_TM_RM;
 	rjetty.type = URMA_JETTY;
 	rjetty.tp_type = URMA_CTP;
 
-	/* Import remote jetty using CTP - no bind needed */
+	/* RM mode does not require an explicit bind_jetty. */
 	uqpair->target_jetty = urma_import_jetty(utransport->urma_ctx, &rjetty, &token);
 	if (uqpair->target_jetty == NULL) {
-		SPDK_ERRLOG("urma_import_jetty failed for qid %u\n", uqpair->qid);
+		SPDK_ERRLOG("urma_import_jetty failed for qid %u "
+			    "(multi_path=%d, tp_type=%d, errno=%d: %s)\n",
+			    uqpair->qid, utransport->multi_path, rjetty.tp_type,
+			    errno, strerror(errno));
 		rc = -EIO;
 		goto error;
 	}

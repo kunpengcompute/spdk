@@ -1910,7 +1910,7 @@ nvme_ub_connect_established(struct nvme_ub_qpair *uqpair)
     local_info.jetty_id = uqpair->jetty_id;
     local_info.qid = uqpair->qid;
     local_info.msg_type = 1;
-    local_info.trans_mode = 2;
+    local_info.trans_mode = URMA_TM_RM;
 
     /* The target accesses command payloads, not the response receive ring.
      * Advertise the command/payload segment so it can import it once. */
@@ -1922,12 +1922,12 @@ nvme_ub_connect_established(struct nvme_ub_qpair *uqpair)
 
 
     /* Exchange connection info with remote using SPDK sock */
-    fprintf(stderr, "DEBUG: %s local_info: eid=0x%lx, uasid=0x%x, seg_va=0x%lx, seg_len=%lu, "
-            "seg_flag=0x%x, seg_token_id=0x%x, jetty_id=0x%lx, qid=%u, trans_mode=%u, msg_type=%u\n",
-            __func__, local_info.eid, local_info.uasid, local_info.seg_va, local_info.seg_len,
+    fprintf(stderr, "DEBUG: %s local_info: eid="EID_FMT", uasid=0x%x, seg_va=0x%lx, seg_len=%lu, "
+            "seg_flag=0x%x, seg_token_id=0x%x, jetty_id=0x%x, qid=%u, trans_mode=%u, msg_type=%u\n",
+            __func__, EID_ARGS(local_info.eid), local_info.uasid, local_info.seg_va, local_info.seg_len,
             local_info.seg_flag, local_info.seg_token_id, local_info.jetty_id.id, local_info.qid,
             local_info.trans_mode, local_info.msg_type);
-    fprintf(stderr, "DEBUG: %s seg_flag=0x%x, seg_token_id=0x%x, jetty_id=0x%lx, qid=%u, trans_mode=%u, msg_type=%u\n",
+    fprintf(stderr, "DEBUG: %s seg_flag=0x%x, seg_token_id=0x%x, jetty_id=0x%x, qid=%u, trans_mode=%u, msg_type=%u\n",
              __func__, local_info.seg_flag, local_info.seg_token_id, local_info.jetty_id.id, local_info.qid,
             local_info.trans_mode, local_info.msg_type);
 
@@ -1973,10 +1973,12 @@ nvme_ub_connect_established(struct nvme_ub_qpair *uqpair)
     /* Close socket after info exchange */
     spdk_sock_close(&uqpair->sock);
 
-    /* Import remote jetty - CTP 模式不需要手动 bind_jetty */
+    /* RM mode does not require an explicit bind_jetty. */
     uqpair->tjetty = urma_import_jetty(uctrlr->urma_ctx, &remote_jetty, &uctrlr->token);
     if (uqpair->tjetty == NULL) {
-        NVME_UQPAIR_ERRLOG(uqpair, "Failed to import remote jetty\n");
+        NVME_UQPAIR_ERRLOG(uqpair,
+                          "Failed to import remote jetty (multi_path=%d, tp_type=%d, errno=%d: %s)\n",
+                          uctrlr->multi_path, remote_jetty.tp_type, errno, strerror(errno));
         return -1;
     }
 
