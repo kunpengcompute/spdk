@@ -49,6 +49,15 @@
 #define NVME_UB_MAX_SEND_SIGNAL_INTERVAL 16
 #define URMA_DEVICE_NAME_ENV "URMA_DEVICE_NAME"
 #define URMA_DEFAULT_DEVICE_NAME "bonding_dev_0"
+#define URMA_BONDING_DEVICE_PREFIX "bonding_dev_"
+
+static bool
+nvme_ub_device_uses_multipath(const char *dev_name)
+{
+    return dev_name != NULL &&
+           strncmp(dev_name, URMA_BONDING_DEVICE_PREFIX,
+                   sizeof(URMA_BONDING_DEVICE_PREFIX) - 1) == 0;
+}
 
 static pthread_once_t g_nvme_ub_urma_once = PTHREAD_ONCE_INIT;
 static int g_nvme_ub_urma_init_rc = -EIO;
@@ -277,6 +286,7 @@ struct nvme_ub_ctrlr {
     urma_context_t *urma_ctx;
     urma_device_attr_t dev_attr;
     char dev_name[URMA_MAX_DEV_NAME];
+    bool multi_path;
     int32_t eid_index;
 
     /* UB max SGE */
@@ -864,7 +874,7 @@ nvme_ub_ctrlr_create_io_qpair(struct spdk_nvme_ctrlr *ctrlr, uint16_t qid,
     memset(&jfs_cfg, 0, sizeof(jfs_cfg));
     jfs_cfg.depth = opts->io_queue_size;
     jfs_cfg.flag.bs.order_type = 0;
-    jfs_cfg.flag.bs.multi_path = 0;
+    jfs_cfg.flag.bs.multi_path = uctrlr->multi_path;
     jfs_cfg.trans_mode = URMA_TM_RM;
     jfs_cfg.priority = URMA_MAX_PRIORITY;
     jfs_cfg.max_sge = uctrlr->max_sge;
@@ -1900,7 +1910,7 @@ nvme_ub_connect_established(struct nvme_ub_qpair *uqpair)
     local_info.jetty_id = uqpair->jetty_id;
     local_info.qid = uqpair->qid;
     local_info.msg_type = 1;
-    local_info.trans_mode = 2;
+    local_info.trans_mode = URMA_TM_RM;
 
     /* The target accesses command payloads, not the response receive ring.
      * Advertise the command/payload segment so it can import it once. */
@@ -1912,12 +1922,12 @@ nvme_ub_connect_established(struct nvme_ub_qpair *uqpair)
 
 
     /* Exchange connection info with remote using SPDK sock */
-    fprintf(stderr, "DEBUG: %s local_info: eid=0x%lx, uasid=0x%x, seg_va=0x%lx, seg_len=%lu, "
-            "seg_flag=0x%x, seg_token_id=0x%x, jetty_id=0x%lx, qid=%u, trans_mode=%u, msg_type=%u\n",
-            __func__, local_info.eid, local_info.uasid, local_info.seg_va, local_info.seg_len,
+    fprintf(stderr, "DEBUG: %s local_info: eid="EID_FMT", uasid=0x%x, seg_va=0x%lx, seg_len=%lu, "
+            "seg_flag=0x%x, seg_token_id=0x%x, jetty_id=0x%x, qid=%u, trans_mode=%u, msg_type=%u\n",
+            __func__, EID_ARGS(local_info.eid), local_info.uasid, local_info.seg_va, local_info.seg_len,
             local_info.seg_flag, local_info.seg_token_id, local_info.jetty_id.id, local_info.qid,
             local_info.trans_mode, local_info.msg_type);
-    fprintf(stderr, "DEBUG: %s seg_flag=0x%x, seg_token_id=0x%x, jetty_id=0x%lx, qid=%u, trans_mode=%u, msg_type=%u\n",
+    fprintf(stderr, "DEBUG: %s seg_flag=0x%x, seg_token_id=0x%x, jetty_id=0x%x, qid=%u, trans_mode=%u, msg_type=%u\n",
              __func__, local_info.seg_flag, local_info.seg_token_id, local_info.jetty_id.id, local_info.qid,
             local_info.trans_mode, local_info.msg_type);
 
@@ -1963,10 +1973,12 @@ nvme_ub_connect_established(struct nvme_ub_qpair *uqpair)
     /* Close socket after info exchange */
     spdk_sock_close(&uqpair->sock);
 
-    /* Import remote jetty - CTP 模式不需要手动 bind_jetty */
+    /* RM mode does not require an explicit bind_jetty. */
     uqpair->tjetty = urma_import_jetty(uctrlr->urma_ctx, &remote_jetty, &uctrlr->token);
     if (uqpair->tjetty == NULL) {
-        NVME_UQPAIR_ERRLOG(uqpair, "Failed to import remote jetty\n");
+        NVME_UQPAIR_ERRLOG(uqpair,
+                          "Failed to import remote jetty (multi_path=%d, tp_type=%d, errno=%d: %s)\n",
+                          uctrlr->multi_path, remote_jetty.tp_type, errno, strerror(errno));
         return -1;
     }
 
@@ -2444,13 +2456,15 @@ nvme_ub_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
     uctrlr->max_sge = spdk_min(uctrlr->max_sge, (uint16_t)dev_attr.dev_cap.max_jfs_sge);
     uctrlr->dev_attr = dev_attr;
     strncpy(uctrlr->dev_name, urma_dev->name, URMA_MAX_DEV_NAME - 1);
+    uctrlr->multi_path = nvme_ub_device_uses_multipath(uctrlr->dev_name);
 
     if (urma_dev == NULL) {
         NVME_CTRLR_ERRLOG(&uctrlr->ctrlr, "No URMA device found.\n");
         spdk_free(uctrlr);
         return NULL;
     }
-    NVME_CTRLR_DEBUGLOG(&uctrlr->ctrlr, "Using device: %s\n", uctrlr->dev_name);
+    NVME_CTRLR_DEBUGLOG(&uctrlr->ctrlr, "Using device: %s, multi_path=%d\n",
+                        uctrlr->dev_name, uctrlr->multi_path);
 
     /* Get EID index */
     eid_list = urma_get_eid_list(urma_dev, &eid_cnt);
@@ -2552,7 +2566,7 @@ nvme_ub_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
     memset(&jfs_cfg, 0, sizeof(jfs_cfg));
     jfs_cfg.depth = admin_queue_size;
     jfs_cfg.flag.bs.order_type = 0;
-    jfs_cfg.flag.bs.multi_path = 0;
+    jfs_cfg.flag.bs.multi_path = uctrlr->multi_path;
     jfs_cfg.trans_mode = URMA_TM_RM;
     jfs_cfg.priority = URMA_MAX_PRIORITY;
     jfs_cfg.max_sge = uctrlr->max_sge;

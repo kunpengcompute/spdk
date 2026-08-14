@@ -35,6 +35,15 @@
 #define MSG_SIZE 4096
 #define URMA_DEVICE_NAME_ENV "URMA_DEVICE_NAME"
 #define URMA_DEFAULT_DEVICE_NAME "bonding_dev_0"
+#define URMA_BONDING_DEVICE_PREFIX "bonding_dev_"
+
+static bool
+nvmf_ub_device_uses_multipath(const char *dev_name)
+{
+	return dev_name != NULL &&
+	       strncmp(dev_name, URMA_BONDING_DEVICE_PREFIX,
+	               sizeof(URMA_BONDING_DEVICE_PREFIX) - 1) == 0;
+}
 
 const struct spdk_nvmf_transport_ops spdk_nvmf_transport_ub;
 static const struct spdk_mem_map_ops g_nvmf_ub_mem_map_ops;
@@ -158,6 +167,7 @@ struct spdk_nvmf_ub_transport {
 	urma_context_t				*urma_ctx;
 	urma_jfce_t 				*jfce;
 	struct spdk_mem_map			*mem_map;
+	bool					multi_path;
 
 	/* Pending connections sock_group for handling connect requests */
 	struct spdk_sock_group		*listen_sock_group;
@@ -340,10 +350,10 @@ nvmf_ub_dump_req_rsp(struct ub_connect_req_rsp *req)
     SPDK_NOTICELOG("=== UB Connect Req/Rsp ===\n");
     SPDK_NOTICELOG("msg_type: 0x%02x\n", req->msg_type);
     SPDK_NOTICELOG("qid: %u\n", req->qid);
-    SPDK_NOTICELOG("jetty_id: uasid=%u, id=%u\n",
-                   req->jetty_id.uasid, req->jetty_id.id);
+    SPDK_NOTICELOG("jetty_id: eid="EID_FMT", uasid=%u, id=%u\n",
+                   EID_ARGS(req->jetty_id.eid), req->jetty_id.uasid, req->jetty_id.id);
     SPDK_NOTICELOG("uasid: %u\n", req->uasid);
-    SPDK_NOTICELOG("eid: %s\n", req->eid.raw);
+    SPDK_NOTICELOG("segment eid: "EID_FMT"\n", EID_ARGS(req->eid));
     SPDK_NOTICELOG("seg_va: 0x%016lx\n", req->seg_va);
     SPDK_NOTICELOG("seg_len: %lu\n", req->seg_len);
     SPDK_NOTICELOG("seg_flag: 0x%08x\n", req->seg_flag);
@@ -455,6 +465,7 @@ nvmf_ub_create_urma(struct spdk_nvmf_ub_transport *utransport)
 		SPDK_ERRLOG("Failed to get URMA device %s.\n", dev_name);
 		return -1;
 	}
+	utransport->multi_path = nvmf_ub_device_uses_multipath(dev->name);
 
 	urma_device_attr_t dev_attr;
 	if (urma_query_device(dev, &dev_attr) != URMA_SUCCESS) {
@@ -462,7 +473,8 @@ nvmf_ub_create_urma(struct spdk_nvmf_ub_transport *utransport)
 		return -1;
 	}
 
-	SPDK_NOTICELOG("Got URMA device by eid successfully\n");
+	SPDK_NOTICELOG("Using URMA device %s, multi_path=%d\n",
+		       dev->name, utransport->multi_path);
 
     int eid_index = get_eid_index(dev);
     if (eid_index < 0) {
@@ -643,6 +655,7 @@ nvmf_ub_create_jetty(struct spdk_nvmf_ub_qpair *uqpair, bool is_admin_qpair)
 		.err_timeout     = URMA_TYPICAL_ERR_TIMEOUT,
 		.jfc             = uqpair->send_jfc,
 	};
+	jfs_cfg.flag.bs.multi_path = utransport->multi_path;
 
 	urma_jetty_cfg_t jetty_cfg = {
 		.flag.bs.share_jfr = 1,
@@ -941,18 +954,20 @@ nvmf_ub_handle_connect(struct spdk_nvmf_ub_qpair *uqpair, struct ub_connect_req_
 		goto error;
 	}
 
-	/* Build remote jetty info */
-	rjetty.jetty_id.id = uqpair->remote_jetty_id.id;
-	rjetty.jetty_id.uasid = uqpair->remote_uasid;
-	memcpy(rjetty.jetty_id.eid.raw, uqpair->remote_eid.raw, URMA_EID_SIZE);
+	/* The Jetty ID is an independent URMA identifier.  In particular, a
+	 * bonding Jetty's EID must not be replaced with the segment/context EID. */
+	rjetty.jetty_id = uqpair->remote_jetty_id;
 	rjetty.trans_mode = URMA_TM_RM;
 	rjetty.type = URMA_JETTY;
 	rjetty.tp_type = URMA_CTP;
 
-	/* Import remote jetty using CTP - no bind needed */
+	/* RM mode does not require an explicit bind_jetty. */
 	uqpair->target_jetty = urma_import_jetty(utransport->urma_ctx, &rjetty, &token);
 	if (uqpair->target_jetty == NULL) {
-		SPDK_ERRLOG("urma_import_jetty failed for qid %u\n", uqpair->qid);
+		SPDK_ERRLOG("urma_import_jetty failed for qid %u "
+			    "(multi_path=%d, tp_type=%d, errno=%d: %s)\n",
+			    uqpair->qid, utransport->multi_path, rjetty.tp_type,
+			    errno, strerror(errno));
 		rc = -EIO;
 		goto error;
 	}
