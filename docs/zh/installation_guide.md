@@ -140,7 +140,7 @@ sh env-check.sh
     >     patch -p1 < spdk_v21.01.1_dpdk_compress_kae.patch
     >    ```
     >
-    > 4. `--with-ksal`是加载ksal算法模块，KSAL是华为自研的高性能crc算法，对外闭源，采取动态库的形式集成，因此需要先[安装KSAL算法包](https://www.hikunpeng.com/document/detail/zh/kunpengsdss/basicAccelFeatures/ksal/kunpengksal_16_0007.html)，加载KSAL动态库才能正常配置与编译，执行编译操作，单击[下载rpm包](https://www.hikunpeng.com/boostkit/download?version=24.0.RC5)。
+    > 4. `--with-ksal`是加载ksal算法模块，KSAL是华为自研的高性能crc算法，对外闭源，采取动态库的形式集成，因此需要先[安装KSAL算法包](https://www.hikunpeng.com/document/detail/zh/kunpengaccel/storage/ksal/kunpengksal_16_0007.html)，加载KSAL动态库才能正常配置与编译，执行编译操作，单击[下载rpm包](https://www.hikunpeng.com/boostkit/download?version=24.0.RC5)。
 
 7. <a id="000001"></a>执行编译操作。
 
