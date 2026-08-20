@@ -16,6 +16,7 @@
 #include "spdk/tree.h"
 #include "spdk/util.h"
 #include "spdk/sock.h"
+#include "spdk_internal/nvme_ub.h"
 
 #include "spdk_internal/assert.h"
 #include "spdk/log.h"
@@ -28,6 +29,11 @@
 
 #include "spdk_internal/trace_defs.h"
 
+SPDK_STATIC_ASSERT(URMA_EID_SIZE == SPDK_NVME_UB_EID_SIZE,
+		   "URMA EID size does not match UB OOB protocol");
+SPDK_STATIC_ASSERT(SPDK_NVME_UB_MAX_SGL_DESCRIPTORS <= SPDK_NVMF_MAX_SGL_ENTRIES,
+		   "UB descriptor limit exceeds the NVMf request SGL capacity");
+
 #ifndef PAGE_SIZE
 #define PAGE_SIZE (0x1 << 12) /* 4KB */
 #endif
@@ -35,6 +41,8 @@
 #define MSG_SIZE 4096
 #define URMA_DEVICE_NAME_ENV "URMA_DEVICE_NAME"
 #define URMA_DEFAULT_DEVICE_NAME "bonding_dev_0"
+#define URMA_EID_INDEX_ENV "URMA_EID_INDEX"
+#define URMA_DEFAULT_EID_INDEX 1
 #define URMA_BONDING_DEVICE_PREFIX "bonding_dev_"
 
 static bool
@@ -54,7 +62,7 @@ bool g_nvmf_urma_initialized = false;
 #define SPDK_NVMF_UB_DEFAULT_AQ_DEPTH 128
 #define SPDK_NVMF_UB_DEFAULT_MAX_QPAIRS_PER_CTRLR 8 /* 暂时约束最大8 queue*/
 #define SPDK_NVMF_UB_DEFAULT_IN_CAPSULE_DATA_SIZE 4096
-#define SPDK_NVMF_UB_DEFAULT_MAX_IO_SIZE (128 * 1024) /* Single-SGL 128 KiB I/O */
+#define SPDK_NVMF_UB_DEFAULT_MAX_IO_SIZE (128 * 1024)
 #define SPDK_NVMF_UB_DIF_INSERT_OR_STRIP false
 #define SPDK_NVMF_UB_DEFAULT_ABORT_TIMEOUT_SEC 1
 #define SPDK_NVMF_UB_DEFAULT_DATA_WR_POOL_SIZE 4095
@@ -64,11 +72,6 @@ bool g_nvmf_urma_initialized = false;
 
 #define SPDK_NVMF_UB_DEFAULT_NO_SRQ false
 #define NVMF_DEFAULT_TX_SGE		SPDK_NVMF_MAX_SGL_ENTRIES
-
-/* UB transport out-of-band message types */
-#define UB_MSG_TYPE_CONNECT      1
-#define UB_MSG_TYPE_CONNECT_RSP  2
-#define UB_MSG_TYPE_DISCONNECT   3
 
 /* UB transport specific constants */
 #define SPDK_NVMF_UB_MAX_ACCEPT_SOCK_ONE_TIME 16
@@ -206,6 +209,14 @@ enum spdk_nvmf_ub_req_ub_state {
 	UB_REQ_UB_STATE_WAIT_RESPONSE,	/* Waiting for a response SEND context */
 };
 
+struct spdk_nvmf_ub_remote_sge {
+	uint64_t				remote_addr;
+	uint32_t				length;
+	uint32_t				key;
+	urma_target_seg_t			*tseg;
+	urma_target_jetty_t			*tjetty;
+};
+
 struct spdk_nvmf_ub_request {
 	struct spdk_nvmf_request		req;
 
@@ -215,6 +226,12 @@ struct spdk_nvmf_ub_request {
 	/* Remote address and key for UB operations */
 	uint64_t				remote_addr;
 	uint32_t				remote_key;
+	urma_target_seg_t			*remote_data_tseg;
+	urma_target_jetty_t			*remote_data_tjetty;
+	struct spdk_nvmf_ub_remote_sge		remote_sges[SPDK_NVME_UB_MAX_SGL_DESCRIPTORS];
+	uint32_t				num_remote_sges;
+	uint32_t				num_outstanding_data_wr;
+	bool					data_transfer_failed;
 
 	/* Flag indicating if data needs to be fetched from remote */
 	bool					data_from_remote;
@@ -242,8 +259,26 @@ struct spdk_nvmf_ub_response {
 
 struct spdk_nvmf_ub_remote_seg {
 	uint32_t				token_id;
+	uint64_t				addr;
+	uint64_t				length;
 	urma_target_seg_t			*tseg;
 	TAILQ_ENTRY(spdk_nvmf_ub_remote_seg)	link;
+};
+
+struct spdk_nvmf_ub_npu_endpoint {
+	uint32_t				endpoint_id;
+	urma_target_jetty_t			*tjetty;
+	TAILQ_ENTRY(spdk_nvmf_ub_npu_endpoint)	link;
+};
+
+struct spdk_nvmf_ub_npu_region {
+	uint32_t				region_id;
+	uint32_t				endpoint_id;
+	uint64_t				remote_base;
+	uint64_t				length;
+	urma_target_seg_t			*tseg;
+	urma_target_jetty_t			*tjetty;
+	TAILQ_ENTRY(spdk_nvmf_ub_npu_region)	link;
 };
 
 struct spdk_nvmf_ub_qpair {
@@ -277,6 +312,9 @@ struct spdk_nvmf_ub_qpair {
 	urma_target_seg_t			*local_tseg;
 	urma_target_seg_t			*remote_tseg;
 	TAILQ_HEAD(, spdk_nvmf_ub_remote_seg)	remote_segs;
+	TAILQ_HEAD(, spdk_nvmf_ub_npu_endpoint)	npu_endpoints;
+	TAILQ_HEAD(, spdk_nvmf_ub_npu_region)	npu_regions;
+	uint64_t				npu_registry_generation;
 	size_t				rsp_offset;
 	size_t				data_offset;
 	size_t				seg_len;
@@ -344,8 +382,9 @@ struct ub_connect_req_rsp {
     uint8_t msg_type;
 } __attribute__((packed));
 
+#if 0 /* Legacy fixed-size OOB v1 debug helper. */
 static void
-nvmf_ub_dump_req_rsp(struct ub_connect_req_rsp *req)
+nvmf_ub_dump_req_rsp_v1_disabled(struct ub_connect_req_rsp *req)
 {
     SPDK_NOTICELOG("=== UB Connect Req/Rsp ===\n");
     SPDK_NOTICELOG("msg_type: 0x%02x\n", req->msg_type);
@@ -361,13 +400,15 @@ nvmf_ub_dump_req_rsp(struct ub_connect_req_rsp *req)
     SPDK_NOTICELOG("trans_mode: %u\n", req->trans_mode);
     SPDK_NOTICELOG("================================\n");
 }
+#endif
 
 
 /* Pending connection waiting for connect request */
 struct spdk_nvmf_ub_pending_conn {
 	struct spdk_sock			*sock;
 	struct spdk_nvmf_ub_qpair		*uqpair;
-	struct ub_connect_req_rsp			req;
+	struct spdk_nvme_ub_oob_header		header;
+	uint8_t					*request;
 	size_t					req_offset;
 	TAILQ_ENTRY(spdk_nvmf_ub_pending_conn)	link;
 };
@@ -409,30 +450,51 @@ nvmf_ub_destroy(struct spdk_nvmf_transport *transport,
 	}
 }
 
-static int get_eid_index(urma_device_t *dev)
+static int
+nvmf_ub_get_eid_index(urma_device_t *dev)
 {
-    urma_eid_info_t *eid_list;
-    uint32_t eid_cnt;
-    int eid_index = -1;
+	urma_eid_info_t *eid_list;
+	const char *value;
+	uint32_t eid_cnt;
+	long eid_index;
 
-    eid_list = urma_get_eid_list(dev, &eid_cnt);
-    if (eid_list == NULL) {
-        return -1;
-    }
-    for (uint32_t i = 0; eid_list != NULL && i < eid_cnt; i++) {
-        printf("device_name :%s (eid%d: "EID_FMT").\n", dev->name, eid_list[i].eid_index, EID_ARGS(eid_list[i].eid));
-    }
-    if (eid_cnt > 0) {
-        eid_index = eid_list[0].eid_index;
-    }
-    urma_free_eid_list(eid_list);
-    return eid_index;
+	eid_list = urma_get_eid_list(dev, &eid_cnt);
+	if (eid_list == NULL) {
+		SPDK_ERRLOG("Failed to get EID list for URMA device %s\n", dev->name);
+		return -ENODEV;
+	}
+
+	for (uint32_t i = 0; i < eid_cnt; i++) {
+		printf("device_name :%s (eid%d: "EID_FMT").\n", dev->name,
+		       eid_list[i].eid_index, EID_ARGS(eid_list[i].eid));
+	}
+	urma_free_eid_list(eid_list);
+
+	if (eid_cnt == 0) {
+		SPDK_ERRLOG("URMA device %s has no EIDs\n", dev->name);
+		return -ENODEV;
+	}
+
+	value = getenv(URMA_EID_INDEX_ENV);
+	if (value == NULL || value[0] == '\0') {
+		return URMA_DEFAULT_EID_INDEX;
+	}
+
+	eid_index = spdk_strtol(value, 10);
+	if (eid_index < 0 || eid_index > INT_MAX) {
+		SPDK_ERRLOG("Invalid %s value '%s'; expected an integer between 0 and %d\n",
+			    URMA_EID_INDEX_ENV, value, INT_MAX);
+		return -EINVAL;
+	}
+
+	return (int)eid_index;
 }
 
 static int
 nvmf_ub_create_urma(struct spdk_nvmf_ub_transport *utransport)
 {
 	urma_init_attr_t init_attr = {};
+	int eid_index;
 	int rc;
 
 	if (g_nvmf_urma_initialized) {
@@ -447,13 +509,22 @@ nvmf_ub_create_urma(struct spdk_nvmf_ub_transport *utransport)
 
 	/* Initialize URMA library */
 	rc = urma_init(&init_attr);
-	if (rc != URMA_SUCCESS) {
-		SPDK_ERRLOG("Failed to initialize URMA library: %d\n", rc);
+	if (rc == EEXIST) {
+		/*
+		 * URMA is process-wide and may already have been initialized by
+		 * another transport or runtime.  Reuse the existing instance.
+		 */
+		SPDK_NOTICELOG("URMA library was already initialized; reusing the existing instance\n");
+	} else if (rc != URMA_SUCCESS) {
+		SPDK_ERRLOG("Failed to initialize URMA library: %d (%s)\n",
+			    rc, strerror(rc));
 		return -1;
 	}
 
 	g_nvmf_urma_initialized = true;
-	SPDK_NOTICELOG("URMA library initialized successfully\n");
+	if (rc == URMA_SUCCESS) {
+		SPDK_NOTICELOG("URMA library initialized successfully\n");
+	}
 
 	const char *dev_name = getenv(URMA_DEVICE_NAME_ENV);
 	if (dev_name == NULL || dev_name[0] == '\0') {
@@ -476,12 +547,12 @@ nvmf_ub_create_urma(struct spdk_nvmf_ub_transport *utransport)
 	SPDK_NOTICELOG("Using URMA device %s, multi_path=%d\n",
 		       dev->name, utransport->multi_path);
 
-    int eid_index = get_eid_index(dev);
-    if (eid_index < 0) {
-		SPDK_ERRLOG("Failed to get eid_index\n");
+	eid_index = nvmf_ub_get_eid_index(dev);
+	if (eid_index < 0) {
+		SPDK_ERRLOG("Failed to determine EID index\n");
 		return -1;
-    }
-	SPDK_NOTICELOG("eid_index %d\n", eid_index);
+	}
+	SPDK_NOTICELOG("Using EID index %d\n", eid_index);
 
 	/* Create the URMA context using the selected endpoint. */
 	utransport->urma_ctx = urma_create_context(dev, eid_index);
@@ -853,12 +924,15 @@ nvmf_ub_get_remote_tseg(struct spdk_nvmf_ub_qpair *uqpair, uint64_t addr, uint32
 	urma_target_seg_t *tseg;
 	urma_seg_attr_t attr = {0};
 
-	if (uqpair->remote_tseg != NULL && uqpair->remote_tseg->seg.token_id == token_id) {
+	if (uqpair->remote_tseg != NULL && uqpair->remote_tseg->seg.token_id == token_id &&
+	    spdk_nvme_ub_range_contains(uqpair->remote_tseg->seg.ubva.va,
+					uqpair->remote_tseg->seg.len, addr, length)) {
 		return uqpair->remote_tseg;
 	}
 
 	TAILQ_FOREACH(entry, &uqpair->remote_segs, link) {
-		if (entry->token_id == token_id) {
+		if (entry->token_id == token_id &&
+		    spdk_nvme_ub_range_contains(entry->addr, entry->length, addr, length)) {
 			return entry->tseg;
 		}
 	}
@@ -877,6 +951,8 @@ nvmf_ub_get_remote_tseg(struct spdk_nvmf_ub_qpair *uqpair, uint64_t addr, uint32
 	}
 
 	entry->token_id = token_id;
+	entry->addr = addr;
+	entry->length = length;
 	entry->tseg = tseg;
 	TAILQ_INSERT_TAIL(&uqpair->remote_segs, entry, link);
 	return tseg;
@@ -921,8 +997,32 @@ nvmf_ub_unimport_remote_segs(struct spdk_nvmf_ub_qpair *uqpair)
 	}
 }
 
+static void
+nvmf_ub_unimport_npu_resources(struct spdk_nvmf_ub_qpair *uqpair)
+{
+	struct spdk_nvmf_ub_npu_endpoint *endpoint, *endpoint_tmp;
+	struct spdk_nvmf_ub_npu_region *region, *region_tmp;
+
+	TAILQ_FOREACH_SAFE(region, &uqpair->npu_regions, link, region_tmp) {
+		TAILQ_REMOVE(&uqpair->npu_regions, region, link);
+		if (region->tseg != NULL) {
+			urma_unimport_seg(region->tseg);
+		}
+		free(region);
+	}
+	TAILQ_FOREACH_SAFE(endpoint, &uqpair->npu_endpoints, link, endpoint_tmp) {
+		TAILQ_REMOVE(&uqpair->npu_endpoints, endpoint, link);
+		if (endpoint->tjetty != NULL) {
+			urma_unimport_jetty(endpoint->tjetty);
+		}
+		free(endpoint);
+	}
+}
+
+#if 0 /* Legacy fixed-size OOB v1 connection handler. */
 static int
-nvmf_ub_handle_connect(struct spdk_nvmf_ub_qpair *uqpair, struct ub_connect_req_rsp *req,
+nvmf_ub_handle_connect_v1_disabled(struct spdk_nvmf_ub_qpair *uqpair,
+				   struct ub_connect_req_rsp *req,
 		       struct spdk_sock *sock)
 {
 	struct spdk_nvmf_ub_transport *utransport;
@@ -940,7 +1040,7 @@ nvmf_ub_handle_connect(struct spdk_nvmf_ub_qpair *uqpair, struct ub_connect_req_
 	uqpair->remote_trans_mode = req->trans_mode;
 
 	SPDK_NOTICELOG("Handling connect req\n");
-	nvmf_ub_dump_req_rsp(req);
+	nvmf_ub_dump_req_rsp_v1_disabled(req);
 
 	rc = nvmf_ub_create_jetty(uqpair, (uqpair->qid == 0));
 	if (rc < 0) {
@@ -1037,6 +1137,306 @@ error:
 
 	return rc;
 }
+#endif
+
+static struct spdk_nvmf_ub_npu_endpoint *
+nvmf_ub_find_npu_endpoint(struct spdk_nvmf_ub_qpair *uqpair, uint32_t endpoint_id)
+{
+	struct spdk_nvmf_ub_npu_endpoint *endpoint;
+
+	TAILQ_FOREACH(endpoint, &uqpair->npu_endpoints, link) {
+		if (endpoint->endpoint_id == endpoint_id) {
+			return endpoint;
+		}
+	}
+
+	return NULL;
+}
+
+static struct spdk_nvmf_ub_npu_region *
+nvmf_ub_find_npu_region(struct spdk_nvmf_ub_qpair *uqpair, uint32_t region_id)
+{
+	struct spdk_nvmf_ub_npu_region *region;
+
+	TAILQ_FOREACH(region, &uqpair->npu_regions, link) {
+		if (region->region_id == region_id) {
+			return region;
+		}
+	}
+
+	return NULL;
+}
+
+static int
+nvmf_ub_import_npu_resources(struct spdk_nvmf_ub_qpair *uqpair,
+			     const struct spdk_nvme_ub_oob_header *header,
+			     const uint8_t *cursor, const uint8_t *end)
+{
+	struct spdk_nvmf_ub_transport *utransport;
+	urma_import_seg_flag_t import_flag = {};
+	uint32_t i;
+
+	utransport = nvmf_ub_get_transport(uqpair->qpair.transport);
+	if (header->qid == 0 && (header->endpoint_count != 0 || header->region_count != 0)) {
+		return -EPROTO;
+	}
+
+	for (i = 0; i < header->endpoint_count; i++) {
+		const struct spdk_nvme_ub_oob_endpoint *wire;
+		struct spdk_nvmf_ub_npu_endpoint *endpoint;
+		urma_token_t token;
+		void *context;
+
+		if ((size_t)(end - cursor) < sizeof(*wire)) {
+			return -EPROTO;
+		}
+		wire = (const void *)cursor;
+		if (wire->endpoint_id == 0 ||
+		    wire->rjetty_context_size < sizeof(urma_rjetty_t) ||
+		    wire->rjetty_context_size > SPDK_NVME_UB_OOB_MAX_CONTEXT_SIZE ||
+		    wire->record_size != sizeof(*wire) + wire->rjetty_context_size ||
+		    wire->record_size > (size_t)(end - cursor) ||
+		    nvmf_ub_find_npu_endpoint(uqpair, wire->endpoint_id) != NULL) {
+			return -EPROTO;
+		}
+
+		endpoint = calloc(1, sizeof(*endpoint));
+		context = malloc(wire->rjetty_context_size);
+		if (endpoint == NULL || context == NULL) {
+			free(endpoint);
+			free(context);
+			return -ENOMEM;
+		}
+		memcpy(context, wire + 1, wire->rjetty_context_size);
+		token.token = wire->token;
+		endpoint->tjetty = urma_import_jetty(utransport->urma_ctx, context, &token);
+		free(context);
+		if (endpoint->tjetty == NULL) {
+			free(endpoint);
+			SPDK_ERRLOG("Failed to import NPU endpoint %u: errno=%d (%s)\n",
+				    wire->endpoint_id, errno, strerror(errno));
+			return -EIO;
+		}
+		endpoint->endpoint_id = wire->endpoint_id;
+		TAILQ_INSERT_TAIL(&uqpair->npu_endpoints, endpoint, link);
+		cursor += wire->record_size;
+	}
+
+	import_flag.bs.cacheable = URMA_NON_CACHEABLE;
+	import_flag.bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE;
+	import_flag.bs.mapping = URMA_SEG_NOMAP;
+	for (i = 0; i < header->region_count; i++) {
+		const struct spdk_nvme_ub_oob_region *wire;
+		struct spdk_nvmf_ub_npu_endpoint *endpoint;
+		struct spdk_nvmf_ub_npu_region *region;
+		const urma_seg_t *remote_seg;
+		urma_token_t token;
+		void *context;
+
+		if ((size_t)(end - cursor) < sizeof(*wire)) {
+			return -EPROTO;
+		}
+		wire = (const void *)cursor;
+		endpoint = nvmf_ub_find_npu_endpoint(uqpair, wire->endpoint_id);
+		if (wire->region_id == 0 || endpoint == NULL || wire->length == 0 ||
+		    wire->remote_base > UINT64_MAX - wire->length ||
+		    wire->segment_context_size < sizeof(urma_seg_t) ||
+		    wire->segment_context_size > SPDK_NVME_UB_OOB_MAX_CONTEXT_SIZE ||
+		    wire->record_size != sizeof(*wire) + wire->segment_context_size ||
+		    wire->record_size > (size_t)(end - cursor) ||
+		    nvmf_ub_find_npu_region(uqpair, wire->region_id) != NULL) {
+			return -EPROTO;
+		}
+
+		context = malloc(wire->segment_context_size);
+		region = calloc(1, sizeof(*region));
+		if (context == NULL || region == NULL) {
+			free(context);
+			free(region);
+			return -ENOMEM;
+		}
+		memcpy(context, wire + 1, wire->segment_context_size);
+		remote_seg = context;
+		if (remote_seg->ubva.va != wire->remote_base || remote_seg->len < wire->length) {
+			free(context);
+			free(region);
+			return -EPROTO;
+		}
+
+		token.token = wire->token;
+		region->tseg = urma_import_seg(utransport->urma_ctx, context, &token, 0,
+					     import_flag);
+		free(context);
+		if (region->tseg == NULL) {
+			SPDK_ERRLOG("Failed to import NPU region %u: errno=%d (%s)\n",
+				    wire->region_id, errno, strerror(errno));
+			free(region);
+			return -EIO;
+		}
+		region->region_id = wire->region_id;
+		region->endpoint_id = wire->endpoint_id;
+		region->remote_base = wire->remote_base;
+		region->length = wire->length;
+		region->tjetty = endpoint->tjetty;
+		TAILQ_INSERT_TAIL(&uqpair->npu_regions, region, link);
+		cursor += wire->record_size;
+	}
+
+	return cursor == end ? 0 : -EPROTO;
+}
+
+static int
+nvmf_ub_sock_write_all(struct spdk_sock *sock, const void *buf, size_t length)
+{
+	uint64_t deadline = spdk_get_ticks() + 5 * spdk_get_ticks_hz();
+	size_t offset = 0;
+
+	while (offset < length) {
+		struct iovec iov = {
+			.iov_base = (uint8_t *)buf + offset,
+			.iov_len = length - offset,
+		};
+		ssize_t rc = spdk_sock_writev(sock, &iov, 1);
+
+		if (rc > 0) {
+			offset += rc;
+			continue;
+		}
+		if (rc < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+			return -errno;
+		}
+		if (spdk_get_ticks() >= deadline) {
+			return -ETIMEDOUT;
+		}
+		spdk_delay_us(100);
+	}
+
+	return 0;
+}
+
+static int
+nvmf_ub_send_connect_response(struct spdk_nvmf_ub_qpair *uqpair, struct spdk_sock *sock,
+			      uint16_t qid, int status, uint64_t registry_generation)
+{
+	uint8_t response[sizeof(struct spdk_nvme_ub_oob_header) +
+			 sizeof(struct spdk_nvme_ub_oob_cpu_info)] = {};
+	struct spdk_nvme_ub_oob_header *header = (void *)response;
+	struct spdk_nvme_ub_oob_cpu_info *cpu = (void *)(header + 1);
+
+	header->magic = SPDK_NVME_UB_OOB_MAGIC;
+	header->version = SPDK_NVME_UB_OOB_VERSION;
+	header->msg_type = SPDK_NVME_UB_OOB_CONNECT_RSP;
+	header->length = sizeof(response);
+	header->status = status;
+	header->qid = qid;
+	header->registry_generation = registry_generation;
+
+	if (status == 0) {
+		memcpy(cpu->seg_eid, uqpair->local_tseg->seg.ubva.eid.raw,
+		       SPDK_NVME_UB_EID_SIZE);
+		cpu->seg_uasid = uqpair->local_tseg->seg.ubva.uasid;
+		cpu->seg_va = uqpair->local_tseg->seg.ubva.va;
+		cpu->seg_len = uqpair->local_tseg->seg.len;
+		cpu->seg_flag = uqpair->local_tseg->seg.attr.value;
+		cpu->seg_token_id = uqpair->local_tseg->seg.token_id;
+		memcpy(cpu->jetty_eid, uqpair->jetty->jetty_id.eid.raw,
+		       SPDK_NVME_UB_EID_SIZE);
+		cpu->jetty_uasid = uqpair->jetty->jetty_id.uasid;
+		cpu->jetty_id = uqpair->jetty->jetty_id.id;
+		cpu->trans_mode = URMA_TM_RM;
+	}
+
+	return nvmf_ub_sock_write_all(sock, response, sizeof(response));
+}
+
+static int
+nvmf_ub_handle_connect_v2(struct spdk_nvmf_ub_qpair *uqpair, const uint8_t *request,
+			  struct spdk_sock *sock)
+{
+	const struct spdk_nvme_ub_oob_header *header = (const void *)request;
+	const struct spdk_nvme_ub_oob_cpu_info *cpu = (const void *)(header + 1);
+	struct spdk_nvmf_ub_transport *utransport;
+	urma_rjetty_t rjetty = {};
+	urma_token_t token = { .token = 0xABCD };
+	const uint8_t *cursor, *end;
+	int rc;
+
+	utransport = nvmf_ub_get_transport(uqpair->qpair.transport);
+	uqpair->qid = header->qid;
+	uqpair->npu_registry_generation = header->registry_generation;
+	uqpair->remote_uasid = cpu->seg_uasid;
+	memcpy(uqpair->remote_eid.raw, cpu->seg_eid, SPDK_NVME_UB_EID_SIZE);
+	memcpy(uqpair->remote_jetty_id.eid.raw, cpu->jetty_eid, SPDK_NVME_UB_EID_SIZE);
+	uqpair->remote_jetty_id.uasid = cpu->jetty_uasid;
+	uqpair->remote_jetty_id.id = cpu->jetty_id;
+	uqpair->remote_trans_mode = cpu->trans_mode;
+	if (cpu->trans_mode != URMA_TM_RM || cpu->seg_len == 0 ||
+	    cpu->seg_va > UINT64_MAX - cpu->seg_len) {
+		rc = -EPROTO;
+		goto error;
+	}
+
+	rc = nvmf_ub_create_jetty(uqpair, uqpair->qid == 0);
+	if (rc != 0) {
+		goto error;
+	}
+	rc = nvmf_ub_register_seg(uqpair);
+	if (rc != 0) {
+		goto error;
+	}
+
+	rjetty.jetty_id = uqpair->remote_jetty_id;
+	rjetty.trans_mode = URMA_TM_RM;
+	rjetty.type = URMA_JETTY;
+	rjetty.tp_type = URMA_CTP;
+	uqpair->target_jetty = urma_import_jetty(utransport->urma_ctx, &rjetty, &token);
+	if (uqpair->target_jetty == NULL) {
+		rc = -EIO;
+		goto error;
+	}
+
+	uqpair->remote_tseg = nvmf_ub_import_remote_seg(uqpair, cpu->seg_va, cpu->seg_len,
+						      cpu->seg_flag, cpu->seg_token_id);
+	if (uqpair->remote_tseg == NULL) {
+		SPDK_WARNLOG("Unable to pre-import initiator CPU segment for qid %u\n", uqpair->qid);
+	}
+
+	cursor = (const uint8_t *)(cpu + 1);
+	end = request + header->length;
+	rc = nvmf_ub_import_npu_resources(uqpair, header, cursor, end);
+	if (rc != 0) {
+		goto error;
+	}
+
+	uqpair->resources = nvmf_ub_resources_create(uqpair, uqpair->depth);
+	if (uqpair->resources == NULL) {
+		rc = -ENOMEM;
+		goto error;
+	}
+
+	rc = nvmf_ub_send_connect_response(uqpair, sock, uqpair->qid, 0,
+					   header->registry_generation);
+	if (rc != 0) {
+		goto error;
+	}
+
+	spdk_nvmf_tgt_new_qpair(utransport->transport.tgt, &uqpair->qpair);
+	uqpair->state = UB_QPAIR_STATE_RUNNING;
+	SPDK_NOTICELOG("UB qpair %u imported %u NPU endpoints and %u NPU regions, generation=%"
+		       PRIu64 "\n", uqpair->qid, header->endpoint_count, header->region_count,
+		       header->registry_generation);
+	return 0;
+
+error:
+	if (rc >= 0) {
+		rc = -EIO;
+	}
+	if (nvmf_ub_send_connect_response(uqpair, sock, header->qid, rc,
+					  header->registry_generation) != 0) {
+		SPDK_ERRLOG("Failed to send OOB v2 error response for qid %u\n", header->qid);
+	}
+	return rc;
+}
 
 static void
 nvmf_ub_resources_destroy(struct spdk_nvmf_ub_resources *resources)
@@ -1066,6 +1466,7 @@ nvmf_ub_qpair_destroy(struct spdk_nvmf_ub_qpair *uqpair)
 		       uqpair->zcopy_map_failures);
 
 	nvmf_ub_unimport_remote_segs(uqpair);
+	nvmf_ub_unimport_npu_resources(uqpair);
 
 	if (uqpair->target_jetty) {
 		urma_unimport_jetty(uqpair->target_jetty);
@@ -1172,6 +1573,8 @@ nvmf_ub_handle_accept(struct spdk_nvmf_ub_port *port, struct spdk_sock *sock)
 	pending->uqpair->qpair.transport = transport;
 	pending->uqpair->listen_trid = *port->trid;
 	TAILQ_INIT(&pending->uqpair->remote_segs);
+	TAILQ_INIT(&pending->uqpair->npu_endpoints);
+	TAILQ_INIT(&pending->uqpair->npu_regions);
 	pending->req_offset = 0;
 
 	SPDK_NOTICELOG("New connection accepted, waiting for connect request\n");
@@ -1211,8 +1614,10 @@ nvmf_ub_pending_poll(void *ctx)
 	return rc != 0 ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
 }
 
+#if 0 /* Legacy fixed-size OOB v1 receiver. */
 static void
-nvmf_ub_pending_sock_cb(void *ctx, struct spdk_sock_group *group, struct spdk_sock *sock)
+nvmf_ub_pending_sock_cb_v1_disabled(void *ctx, struct spdk_sock_group *group,
+				    struct spdk_sock *sock)
 {
 	struct spdk_nvmf_ub_pending_conn *pending = ctx;
 	struct ub_connect_req_rsp *req;
@@ -1259,7 +1664,7 @@ nvmf_ub_pending_sock_cb(void *ctx, struct spdk_sock_group *group, struct spdk_so
 		goto cleanup;
 	}
 
-	rc = nvmf_ub_handle_connect(pending->uqpair, req, sock);
+	rc = nvmf_ub_handle_connect_v1_disabled(pending->uqpair, req, sock);
 	if (rc < 0) {
 		SPDK_ERRLOG("Failed to handle connect: %d\n", rc);
 		goto cleanup;
@@ -1285,6 +1690,96 @@ cleanup:
 		SPDK_ERRLOG("Failed to remove UB socket from pending group: %d\n", rc);
 	}
 	nvmf_ub_qpair_destroy(pending->uqpair);
+	free(pending);
+	spdk_sock_close(&sock);
+}
+#endif
+
+static void
+nvmf_ub_pending_sock_cb(void *ctx, struct spdk_sock_group *group, struct spdk_sock *sock)
+{
+	struct spdk_nvmf_ub_pending_conn *pending = ctx;
+	void *destination;
+	size_t remaining;
+	ssize_t ret;
+	int rc;
+
+	if (pending->request == NULL) {
+		destination = (uint8_t *)&pending->header + pending->req_offset;
+		remaining = sizeof(pending->header) - pending->req_offset;
+	} else {
+		destination = pending->request + pending->req_offset;
+		remaining = pending->header.length - pending->req_offset;
+	}
+
+	ret = spdk_sock_recv(sock, destination, remaining);
+	if (ret < 0) {
+		if (errno == EAGAIN || errno == EWOULDBLOCK) {
+			return;
+		}
+		SPDK_ERRLOG("Failed to receive OOB v2 request: errno=%d (%s)\n",
+			    errno, strerror(errno));
+		goto cleanup;
+	}
+	if (ret == 0) {
+		SPDK_ERRLOG("OOB socket closed by peer\n");
+		goto cleanup;
+	}
+	pending->req_offset += ret;
+
+	if (pending->request == NULL && pending->req_offset == sizeof(pending->header)) {
+		if (pending->header.magic != SPDK_NVME_UB_OOB_MAGIC ||
+		    pending->header.version != SPDK_NVME_UB_OOB_VERSION ||
+		    pending->header.msg_type != SPDK_NVME_UB_OOB_CONNECT ||
+		    pending->header.status != 0 ||
+		    pending->header.length < sizeof(pending->header) +
+		    sizeof(struct spdk_nvme_ub_oob_cpu_info) ||
+		    pending->header.length > SPDK_NVME_UB_OOB_MAX_SIZE ||
+		    pending->header.endpoint_count > SPDK_NVME_UB_OOB_MAX_ENDPOINTS ||
+		    pending->header.region_count > SPDK_NVME_UB_OOB_MAX_REGIONS) {
+			SPDK_ERRLOG("Invalid OOB v2 header\n");
+			goto cleanup;
+		}
+
+		pending->request = malloc(pending->header.length);
+		if (pending->request == NULL) {
+			goto cleanup;
+		}
+		memcpy(pending->request, &pending->header, sizeof(pending->header));
+		if (pending->req_offset < pending->header.length) {
+			return;
+		}
+	}
+
+	if (pending->request == NULL || pending->req_offset < pending->header.length) {
+		return;
+	}
+	if (pending->req_offset != pending->header.length) {
+		goto cleanup;
+	}
+
+	rc = nvmf_ub_handle_connect_v2(pending->uqpair, pending->request, sock);
+	if (rc != 0) {
+		SPDK_ERRLOG("Failed to handle OOB v2 connect: %d\n", rc);
+		goto cleanup;
+	}
+
+	rc = spdk_sock_group_remove_sock(group, sock);
+	if (rc != 0) {
+		SPDK_ERRLOG("Failed to remove connected UB socket from pending group: %d\n", rc);
+	}
+	spdk_sock_close(&sock);
+	free(pending->request);
+	free(pending);
+	return;
+
+cleanup:
+	rc = spdk_sock_group_remove_sock(group, sock);
+	if (rc != 0) {
+		SPDK_ERRLOG("Failed to remove UB socket from pending group: %d\n", rc);
+	}
+	nvmf_ub_qpair_destroy(pending->uqpair);
+	free(pending->request);
 	free(pending);
 	spdk_sock_close(&sock);
 }
@@ -1680,48 +2175,88 @@ static int nvmf_ub_post_send_response_ctx(struct spdk_nvmf_ub_request *ub_req,
 		struct spdk_nvmf_ub_response *ub_rsp);
 
 static int
-nvmf_ub_post_ub_read(struct spdk_nvmf_ub_request *ub_req, void *local_buf,
-		     urma_target_seg_t *local_tseg)
+nvmf_ub_post_data_transfer(struct spdk_nvmf_ub_request *ub_req, void *local_buf,
+			   urma_target_seg_t *local_tseg, urma_opcode_t opcode)
 {
 	struct spdk_nvmf_ub_qpair *uqpair = SPDK_CONTAINEROF(ub_req->req.qpair,
 		struct spdk_nvmf_ub_qpair, qpair);
-	urma_target_seg_t *remote_tseg;
-	urma_sge_t remote_sge, local_sge;
-	urma_sg_t remote_sg, local_sg;
-	urma_rw_wr_t ub_rw_wr;
-	urma_jfs_wr_t read_wr = {0};
-	urma_jfs_wr_t *bad_wr = NULL;
+	uint64_t local_offset = 0;
+	uint32_t i;
 
-	remote_tseg = nvmf_ub_get_remote_tseg(uqpair, ub_req->remote_addr,
-			ub_req->req.length, ub_req->remote_key);
-	if (remote_tseg == NULL) {
-		return -EFAULT;
+	if ((opcode != URMA_OPC_READ && opcode != URMA_OPC_WRITE) ||
+	    ub_req->num_remote_sges == 0 || local_tseg == NULL || local_buf == NULL) {
+		return -EINVAL;
+	}
+	for (i = 0; i < ub_req->num_remote_sges; i++) {
+		struct spdk_nvmf_ub_remote_sge *remote = &ub_req->remote_sges[i];
+
+		if (remote->tseg == NULL || remote->tjetty == NULL || remote->length == 0 ||
+		    local_offset + remote->length > ub_req->req.length) {
+			return -EINVAL;
+		}
+		local_offset += remote->length;
+	}
+	if (local_offset != ub_req->req.length) {
+		return -EINVAL;
+	}
+	local_offset = 0;
+
+	ub_req->num_outstanding_data_wr = 0;
+	ub_req->data_transfer_failed = false;
+	ub_req->awaiting_ub_read_completion = opcode == URMA_OPC_READ;
+	ub_req->awaiting_ub_write_completion = opcode == URMA_OPC_WRITE;
+	ub_req->ub_state = opcode == URMA_OPC_READ ? UB_REQ_UB_STATE_WAIT_READ :
+							      UB_REQ_UB_STATE_WAIT_WRITE;
+
+	for (i = 0; i < ub_req->num_remote_sges; i++) {
+		struct spdk_nvmf_ub_remote_sge *remote = &ub_req->remote_sges[i];
+		urma_sge_t remote_sge = {0}, local_sge = {0};
+		urma_sg_t remote_sg = {0}, local_sg = {0};
+		urma_rw_wr_t ub_rw_wr = {0};
+		urma_jfs_wr_t data_wr = {0};
+		urma_jfs_wr_t *bad_wr = NULL;
+
+		remote_sge.addr = remote->remote_addr;
+		remote_sge.len = remote->length;
+		remote_sge.tseg = remote->tseg;
+		remote_sg.sge = &remote_sge;
+		remote_sg.num_sge = 1;
+
+		local_sge.addr = (uint64_t)(uintptr_t)local_buf + local_offset;
+		local_sge.len = remote->length;
+		local_sge.tseg = local_tseg;
+		local_sg.sge = &local_sge;
+		local_sg.num_sge = 1;
+
+		if (opcode == URMA_OPC_READ) {
+			ub_rw_wr.src = remote_sg;
+			ub_rw_wr.dst = local_sg;
+		} else {
+			ub_rw_wr.src = local_sg;
+			ub_rw_wr.dst = remote_sg;
+		}
+
+		data_wr.opcode = opcode;
+		data_wr.flag.bs.complete_enable = 1;
+		data_wr.tjetty = remote->tjetty;
+		data_wr.user_ctx = (uint64_t)(uintptr_t)ub_req;
+		data_wr.rw = ub_rw_wr;
+
+		if (urma_post_jetty_send_wr(uqpair->jetty, &data_wr, &bad_wr) != URMA_SUCCESS) {
+			SPDK_ERRLOG("Failed to post UB %s for qid %u SGE %u/%u\n",
+				    opcode == URMA_OPC_READ ? "READ" : "WRITE", uqpair->qid,
+				    i, ub_req->num_remote_sges);
+			ub_req->data_transfer_failed = true;
+			break;
+		}
+
+		ub_req->num_outstanding_data_wr++;
+		local_offset += remote->length;
 	}
 
-	remote_sge.addr = ub_req->remote_addr;
-	remote_sge.len = ub_req->req.length;
-	remote_sge.tseg = remote_tseg;
-	remote_sg.sge = &remote_sge;
-	remote_sg.num_sge = 1;
-
-	local_sge.addr = (uint64_t)(uintptr_t)local_buf;
-	local_sge.len = ub_req->req.length;
-	local_sge.tseg = local_tseg;
-	local_sg.sge = &local_sge;
-	local_sg.num_sge = 1;
-
-	ub_rw_wr.src = remote_sg;
-	ub_rw_wr.dst = local_sg;
-	read_wr.opcode = URMA_OPC_READ;
-	read_wr.flag.bs.complete_enable = 1;
-	read_wr.tjetty = uqpair->target_jetty;
-	read_wr.user_ctx = (uint64_t)(uintptr_t)ub_req;
-	read_wr.rw = ub_rw_wr;
-
-	ub_req->awaiting_ub_read_completion = true;
-	ub_req->ub_state = UB_REQ_UB_STATE_WAIT_READ;
-	if (urma_post_jetty_send_wr(uqpair->jetty, &read_wr, &bad_wr) != URMA_SUCCESS) {
+	if (ub_req->num_outstanding_data_wr == 0) {
 		ub_req->awaiting_ub_read_completion = false;
+		ub_req->awaiting_ub_write_completion = false;
 		ub_req->ub_state = UB_REQ_UB_STATE_NONE;
 		return -EIO;
 	}
@@ -1730,53 +2265,17 @@ nvmf_ub_post_ub_read(struct spdk_nvmf_ub_request *ub_req, void *local_buf,
 }
 
 static int
+nvmf_ub_post_ub_read(struct spdk_nvmf_ub_request *ub_req, void *local_buf,
+		     urma_target_seg_t *local_tseg)
+{
+	return nvmf_ub_post_data_transfer(ub_req, local_buf, local_tseg, URMA_OPC_READ);
+}
+
+static int
 nvmf_ub_post_ub_write(struct spdk_nvmf_ub_request *ub_req, void *local_buf,
 		      urma_target_seg_t *local_tseg)
 {
-	struct spdk_nvmf_ub_qpair *uqpair = SPDK_CONTAINEROF(ub_req->req.qpair,
-		struct spdk_nvmf_ub_qpair, qpair);
-	urma_target_seg_t *remote_tseg;
-	urma_sge_t remote_sge, local_sge;
-	urma_sg_t remote_sg, local_sg;
-	urma_rw_wr_t ub_rw_wr;
-	urma_jfs_wr_t write_wr = {0};
-	urma_jfs_wr_t *bad_wr = NULL;
-
-	remote_tseg = nvmf_ub_get_remote_tseg(uqpair, ub_req->remote_addr,
-			ub_req->req.length, ub_req->remote_key);
-	if (remote_tseg == NULL) {
-		return -EFAULT;
-	}
-
-	remote_sge.addr = ub_req->remote_addr;
-	remote_sge.len = ub_req->req.length;
-	remote_sge.tseg = remote_tseg;
-	remote_sg.sge = &remote_sge;
-	remote_sg.num_sge = 1;
-
-	local_sge.addr = (uint64_t)(uintptr_t)local_buf;
-	local_sge.len = ub_req->req.length;
-	local_sge.tseg = local_tseg;
-	local_sg.sge = &local_sge;
-	local_sg.num_sge = 1;
-
-	ub_rw_wr.src = local_sg;
-	ub_rw_wr.dst = remote_sg;
-	write_wr.opcode = URMA_OPC_WRITE;
-	write_wr.flag.bs.complete_enable = 1;
-	write_wr.tjetty = uqpair->target_jetty;
-	write_wr.user_ctx = (uint64_t)(uintptr_t)ub_req;
-	write_wr.rw = ub_rw_wr;
-
-	ub_req->awaiting_ub_write_completion = true;
-	ub_req->ub_state = UB_REQ_UB_STATE_WAIT_WRITE;
-	if (urma_post_jetty_send_wr(uqpair->jetty, &write_wr, &bad_wr) != URMA_SUCCESS) {
-		ub_req->awaiting_ub_write_completion = false;
-		ub_req->ub_state = UB_REQ_UB_STATE_NONE;
-		return -EIO;
-	}
-
-	return 0;
+	return nvmf_ub_post_data_transfer(ub_req, local_buf, local_tseg, URMA_OPC_WRITE);
 }
 
 static int
@@ -1950,6 +2449,9 @@ nvmf_ub_req_put(struct spdk_nvmf_ub_request *ub_req)
 	ub_req->ub_state = UB_REQ_UB_STATE_NONE;
 	ub_req->awaiting_ub_read_completion = false;
 	ub_req->awaiting_ub_write_completion = false;
+	ub_req->num_remote_sges = 0;
+	ub_req->num_outstanding_data_wr = 0;
+	ub_req->data_transfer_failed = false;
 	ub_req->zcopy_abort = false;
 	ub_req->recv_slot = NVMF_UB_INVALID_RECV_SLOT;
 	ub_req->in_use = false;
@@ -2022,7 +2524,42 @@ nvmf_ub_req_free(struct spdk_nvmf_request *req)
 }
 
 static void
-nvmf_ub_handle_cmd(struct spdk_nvmf_ub_qpair *uqpair, uint32_t recv_slot)
+nvmf_ub_start_remote_request(struct spdk_nvmf_ub_request *ub_req, void *local_buf)
+{
+	struct spdk_nvmf_request *req = &ub_req->req;
+	struct spdk_nvmf_ub_qpair *uqpair = SPDK_CONTAINEROF(req->qpair,
+		struct spdk_nvmf_ub_qpair, qpair);
+
+	ub_req->data_from_remote = true;
+	if (nvmf_ctrlr_use_zcopy(req)) {
+		req->data_from_pool = false;
+		spdk_nvmf_request_zcopy_start(req);
+		return;
+	}
+
+	if (req->xfer == SPDK_NVME_DATA_CONTROLLER_TO_HOST) {
+		spdk_nvmf_request_exec(req);
+		return;
+	}
+
+	if (req->xfer == SPDK_NVME_DATA_HOST_TO_CONTROLLER) {
+		if (nvmf_ub_post_ub_read(ub_req, local_buf, uqpair->local_tseg) == 0) {
+			return;
+		}
+
+		SPDK_ERRLOG("Failed to post UB READ WRs on qid %u\n", uqpair->qid);
+		req->rsp->nvme_cpl.cid = req->cmd->nvme_cmd.cid;
+		req->rsp->nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+		nvmf_ub_post_send_response(ub_req);
+		return;
+	}
+
+	spdk_nvmf_request_exec(req);
+}
+
+static void
+nvmf_ub_handle_cmd(struct spdk_nvmf_ub_qpair *uqpair, uint32_t recv_slot,
+		   uint32_t capsule_len)
 {
 	struct spdk_nvmf_ub_resources *resources = uqpair->resources;
 	struct spdk_nvmf_ub_request *ub_req;
@@ -2033,7 +2570,8 @@ nvmf_ub_handle_cmd(struct spdk_nvmf_ub_qpair *uqpair, uint32_t recv_slot)
 	uint32_t data_len;
 	void *cmd;
 
-	if (resources == NULL || recv_slot >= uqpair->depth) {
+	if (resources == NULL || recv_slot >= uqpair->depth ||
+	    capsule_len < sizeof(struct spdk_nvme_cmd) || capsule_len > MSG_SIZE) {
 		SPDK_ERRLOG("Invalid UB receive on qid %u, slot=%u\n", uqpair->qid, recv_slot);
 		spdk_nvmf_qpair_disconnect(&uqpair->qpair);
 		return;
@@ -2078,6 +2616,11 @@ nvmf_ub_handle_cmd(struct spdk_nvmf_ub_qpair *uqpair, uint32_t recv_slot)
 	ub_req->data_from_remote = false;
 	ub_req->remote_addr = 0;
 	ub_req->remote_key = 0;
+	ub_req->remote_data_tseg = NULL;
+	ub_req->remote_data_tjetty = NULL;
+	ub_req->num_remote_sges = 0;
+	ub_req->num_outstanding_data_wr = 0;
+	ub_req->data_transfer_failed = false;
 	ub_req->awaiting_ub_read_completion = false;
 	ub_req->awaiting_ub_write_completion = false;
 	ub_req->zcopy_abort = false;
@@ -2113,6 +2656,51 @@ nvmf_ub_handle_cmd(struct spdk_nvmf_ub_qpair *uqpair, uint32_t recv_slot)
 
 	/* Handle different SGL types */
 	switch (sgl->generic.type) {
+	case SPDK_NVME_SGL_TYPE_VENDOR_SPECIFIC:
+		{
+			struct spdk_nvmf_ub_npu_region *region;
+
+			if (sgl->keyed.subtype != SPDK_NVME_UB_SGL_SUBTYPE_NPU) {
+				SPDK_ERRLOG("Unsupported UB vendor SGL subtype %u on qid %u\n",
+					    sgl->keyed.subtype, uqpair->qid);
+				nvmf_req->rsp->nvme_cpl.cid = nvmf_req->cmd->nvme_cmd.cid;
+				nvmf_req->rsp->nvme_cpl.status.sc =
+					SPDK_NVME_SC_SGL_DESCRIPTOR_TYPE_INVALID;
+				nvmf_ub_post_send_response(ub_req);
+				return;
+			}
+
+			region = nvmf_ub_find_npu_region(uqpair, sgl->keyed.key);
+			if (region == NULL ||
+			    !spdk_nvme_ub_range_contains(region->remote_base, region->length,
+						     sgl->address, sgl->keyed.length)) {
+				SPDK_ERRLOG("Invalid NPU region/address: qid=%u region=%u addr=0x%" PRIx64
+					    " len=%u\n", uqpair->qid, sgl->keyed.key,
+					    sgl->address, (uint32_t)sgl->keyed.length);
+				nvmf_req->rsp->nvme_cpl.cid = nvmf_req->cmd->nvme_cmd.cid;
+				nvmf_req->rsp->nvme_cpl.status.sc =
+					SPDK_NVME_SC_DATA_SGL_LENGTH_INVALID;
+				nvmf_ub_post_send_response(ub_req);
+				return;
+			}
+
+			ub_req->data_from_remote = true;
+			ub_req->remote_addr = sgl->address;
+			ub_req->remote_key = sgl->keyed.key;
+			ub_req->remote_data_tseg = region->tseg;
+			ub_req->remote_data_tjetty = region->tjetty;
+			ub_req->num_remote_sges = 1;
+			ub_req->remote_sges[0].remote_addr = sgl->address;
+			ub_req->remote_sges[0].length = sgl->keyed.length;
+			ub_req->remote_sges[0].key = sgl->keyed.key;
+			ub_req->remote_sges[0].tseg = region->tseg;
+			ub_req->remote_sges[0].tjetty = region->tjetty;
+
+			nvmf_ub_start_remote_request(ub_req, local_buf);
+			return;
+		}
+		break;
+
 	case SPDK_NVME_SGL_TYPE_KEYED_DATA_BLOCK:
 		if (sgl->keyed.subtype != SPDK_NVME_SGL_SUBTYPE_ADDRESS) {
 			SPDK_ERRLOG("Unsupported keyed SGL subtype %u on qid %u\n",
@@ -2124,6 +2712,8 @@ nvmf_ub_handle_cmd(struct spdk_nvmf_ub_qpair *uqpair, uint32_t recv_slot)
 		}
 
 		{
+			urma_target_seg_t *remote_tseg;
+
 			/* Store remote info for UB operations in ub_req */
 			ub_req->data_from_remote = true;
 			ub_req->remote_addr = sgl->address;
@@ -2134,34 +2724,127 @@ nvmf_ub_handle_cmd(struct spdk_nvmf_ub_qpair *uqpair, uint32_t recv_slot)
 				      local_buf, sgl->address, sgl->keyed.length, sgl->keyed.key,
 				      nvmf_req->xfer);
 
-			if ((nvmf_req->xfer == SPDK_NVME_DATA_HOST_TO_CONTROLLER ||
-			     nvmf_req->xfer == SPDK_NVME_DATA_CONTROLLER_TO_HOST) &&
-			    nvmf_ctrlr_use_zcopy(nvmf_req)) {
-				nvmf_req->data_from_pool = false;
-				spdk_nvmf_request_zcopy_start(nvmf_req);
+			if (nvmf_req->xfer == SPDK_NVME_DATA_NONE) {
+				break;
+			}
+
+			remote_tseg = nvmf_ub_get_remote_tseg(uqpair, sgl->address,
+							       sgl->keyed.length, sgl->keyed.key);
+			if (remote_tseg == NULL) {
+				nvmf_req->rsp->nvme_cpl.cid = nvmf_req->cmd->nvme_cmd.cid;
+				nvmf_req->rsp->nvme_cpl.status.sc = SPDK_NVME_SC_DATA_SGL_LENGTH_INVALID;
+				nvmf_ub_post_send_response(ub_req);
 				return;
 			}
 
-			if (nvmf_req->xfer == SPDK_NVME_DATA_CONTROLLER_TO_HOST) {
-				spdk_nvmf_request_exec(nvmf_req);
-				return;
-			}
+			ub_req->num_remote_sges = 1;
+			ub_req->remote_sges[0].remote_addr = sgl->address;
+			ub_req->remote_sges[0].length = sgl->keyed.length;
+			ub_req->remote_sges[0].key = sgl->keyed.key;
+			ub_req->remote_sges[0].tseg = remote_tseg;
+			ub_req->remote_sges[0].tjetty = uqpair->target_jetty;
 
-			/* If this is a Host-to-Controller transfer, we need to UB READ the data
-			 * from client's remote memory before executing the command. */
-			if (nvmf_req->xfer == SPDK_NVME_DATA_HOST_TO_CONTROLLER) {
-				if (nvmf_ub_post_ub_read(ub_req, local_buf,
-							  uqpair->local_tseg) != 0) {
-					SPDK_ERRLOG("Failed to post UB READ WR\n");
-					nvmf_req->rsp->nvme_cpl.cid = nvmf_req->cmd->nvme_cmd.cid;
-					nvmf_req->rsp->nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
-					nvmf_ub_post_send_response(ub_req);
-					return;
-				}
-				return;
-			}
+			nvmf_ub_start_remote_request(ub_req, local_buf);
+			return;
 		}
 		break;
+
+	case SPDK_NVME_SGL_TYPE_LAST_SEGMENT:
+		{
+			struct spdk_nvme_sgl_descriptor *descs;
+			uint32_t capsule_data_len = capsule_len - sizeof(struct spdk_nvme_cmd);
+			uint32_t descriptor_bytes = sgl->unkeyed.length;
+			uint32_t descriptor_count;
+			uint64_t total_length = 0;
+			uint32_t i;
+
+			if (sgl->unkeyed.subtype != SPDK_NVME_SGL_SUBTYPE_OFFSET ||
+			    descriptor_bytes == 0 ||
+			    descriptor_bytes % sizeof(struct spdk_nvme_sgl_descriptor) != 0 ||
+			    sgl->address > capsule_data_len ||
+			    descriptor_bytes > capsule_data_len - sgl->address) {
+				SPDK_ERRLOG("Invalid UB SGL segment: qid=%u offset=%" PRIu64
+					    " length=%u capsule_data=%u\n", uqpair->qid, sgl->address,
+					    descriptor_bytes, capsule_data_len);
+				nvmf_req->rsp->nvme_cpl.cid = nvmf_req->cmd->nvme_cmd.cid;
+				nvmf_req->rsp->nvme_cpl.status.sc = SPDK_NVME_SC_INVALID_SGL_OFFSET;
+				nvmf_ub_post_send_response(ub_req);
+				return;
+			}
+
+			descriptor_count = descriptor_bytes / sizeof(*descs);
+			if (descriptor_count > SPDK_NVME_UB_MAX_SGL_DESCRIPTORS) {
+				nvmf_req->rsp->nvme_cpl.cid = nvmf_req->cmd->nvme_cmd.cid;
+				nvmf_req->rsp->nvme_cpl.status.sc = SPDK_NVME_SC_DATA_SGL_LENGTH_INVALID;
+				nvmf_ub_post_send_response(ub_req);
+				return;
+			}
+
+			descs = (struct spdk_nvme_sgl_descriptor *)
+				((uint8_t *)cmd + sizeof(struct spdk_nvme_cmd) + sgl->address);
+			for (i = 0; i < descriptor_count; i++) {
+				struct spdk_nvme_sgl_descriptor *desc = &descs[i];
+				struct spdk_nvmf_ub_remote_sge *remote = &ub_req->remote_sges[i];
+
+				if (desc->keyed.length == 0 ||
+				    total_length + desc->keyed.length > SPDK_NVMF_UB_DEFAULT_MAX_IO_SIZE) {
+					goto invalid_multi_sgl;
+				}
+
+				remote->remote_addr = desc->address;
+				remote->length = desc->keyed.length;
+				remote->key = desc->keyed.key;
+				if (desc->generic.type == SPDK_NVME_SGL_TYPE_VENDOR_SPECIFIC &&
+				    desc->keyed.subtype == SPDK_NVME_UB_SGL_SUBTYPE_NPU) {
+					struct spdk_nvmf_ub_npu_region *region;
+
+					region = nvmf_ub_find_npu_region(uqpair, desc->keyed.key);
+					if (region == NULL ||
+					    !spdk_nvme_ub_range_contains(region->remote_base, region->length,
+								     desc->address, desc->keyed.length)) {
+						goto invalid_multi_sgl;
+					}
+					remote->tseg = region->tseg;
+					remote->tjetty = region->tjetty;
+				} else if (desc->generic.type == SPDK_NVME_SGL_TYPE_KEYED_DATA_BLOCK &&
+					   desc->keyed.subtype == SPDK_NVME_SGL_SUBTYPE_ADDRESS) {
+					remote->tseg = nvmf_ub_get_remote_tseg(uqpair, desc->address,
+										 desc->keyed.length,
+										 desc->keyed.key);
+					remote->tjetty = uqpair->target_jetty;
+					if (remote->tseg == NULL || remote->tjetty == NULL) {
+						goto invalid_multi_sgl;
+					}
+				} else {
+					goto invalid_multi_sgl;
+				}
+
+				total_length += desc->keyed.length;
+			}
+
+			ub_req->num_remote_sges = descriptor_count;
+			ub_req->remote_addr = ub_req->remote_sges[0].remote_addr;
+			ub_req->remote_key = ub_req->remote_sges[0].key;
+			ub_req->remote_data_tseg = ub_req->remote_sges[0].tseg;
+			ub_req->remote_data_tjetty = ub_req->remote_sges[0].tjetty;
+			nvmf_req->iov[0].iov_base = local_buf;
+			nvmf_req->iov[0].iov_len = total_length;
+			nvmf_req->iovcnt = 1;
+			nvmf_req->length = total_length;
+
+			SPDK_DEBUGLOG(ub, "Multi SGL: qid=%u descriptors=%u length=%u xfer=%d\n",
+				      uqpair->qid, descriptor_count, nvmf_req->length, nvmf_req->xfer);
+			nvmf_ub_start_remote_request(ub_req, local_buf);
+			return;
+
+invalid_multi_sgl:
+			SPDK_ERRLOG("Invalid UB multi-SGL descriptor %u/%u on qid %u\n",
+				    i, descriptor_count, uqpair->qid);
+			nvmf_req->rsp->nvme_cpl.cid = nvmf_req->cmd->nvme_cmd.cid;
+			nvmf_req->rsp->nvme_cpl.status.sc = SPDK_NVME_SC_DATA_SGL_LENGTH_INVALID;
+			nvmf_ub_post_send_response(ub_req);
+			return;
+		}
 
 	case SPDK_NVME_SGL_TYPE_DATA_BLOCK:
 		{
@@ -2288,7 +2971,8 @@ nvmf_ub_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 					}
 					SPDK_DEBUGLOG(ub, "Received command: qid=%u slot=%" PRIu64 " len=%u\n",
 						      uqpair->qid, cr->user_ctx, cr->completion_len);
-					nvmf_ub_handle_cmd(uqpair, (uint32_t)cr->user_ctx);
+					nvmf_ub_handle_cmd(uqpair, (uint32_t)cr->user_ctx,
+							   cr->completion_len);
 
 				} else {
 					completed_ub_rsp = (struct spdk_nvmf_ub_response *)(uintptr_t)cr->user_ctx;
@@ -2324,9 +3008,29 @@ nvmf_ub_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 
 						switch (completed_ub_req->ub_state) {
 						case UB_REQ_UB_STATE_WAIT_READ:
+							if (completed_ub_req->num_outstanding_data_wr == 0) {
+								SPDK_ERRLOG("Unexpected extra UB READ completion for req %p\n",
+									    completed_ub_req);
+								spdk_nvmf_qpair_disconnect(&uqpair->qpair);
+								qpair_failed = true;
+								break;
+							}
+							completed_ub_req->num_outstanding_data_wr--;
+							if (completed_ub_req->num_outstanding_data_wr != 0) {
+								break;
+							}
 							completed_ub_req->awaiting_ub_read_completion = false;
 							completed_ub_req->ub_state = UB_REQ_UB_STATE_NONE;
-							if (completed_ub_req->zcopy_abort ||
+							if (completed_ub_req->data_transfer_failed) {
+								completed_ub_req->req.rsp->nvme_cpl.status.sct = SPDK_NVME_SCT_GENERIC;
+								completed_ub_req->req.rsp->nvme_cpl.status.sc =
+									SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+								if (completed_ub_req->req.zcopy_phase == NVMF_ZCOPY_PHASE_EXECUTE) {
+									spdk_nvmf_request_zcopy_end(&completed_ub_req->req, false);
+								} else {
+									nvmf_ub_post_send_response(completed_ub_req);
+								}
+							} else if (completed_ub_req->zcopy_abort ||
 							    __atomic_load_n(&uqpair->qpair.disconnect_started,
 									    __ATOMIC_RELAXED)) {
 								if (completed_ub_req->req.zcopy_phase ==
@@ -2344,9 +3048,29 @@ nvmf_ub_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 							break;
 
 						case UB_REQ_UB_STATE_WAIT_WRITE:
+							if (completed_ub_req->num_outstanding_data_wr == 0) {
+								SPDK_ERRLOG("Unexpected extra UB WRITE completion for req %p\n",
+									    completed_ub_req);
+								spdk_nvmf_qpair_disconnect(&uqpair->qpair);
+								qpair_failed = true;
+								break;
+							}
+							completed_ub_req->num_outstanding_data_wr--;
+							if (completed_ub_req->num_outstanding_data_wr != 0) {
+								break;
+							}
 							completed_ub_req->awaiting_ub_write_completion = false;
 							completed_ub_req->ub_state = UB_REQ_UB_STATE_NONE;
-							if (completed_ub_req->zcopy_abort ||
+							if (completed_ub_req->data_transfer_failed) {
+								completed_ub_req->req.rsp->nvme_cpl.status.sct = SPDK_NVME_SCT_GENERIC;
+								completed_ub_req->req.rsp->nvme_cpl.status.sc =
+									SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+								if (completed_ub_req->req.zcopy_phase == NVMF_ZCOPY_PHASE_EXECUTE) {
+									spdk_nvmf_request_zcopy_end(&completed_ub_req->req, false);
+								} else {
+									nvmf_ub_post_send_response(completed_ub_req);
+								}
+							} else if (completed_ub_req->zcopy_abort ||
 							    __atomic_load_n(&uqpair->qpair.disconnect_started,
 									    __ATOMIC_RELAXED)) {
 								if (completed_ub_req->req.zcopy_phase ==
