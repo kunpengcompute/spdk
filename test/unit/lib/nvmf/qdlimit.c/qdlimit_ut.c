@@ -11,11 +11,11 @@
 static char g_fake_bdev_a;
 static char g_fake_bdev_b;
 
-DEFINE_STUB(spdk_bdev_get_name, const char *, (const struct spdk_bdev *bdev),
-	    ((void *)bdev == &g_fake_bdev_a) ? "bdevA" : "bdevB");
+// DEFINE_STUB(spdk_bdev_get_name, const char *, (const struct spdk_bdev *bdev),
+// 	    ((void *)bdev == &g_fake_bdev_a) ? "bdevA" : "bdevB");
 
-DEFINE_STUB(_nvmf_subsystem_get_ns, struct spdk_nvmf_ns *,
-	    (struct spdk_nvmf_subsystem *subsystem, uint32_t nsid), NULL);
+// DEFINE_STUB(_nvmf_subsystem_get_ns, struct spdk_nvmf_ns *,
+// 	    (struct spdk_nvmf_subsystem *subsystem, uint32_t nsid), NULL);
 
 static void
 test_config_set_get(void)
