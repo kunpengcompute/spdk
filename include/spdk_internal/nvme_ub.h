@@ -7,8 +7,8 @@
 
 #include "spdk/stdinc.h"
 
-#define SPDK_NVME_UB_OOB_MAGIC			0x32424f55u /* "UOB2" */
-#define SPDK_NVME_UB_OOB_VERSION		2u
+#define SPDK_NVME_UB_OOB_MAGIC			0x31424f55u /* "UOB1" */
+#define SPDK_NVME_UB_OOB_VERSION		1u
 #define SPDK_NVME_UB_OOB_MAX_SIZE		(4u * 1024u * 1024u)
 #define SPDK_NVME_UB_OOB_MAX_ENDPOINTS		64u
 #define SPDK_NVME_UB_OOB_MAX_REGIONS		1024u

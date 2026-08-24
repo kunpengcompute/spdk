@@ -42,7 +42,6 @@ SPDK_STATIC_ASSERT(SPDK_NVME_UB_MAX_SGL_DESCRIPTORS <= SPDK_NVMF_MAX_SGL_ENTRIES
 #define URMA_DEVICE_NAME_ENV "URMA_DEVICE_NAME"
 #define URMA_DEFAULT_DEVICE_NAME "bonding_dev_0"
 #define URMA_EID_INDEX_ENV "URMA_EID_INDEX"
-#define URMA_DEFAULT_EID_INDEX 1
 #define URMA_BONDING_DEVICE_PREFIX "bonding_dev_"
 
 static bool
@@ -51,6 +50,33 @@ nvmf_ub_device_uses_multipath(const char *dev_name)
 	return dev_name != NULL &&
 	       strncmp(dev_name, URMA_BONDING_DEVICE_PREFIX,
 	               sizeof(URMA_BONDING_DEVICE_PREFIX) - 1) == 0;
+}
+
+static const char *
+nvmf_ub_cr_status_string(urma_cr_status_t status)
+{
+	switch (status) {
+	case URMA_CR_SUCCESS:
+		return "success";
+	case URMA_CR_LOC_LEN_ERR:
+		return "local length error";
+	case URMA_CR_LOC_OPERATION_ERR:
+		return "local operation error";
+	case URMA_CR_LOC_ACCESS_ERR:
+		return "local access error";
+	case URMA_CR_REM_OPERATION_ERR:
+		return "remote operation error";
+	case URMA_CR_REM_ACCESS_ABORT_ERR:
+		return "remote access/abort error";
+	case URMA_CR_ACK_TIMEOUT_ERR:
+		return "ACK timeout";
+	case URMA_CR_RNR_RETRY_CNT_EXC_ERR:
+		return "RNR retry exceeded";
+	case URMA_CR_WR_FLUSH_ERR:
+		return "WR flushed";
+	default:
+		return "unknown";
+	}
 }
 
 const struct spdk_nvmf_transport_ops spdk_nvmf_transport_ub;
@@ -335,8 +361,9 @@ nvmf_ub_get_eid_index(urma_device_t *dev)
 {
 	urma_eid_info_t *eid_list;
 	const char *value;
-	uint32_t eid_cnt;
+	uint32_t eid_cnt, i;
 	long eid_index;
+	int selected;
 
 	eid_list = urma_get_eid_list(dev, &eid_cnt);
 	if (eid_list == NULL) {
@@ -344,26 +371,39 @@ nvmf_ub_get_eid_index(urma_device_t *dev)
 		return -ENODEV;
 	}
 
-	urma_free_eid_list(eid_list);
-
 	if (eid_cnt == 0) {
 		SPDK_ERRLOG("URMA device %s has no EIDs\n", dev->name);
+		urma_free_eid_list(eid_list);
 		return -ENODEV;
 	}
 
 	value = getenv(URMA_EID_INDEX_ENV);
 	if (value == NULL || value[0] == '\0') {
-		return URMA_DEFAULT_EID_INDEX;
+		selected = (int)eid_list[0].eid_index;
+		urma_free_eid_list(eid_list);
+		return selected;
 	}
 
 	eid_index = spdk_strtol(value, 10);
 	if (eid_index < 0 || eid_index > INT_MAX) {
 		SPDK_ERRLOG("Invalid %s value '%s'; expected an integer between 0 and %d\n",
 			    URMA_EID_INDEX_ENV, value, INT_MAX);
+		urma_free_eid_list(eid_list);
 		return -EINVAL;
 	}
 
-	return (int)eid_index;
+	for (i = 0; i < eid_cnt; i++) {
+		if (eid_list[i].eid_index == (uint32_t)eid_index) {
+			selected = (int)eid_index;
+			urma_free_eid_list(eid_list);
+			return selected;
+		}
+	}
+
+	SPDK_ERRLOG("%s=%ld is not present on URMA device %s\n",
+		    URMA_EID_INDEX_ENV, eid_index, dev->name);
+	urma_free_eid_list(eid_list);
+	return -ENODEV;
 }
 
 static int
@@ -1080,7 +1120,7 @@ nvmf_ub_send_connect_response(struct spdk_nvmf_ub_qpair *uqpair, struct spdk_soc
 }
 
 static int
-nvmf_ub_handle_connect_v2(struct spdk_nvmf_ub_qpair *uqpair, const uint8_t *request,
+nvmf_ub_handle_connect_v1(struct spdk_nvmf_ub_qpair *uqpair, const uint8_t *request,
 			  struct spdk_sock *sock)
 {
 	const struct spdk_nvme_ub_oob_header *header = (const void *)request;
@@ -1164,7 +1204,7 @@ error:
 	}
 	if (nvmf_ub_send_connect_response(uqpair, sock, header->qid, rc,
 					  header->registry_generation) != 0) {
-		SPDK_ERRLOG("Failed to send OOB v2 error response for qid %u\n", header->qid);
+		SPDK_ERRLOG("Failed to send OOB v1 error response for qid %u\n", header->qid);
 	}
 	return rc;
 }
@@ -1366,7 +1406,7 @@ nvmf_ub_pending_sock_cb(void *ctx, struct spdk_sock_group *group, struct spdk_so
 		if (errno == EAGAIN || errno == EWOULDBLOCK) {
 			return;
 		}
-		SPDK_ERRLOG("Failed to receive OOB v2 request: errno=%d (%s)\n",
+		SPDK_ERRLOG("Failed to receive OOB v1 request: errno=%d (%s)\n",
 			    errno, strerror(errno));
 		goto cleanup;
 	}
@@ -1386,7 +1426,7 @@ nvmf_ub_pending_sock_cb(void *ctx, struct spdk_sock_group *group, struct spdk_so
 		    pending->header.length > SPDK_NVME_UB_OOB_MAX_SIZE ||
 		    pending->header.endpoint_count > SPDK_NVME_UB_OOB_MAX_ENDPOINTS ||
 		    pending->header.region_count > SPDK_NVME_UB_OOB_MAX_REGIONS) {
-			SPDK_ERRLOG("Invalid OOB v2 header\n");
+			SPDK_ERRLOG("Invalid OOB v1 header\n");
 			goto cleanup;
 		}
 
@@ -1407,9 +1447,9 @@ nvmf_ub_pending_sock_cb(void *ctx, struct spdk_sock_group *group, struct spdk_so
 		goto cleanup;
 	}
 
-	rc = nvmf_ub_handle_connect_v2(pending->uqpair, pending->request, sock);
+	rc = nvmf_ub_handle_connect_v1(pending->uqpair, pending->request, sock);
 	if (rc != 0) {
-		SPDK_ERRLOG("Failed to handle OOB v2 connect: %d\n", rc);
+		SPDK_ERRLOG("Failed to handle OOB v1 connect: %d\n", rc);
 		goto cleanup;
 	}
 
@@ -2575,9 +2615,17 @@ nvmf_ub_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 				struct spdk_nvmf_ub_response *completed_ub_rsp;
 
 				if (cr->status != URMA_CR_SUCCESS) {
-					SPDK_ERRLOG("UB completion failed: qid=%u status=%d opcode=%d s_r=%d "
+					SPDK_ERRLOG("UB completion failed: qid=%u status=%d (%s) opcode=%d s_r=%d "
 						    "user_ctx=0x%" PRIx64 "\n", uqpair->qid, cr->status,
-						    cr->opcode, cr->flag.bs.s_r, cr->user_ctx);
+						    nvmf_ub_cr_status_string(cr->status), cr->opcode,
+						    cr->flag.bs.s_r, cr->user_ctx);
+					if (cr->status == URMA_CR_ACK_TIMEOUT_ERR && uqpair->target_jetty != NULL) {
+						SPDK_ERRLOG("UB ACK timeout path: qid=%u local_jetty_id=%u "
+							    "remote_jetty_id=%u tp_type=%u tpn=%u\n",
+							    uqpair->qid, uqpair->jetty->jetty_id.id,
+							    uqpair->remote_jetty_id.id, uqpair->target_jetty->tp_type,
+							    uqpair->target_jetty->tp.tpn);
+					}
 					if (cr->flag.bs.s_r == 0) {
 						completed_ub_rsp = (struct spdk_nvmf_ub_response *)(uintptr_t)cr->user_ctx;
 						completed_ub_req = (struct spdk_nvmf_ub_request *)(uintptr_t)cr->user_ctx;

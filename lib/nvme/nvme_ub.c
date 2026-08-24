@@ -48,7 +48,6 @@ SPDK_STATIC_ASSERT(URMA_EID_SIZE == SPDK_NVME_UB_EID_SIZE,
 #define URMA_DEVICE_NAME_ENV "URMA_DEVICE_NAME"
 #define URMA_DEFAULT_DEVICE_NAME "bonding_dev_0"
 #define URMA_EID_INDEX_ENV "URMA_EID_INDEX"
-#define URMA_DEFAULT_EID_INDEX 1
 #define URMA_BONDING_DEVICE_PREFIX "bonding_dev_"
 
 static bool
@@ -64,8 +63,9 @@ nvme_ub_get_eid_index(urma_device_t *dev)
 {
     urma_eid_info_t *eid_list;
     const char *value;
-    uint32_t eid_cnt;
+    uint32_t eid_cnt, i;
     long eid_index;
+    int selected;
 
     eid_list = urma_get_eid_list(dev, &eid_cnt);
     if (eid_list == NULL) {
@@ -73,30 +73,39 @@ nvme_ub_get_eid_index(urma_device_t *dev)
         return -ENODEV;
     }
 
-    for (uint32_t i = 0; i < eid_cnt; i++) {
-        printf("device_name :%s (eid%d: "EID_FMT").\n", dev->name,
-               eid_list[i].eid_index, EID_ARGS(eid_list[i].eid));
-    }
-    urma_free_eid_list(eid_list);
-
     if (eid_cnt == 0) {
         SPDK_ERRLOG("URMA device %s has no EIDs\n", dev->name);
+        urma_free_eid_list(eid_list);
         return -ENODEV;
     }
 
     value = getenv(URMA_EID_INDEX_ENV);
     if (value == NULL || value[0] == '\0') {
-        return URMA_DEFAULT_EID_INDEX;
+        selected = (int)eid_list[0].eid_index;
+        urma_free_eid_list(eid_list);
+        return selected;
     }
 
     eid_index = spdk_strtol(value, 10);
     if (eid_index < 0 || eid_index > INT_MAX) {
         SPDK_ERRLOG("Invalid %s value '%s'; expected an integer between 0 and %d\n",
                     URMA_EID_INDEX_ENV, value, INT_MAX);
+        urma_free_eid_list(eid_list);
         return -EINVAL;
     }
 
-    return (int)eid_index;
+    for (i = 0; i < eid_cnt; i++) {
+        if (eid_list[i].eid_index == (uint32_t)eid_index) {
+            selected = (int)eid_index;
+            urma_free_eid_list(eid_list);
+            return selected;
+        }
+    }
+
+    SPDK_ERRLOG("%s=%ld is not present on URMA device %s\n",
+                URMA_EID_INDEX_ENV, eid_index, dev->name);
+    urma_free_eid_list(eid_list);
+    return -ENODEV;
 }
 
 static pthread_once_t g_nvme_ub_urma_once = PTHREAD_ONCE_INIT;
@@ -2457,7 +2466,7 @@ nvme_ub_connect_established(struct nvme_ub_qpair *uqpair)
     rc = nvme_ub_sock_write_all(uqpair->sock, request, request_len);
     free(request);
     if (rc != 0) {
-        NVME_UQPAIR_ERRLOG(uqpair, "Failed to send OOB v2 connect request: %s\n",
+        NVME_UQPAIR_ERRLOG(uqpair, "Failed to send OOB v1 connect request: %s\n",
                           spdk_strerror(-rc));
         return rc;
     }
@@ -2469,6 +2478,7 @@ nvme_ub_connect_established(struct nvme_ub_qpair *uqpair)
             response.msg_type != SPDK_NVME_UB_OOB_CONNECT_RSP ||
             response.length != sizeof(response) + sizeof(remote_info) ||
             response.qid != uqpair->qid ||
+            response.endpoint_count != 0 || response.region_count != 0 ||
             response.registry_generation != registry_generation) {
             rc = -EPROTO;
         } else if (response.status != 0) {
@@ -2479,7 +2489,7 @@ nvme_ub_connect_established(struct nvme_ub_qpair *uqpair)
         rc = nvme_ub_sock_read_all(uqpair->sock, &remote_info, sizeof(remote_info));
     }
     if (rc != 0) {
-        NVME_UQPAIR_ERRLOG(uqpair, "Invalid OOB v2 connect response: %s\n",
+        NVME_UQPAIR_ERRLOG(uqpair, "Invalid OOB v1 connect response: %s\n",
                           spdk_strerror(-rc));
         return rc;
     }
@@ -2514,8 +2524,8 @@ nvme_ub_connect_established(struct nvme_ub_qpair *uqpair)
     }
 
     NVME_UQPAIR_NOTICELOG(uqpair,
-                          "OOB v2 connection established: remote_jetty_id=%u, recv_depth=%u, generation=%"
-                          PRIu64 "\n",
+                          "OOB v1 connection established: remote_jetty_id=%u, recv_depth=%u, "
+                          "generation=%" PRIu64 "\n",
                           remote_info.jetty_id, uqpair->recv_depth, registry_generation);
     return 0;
 }
