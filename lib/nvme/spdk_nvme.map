@@ -214,6 +214,12 @@
 
 	spdk_nvme_rdma_init_hooks;
 
+	# public functions from nvme_ub.h
+	spdk_nvme_ub_register_npu_endpoint;
+	spdk_nvme_ub_unregister_npu_endpoint;
+	spdk_nvme_ub_register_npu_region;
+	spdk_nvme_ub_unregister_npu_region;
+
 	spdk_nvme_cuse_get_ctrlr_name;
 	spdk_nvme_cuse_get_ns_name;
 	spdk_nvme_cuse_register;

@@ -15,6 +15,20 @@
 
 SPDK_LOG_REGISTER_COMPONENT(nvmf)
 
+DEFINE_STUB(spdk_mem_map_alloc, struct spdk_mem_map *, (uint64_t default_translation,
+		const struct spdk_mem_map_ops *ops, void *cb_ctx), NULL);
+DEFINE_STUB_V(spdk_mem_map_free, (struct spdk_mem_map **pmap));
+DEFINE_STUB(spdk_mem_map_set_translation, int, (struct spdk_mem_map *map, uint64_t vaddr,
+		uint64_t size, uint64_t translation), 0);
+DEFINE_STUB(spdk_mem_map_clear_translation, int, (struct spdk_mem_map *map, uint64_t vaddr,
+		uint64_t size), 0);
+DEFINE_STUB(spdk_mem_map_translate, uint64_t, (const struct spdk_mem_map *map, uint64_t vaddr,
+		uint64_t *size), 0);
+DEFINE_STUB(spdk_nvmf_qpair_disconnect, int, (struct spdk_nvmf_qpair *qpair), 0);
+DEFINE_STUB_V(spdk_nvmf_request_exec, (struct spdk_nvmf_request *req));
+DEFINE_STUB_V(spdk_nvmf_request_zcopy_start, (struct spdk_nvmf_request *req));
+DEFINE_STUB_V(spdk_nvmf_request_zcopy_end, (struct spdk_nvmf_request *req, bool commit));
+DEFINE_STUB(nvmf_ctrlr_use_zcopy, bool, (struct spdk_nvmf_request *req), false);
 DEFINE_STUB_V(spdk_nvmf_tgt_new_qpair, (struct spdk_nvmf_tgt *tgt, struct spdk_nvmf_qpair *qpair));
 
 static void
@@ -120,6 +134,50 @@ test_nvmf_ub_pending_response_queue(void)
 	CU_ASSERT(STAILQ_FIRST(&resources.free_queue) == &reqs[1]);
 }
 
+static void
+test_nvmf_ub_npu_region_is_qpair_scoped(void)
+{
+	struct spdk_nvmf_ub_qpair qpair1 = {};
+	struct spdk_nvmf_ub_qpair qpair2 = {};
+	struct spdk_nvmf_ub_npu_region region1 = {
+		.region_id = 1,
+		.remote_base = 0x100000,
+		.length = 0x2000,
+	};
+	struct spdk_nvmf_ub_npu_region region2 = {
+		.region_id = 1,
+		.remote_base = 0x800000,
+		.length = 0x4000,
+	};
+
+	TAILQ_INIT(&qpair1.npu_regions);
+	TAILQ_INIT(&qpair2.npu_regions);
+	TAILQ_INSERT_TAIL(&qpair1.npu_regions, &region1, link);
+	TAILQ_INSERT_TAIL(&qpair2.npu_regions, &region2, link);
+
+	CU_ASSERT(nvmf_ub_find_npu_region(&qpair1, 1) == &region1);
+	CU_ASSERT(nvmf_ub_find_npu_region(&qpair2, 1) == &region2);
+	CU_ASSERT(spdk_nvme_ub_range_contains(region1.remote_base, region1.length,
+					       region1.remote_base + 0x1000, 0x1000));
+	CU_ASSERT(!spdk_nvme_ub_range_contains(region1.remote_base, region1.length,
+						region1.remote_base + 0x1000, 0x1001));
+}
+
+static void
+test_nvmf_ub_cr_status_string(void)
+{
+	CU_ASSERT_STRING_EQUAL(nvmf_ub_cr_status_string(URMA_CR_ACK_TIMEOUT_ERR),
+			       "ACK timeout");
+}
+
+static void
+test_nvmf_ub_oob_v1_layout(void)
+{
+	CU_ASSERT(SPDK_NVME_UB_OOB_VERSION == 1u);
+	CU_ASSERT(SPDK_NVME_UB_OOB_MAGIC == 0x31424f55u);
+	CU_ASSERT(sizeof(struct spdk_nvme_ub_oob_cpu_info) == 76u);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -133,6 +191,9 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_nvmf_ub_opts_init);
 	CU_ADD_TEST(suite, test_nvmf_ub_response_pool);
 	CU_ADD_TEST(suite, test_nvmf_ub_pending_response_queue);
+	CU_ADD_TEST(suite, test_nvmf_ub_npu_region_is_qpair_scoped);
+	CU_ADD_TEST(suite, test_nvmf_ub_cr_status_string);
+	CU_ADD_TEST(suite, test_nvmf_ub_oob_v1_layout);
 
 	num_failures = spdk_ut_run_tests(argc, argv, NULL);
 	CU_cleanup_registry();
