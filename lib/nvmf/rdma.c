@@ -20,6 +20,7 @@
 #include "spdk_internal/rdma.h"
 
 #include "nvmf_internal.h"
+#include "qdlimit.h"
 #include "transport.h"
 
 #include "spdk_internal/trace_defs.h"
@@ -1881,9 +1882,14 @@ _nvmf_rdma_request_free(struct spdk_nvmf_rdma_request *rdma_req,
 	struct spdk_nvmf_rdma_poll_group	*rgroup;
 
 	rqpair = SPDK_CONTAINEROF(rdma_req->req.qpair, struct spdk_nvmf_rdma_qpair, qpair);
-	if (rdma_req->req.data_from_pool) {
-		rgroup = rqpair->poller->group;
+	rgroup = rqpair->poller->group;
 
+	/* Release the qdlimit slot as the request is freed (COMPLETED state). For reads this is
+	 * reached only after the data-transfer WR is ACKed (post-ACK by construction); for writes
+	 * it is reached after the backend write completes. No-op for uncharged requests. */
+	nvmf_qdlimit_release(&rgroup->group, &rdma_req->req);
+
+	if (rdma_req->req.data_from_pool) {
 		spdk_nvmf_request_free_buffers(&rdma_req->req, &rgroup->group, &rtransport->transport);
 	}
 	if (rdma_req->req.stripped_data) {
@@ -1993,7 +1999,11 @@ nvmf_rdma_request_process(struct spdk_nvmf_rdma_transport *rtransport,
 	 * to release resources. */
 	if (rqpair->ibv_state == IBV_QPS_ERR || rqpair->qpair.state != SPDK_NVMF_QPAIR_ACTIVE) {
 		if (rdma_req->state == RDMA_REQUEST_STATE_NEED_BUFFER) {
-			STAILQ_REMOVE(&rgroup->group.pending_buf_queue, &rdma_req->req, spdk_nvmf_request, buf_link);
+			/* A qdlimit-throttled request sits on a per-SSD wait queue, not on
+			 * pending_buf_queue; remove it from whichever queue actually holds it. */
+			if (!nvmf_qdlimit_abort_dequeue(&rgroup->group, &rdma_req->req)) {
+				STAILQ_REMOVE(&rgroup->group.pending_buf_queue, &rdma_req->req, spdk_nvmf_request, buf_link);
+			}
 		} else if (rdma_req->state == RDMA_REQUEST_STATE_DATA_TRANSFER_TO_CONTROLLER_PENDING) {
 			STAILQ_REMOVE(&rqpair->pending_rdma_read_queue, rdma_req, spdk_nvmf_rdma_request, state_link);
 		} else if (rdma_req->state == RDMA_REQUEST_STATE_DATA_TRANSFER_TO_HOST_PENDING) {
@@ -2066,6 +2076,14 @@ nvmf_rdma_request_process(struct spdk_nvmf_rdma_transport *rtransport,
 
 			if (&rdma_req->req != STAILQ_FIRST(&rgroup->group.pending_buf_queue)) {
 				/* This request needs to wait in line to obtain a buffer */
+				break;
+			}
+
+			/* qdlimit admission: cap per-SSD buffer-holding requests before we
+			 * take a buffer. On THROTTLED the request has been moved off
+			 * pending_buf_queue onto a per-SSD wait queue and will be re-armed
+			 * on release. */
+			if (nvmf_qdlimit_admit(&rgroup->group, &rdma_req->req) == NVMF_QDLIMIT_THROTTLED) {
 				break;
 			}
 
@@ -3553,6 +3571,8 @@ nvmf_rdma_poll_group_create(struct spdk_nvmf_transport *transport,
 		rtransport->conn_sched.next_io_pg = rgroup;
 	}
 
+	nvmf_qdlimit_pg_init(&rgroup->group);
+
 	return &rgroup->group;
 }
 
@@ -3662,6 +3682,17 @@ nvmf_rdma_poll_group_destroy(struct spdk_nvmf_transport_poll_group *group)
 	if (!rgroup) {
 		return;
 	}
+
+	/* All qpairs are destroyed before their poll group, and nvmf_rdma_qpair_destroy() sweeps
+	 * every non-FREE request in resources->reqs[] through nvmf_rdma_request_process(). With the
+	 * qpair in error state that hits the teardown branch (see ~"force the request to the
+	 * completed state"), which for a NEED_BUFFER request calls nvmf_qdlimit_abort_dequeue() to
+	 * pull any qdlimit-throttled request off its per-SSD wait queue before completing it. So by
+	 * the time the poll group is destroyed, all wait queues are empty; nvmf_qdlimit_pg_fini
+	 * asserts that as a fail-fast invariant.
+	 * TODO(vm-validation): exercise a connection drop while an SSD is actively throttled to
+	 * confirm this end-to-end on real RDMA. */
+	nvmf_qdlimit_pg_fini(&rgroup->group);
 
 	TAILQ_FOREACH_SAFE(poller, &rgroup->pollers, link, tmp) {
 		TAILQ_REMOVE(&rgroup->pollers, poller, link);
@@ -4349,8 +4380,13 @@ _nvmf_rdma_qpair_abort_request(void *ctx)
 		break;
 
 	case RDMA_REQUEST_STATE_NEED_BUFFER:
-		STAILQ_REMOVE(&rqpair->poller->group->group.pending_buf_queue,
-			      &rdma_req_to_abort->req, spdk_nvmf_request, buf_link);
+		/* A qdlimit-throttled request sits on a per-SSD wait queue, not on
+		 * pending_buf_queue. Remove it from whichever queue actually holds it. */
+		if (!nvmf_qdlimit_abort_dequeue(&rqpair->poller->group->group,
+						&rdma_req_to_abort->req)) {
+			STAILQ_REMOVE(&rqpair->poller->group->group.pending_buf_queue,
+				      &rdma_req_to_abort->req, spdk_nvmf_request, buf_link);
+		}
 
 		nvmf_rdma_request_set_abort_status(req, rdma_req_to_abort);
 		break;

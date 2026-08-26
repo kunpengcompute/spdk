@@ -594,3 +594,30 @@ def nvmf_set_crdt(client, crdt1=None, crdt2=None, crdt3=None):
         params['crdt3'] = crdt3
 
     return client.call('nvmf_set_crdt', params)
+
+
+def nvmf_qdlimit_set_depth(client, bdev_name, depth):
+    """Set the per-SSD pre-buffer admission depth for an NVMe-oF/RDMA backing bdev.
+
+    Args:
+        bdev_name: name of the backing bdev (SSD)
+        depth: max in-flight buffer-holding requests per core (0 = unlimited)
+    """
+    params = {'bdev_name': bdev_name, 'depth': depth}
+    return client.call('nvmf_qdlimit_set_depth', params)
+
+
+def nvmf_qdlimit_get_depth(client, bdev_name):
+    """Get the configured per-SSD admission depth for a backing bdev."""
+    params = {'bdev_name': bdev_name}
+    return client.call('nvmf_qdlimit_get_depth', params)
+
+
+def nvmf_qdlimit_get_stats(client, bdev_name):
+    """Get live qdlimit stats for a backing bdev.
+
+    Returns the configured depth, the total in-flight (buffer-holding) admitted requests
+    summed across all cores, and the number of poll groups qdlimit is active on.
+    """
+    params = {'bdev_name': bdev_name}
+    return client.call('nvmf_qdlimit_get_stats', params)

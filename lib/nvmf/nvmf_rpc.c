@@ -17,6 +17,7 @@
 #include "spdk_internal/assert.h"
 
 #include "nvmf_internal.h"
+#include "qdlimit.h"
 
 static int
 json_write_hex_str(struct spdk_json_write_ctx *w, const void *data, size_t size)
@@ -2486,3 +2487,134 @@ rpc_nvmf_subsystem_get_listeners(struct spdk_jsonrpc_request *request,
 }
 SPDK_RPC_REGISTER("nvmf_subsystem_get_listeners", rpc_nvmf_subsystem_get_listeners,
 		  SPDK_RPC_RUNTIME);
+
+struct rpc_qdlimit_set_depth {
+	char		*bdev_name;
+	uint32_t	depth;
+};
+
+static const struct spdk_json_object_decoder rpc_qdlimit_set_depth_decoders[] = {
+	{"bdev_name", offsetof(struct rpc_qdlimit_set_depth, bdev_name), spdk_json_decode_string},
+	{"depth", offsetof(struct rpc_qdlimit_set_depth, depth), spdk_json_decode_uint32},
+};
+
+static void
+rpc_nvmf_qdlimit_set_depth(struct spdk_jsonrpc_request *request,
+			   const struct spdk_json_val *params)
+{
+	struct rpc_qdlimit_set_depth req = {};
+	int rc;
+
+	if (spdk_json_decode_object(params, rpc_qdlimit_set_depth_decoders,
+				    SPDK_COUNTOF(rpc_qdlimit_set_depth_decoders), &req)) {
+		SPDK_ERRLOG("spdk_json_decode_object failed\n");
+		free(req.bdev_name);
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "Invalid parameters");
+		return;
+	}
+	rc = nvmf_qdlimit_set_depth(req.bdev_name, req.depth);
+	free(req.bdev_name);
+	if (rc != 0) {
+		SPDK_ERRLOG("nvmf_qdlimit_set_depth failed: %s\n", spdk_strerror(-rc));
+		spdk_jsonrpc_send_error_response(request,
+						 rc == -ENOMEM ? SPDK_JSONRPC_ERROR_INTERNAL_ERROR :
+						 SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 spdk_strerror(-rc));
+		return;
+	}
+	spdk_jsonrpc_send_bool_response(request, true);
+}
+SPDK_RPC_REGISTER("nvmf_qdlimit_set_depth", rpc_nvmf_qdlimit_set_depth, SPDK_RPC_RUNTIME)
+
+struct rpc_qdlimit_get_depth {
+	char		*bdev_name;
+};
+
+static const struct spdk_json_object_decoder rpc_qdlimit_get_depth_decoders[] = {
+	{"bdev_name", offsetof(struct rpc_qdlimit_get_depth, bdev_name), spdk_json_decode_string},
+};
+
+static void
+rpc_nvmf_qdlimit_get_depth(struct spdk_jsonrpc_request *request,
+			   const struct spdk_json_val *params)
+{
+	struct rpc_qdlimit_get_depth req = {};
+	struct spdk_json_write_ctx *w;
+	uint32_t depth = 0;
+	int rc;
+
+	if (spdk_json_decode_object(params, rpc_qdlimit_get_depth_decoders,
+				    SPDK_COUNTOF(rpc_qdlimit_get_depth_decoders), &req)) {
+		SPDK_ERRLOG("spdk_json_decode_object failed\n");
+		free(req.bdev_name);
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "Invalid parameters");
+		return;
+	}
+	/* -ENOENT means the bdev has no qdlimit config entry; report that distinctly rather than
+	 * masquerading it as depth 0 (which means "configured unlimited"). */
+	rc = nvmf_qdlimit_get_depth(req.bdev_name, &depth);
+	if (rc != 0) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "bdev not configured for qdlimit");
+		free(req.bdev_name);
+		return;
+	}
+
+	w = spdk_jsonrpc_begin_result(request);
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_string(w, "bdev_name", req.bdev_name);
+	spdk_json_write_named_uint32(w, "depth", depth);
+	spdk_json_write_object_end(w);
+	spdk_jsonrpc_end_result(request, w);
+
+	free(req.bdev_name);
+}
+SPDK_RPC_REGISTER("nvmf_qdlimit_get_depth", rpc_nvmf_qdlimit_get_depth, SPDK_RPC_RUNTIME)
+
+struct rpc_qdlimit_get_stats {
+	char		*bdev_name;
+};
+
+static const struct spdk_json_object_decoder rpc_qdlimit_get_stats_decoders[] = {
+	{"bdev_name", offsetof(struct rpc_qdlimit_get_stats, bdev_name), spdk_json_decode_string},
+};
+
+static void
+rpc_nvmf_qdlimit_get_stats(struct spdk_jsonrpc_request *request,
+			   const struct spdk_json_val *params)
+{
+	struct rpc_qdlimit_get_stats req = {};
+	struct spdk_json_write_ctx *w;
+	uint32_t depth = 0, total_inflight = 0, num_poll_groups = 0;
+	int rc;
+
+	if (spdk_json_decode_object(params, rpc_qdlimit_get_stats_decoders,
+				    SPDK_COUNTOF(rpc_qdlimit_get_stats_decoders), &req)) {
+		SPDK_ERRLOG("spdk_json_decode_object failed\n");
+		free(req.bdev_name);
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "Invalid parameters");
+		return;
+	}
+	rc = nvmf_qdlimit_get_stats(req.bdev_name, &depth, &total_inflight, &num_poll_groups);
+	if (rc != 0) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "bdev not configured for qdlimit");
+		free(req.bdev_name);
+		return;
+	}
+
+	w = spdk_jsonrpc_begin_result(request);
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_string(w, "bdev_name", req.bdev_name);
+	spdk_json_write_named_uint32(w, "depth", depth);
+	spdk_json_write_named_uint32(w, "total_inflight", total_inflight);
+	spdk_json_write_named_uint32(w, "num_poll_groups", num_poll_groups);
+	spdk_json_write_object_end(w);
+	spdk_jsonrpc_end_result(request, w);
+
+	free(req.bdev_name);
+}
+SPDK_RPC_REGISTER("nvmf_qdlimit_get_stats", rpc_nvmf_qdlimit_get_stats, SPDK_RPC_RUNTIME)

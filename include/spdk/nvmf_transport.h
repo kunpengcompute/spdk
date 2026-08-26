@@ -78,6 +78,7 @@ struct spdk_nvmf_request {
 	uint8_t				xfer; /* type enum spdk_nvme_data_transfer */
 	bool				data_from_pool;
 	bool				dif_enabled;
+	bool				qdlimit_charged; /* holds a qdlimit slot, released exactly once */
 	void				*data;
 	union nvmf_h2c_msg		*cmd;
 	union nvmf_c2h_msg		*rsp;
@@ -140,6 +141,7 @@ struct spdk_nvmf_transport_poll_group {
 	struct spdk_nvmf_transport					*transport;
 	/* Requests that are waiting to obtain a data buffer */
 	STAILQ_HEAD(, spdk_nvmf_request)				pending_buf_queue;
+	void								*qdlimit_ctx;	/* opaque per-group qdlimit state; NULL when unused */
 	STAILQ_HEAD(, spdk_nvmf_transport_pg_cache_buf)			buf_cache;
 	uint32_t							buf_cache_count;
 	uint32_t							buf_cache_size;

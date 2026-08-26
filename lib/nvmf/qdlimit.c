@@ -1,0 +1,427 @@
+/*   SPDX-License-Identifier: BSD-3-Clause
+ *   Copyright (C) 2026 Intel Corporation. All rights reserved.
+ */
+
+#include "qdlimit.h"
+#include "spdk/bdev.h"
+#include "spdk/nvme_spec.h"
+#include "spdk/nvmf_transport.h"
+#include "spdk/queue.h"
+#include "spdk/string.h"
+#include "spdk/log.h"
+#include "nvmf_internal.h"
+
+/* Max bdev-name length stored in a config entry (includes the NUL terminator). */
+#define QDLIMIT_BDEV_NAME_MAX 256
+
+/* Global per-SSD config. Entries are created on first set/use and never freed at runtime
+ * (only at config_cleanup), so the per-pg hot path can cache a stable pointer and read
+ * ->depth without locking. depth == 0 means unlimited. */
+struct qdlimit_config_entry {
+	char				bdev_name[QDLIMIT_BDEV_NAME_MAX];
+	uint32_t			depth;
+	TAILQ_ENTRY(qdlimit_config_entry) link;
+};
+
+static TAILQ_HEAD(, qdlimit_config_entry) g_qdlimit_config =
+	TAILQ_HEAD_INITIALIZER(g_qdlimit_config);
+static pthread_mutex_t g_qdlimit_config_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Caller must hold g_qdlimit_config_lock. */
+static struct qdlimit_config_entry *
+qdlimit_config_find(const char *bdev_name)
+{
+	struct qdlimit_config_entry *e;
+
+	TAILQ_FOREACH(e, &g_qdlimit_config, link) {
+		if (strcmp(e->bdev_name, bdev_name) == 0) {
+			return e;
+		}
+	}
+	return NULL;
+}
+
+/* Caller must hold g_qdlimit_config_lock. Creates the entry if absent. */
+static struct qdlimit_config_entry *
+qdlimit_config_get_or_create(const char *bdev_name)
+{
+	struct qdlimit_config_entry *e = qdlimit_config_find(bdev_name);
+
+	if (e != NULL) {
+		return e;
+	}
+	e = calloc(1, sizeof(*e));
+	if (e == NULL) {
+		SPDK_ERRLOG("Failed to allocate qdlimit config entry for %s\n", bdev_name);
+		return NULL;
+	}
+	spdk_strcpy_pad(e->bdev_name, bdev_name, sizeof(e->bdev_name), '\0');
+	TAILQ_INSERT_TAIL(&g_qdlimit_config, e, link);
+	return e;
+}
+
+/* One entry per backing SSD (bdev) seen on this poll group's core. Touched only by the
+ * owning poll thread, so inflight is updated lock-free. */
+struct qdlimit_pg_ssd {
+	struct spdk_bdev		*bdev;		/* identity key for this core */
+	struct qdlimit_config_entry	*cfg;		/* stable pointer; read ->depth on hot path */
+	uint32_t			inflight;	/* admitted, buffer-holding requests on this core */
+	STAILQ_HEAD(, spdk_nvmf_request) wait_q;	/* throttled requests, FIFO (uses req->buf_link) */
+	TAILQ_ENTRY(qdlimit_pg_ssd)	link;
+};
+
+struct qdlimit_pg_ctx {
+	TAILQ_HEAD(, qdlimit_pg_ssd)	ssds;
+	TAILQ_ENTRY(qdlimit_pg_ctx)	global_link;	/* membership in g_qdlimit_pg_list */
+};
+
+/* Registry of all live per-poll-group contexts, so nvmf_qdlimit_get_stats can aggregate the
+ * per-core inflight counters from the RPC thread. Guarded by g_qdlimit_config_lock: pg
+ * register/unregister, per-SSD entry creation, and stats reads are all serialized under it,
+ * so the RPC-thread read never races a poll-thread list mutation. The per-IO hot path
+ * (entry-already-exists lookup, inflight ++/--) stays lock-free. */
+static TAILQ_HEAD(, qdlimit_pg_ctx) g_qdlimit_pg_list = TAILQ_HEAD_INITIALIZER(g_qdlimit_pg_list);
+
+void
+nvmf_qdlimit_pg_init(struct spdk_nvmf_transport_poll_group *group)
+{
+	struct qdlimit_pg_ctx *ctx = calloc(1, sizeof(*ctx));
+
+	if (ctx == NULL) {
+		SPDK_ERRLOG("Failed to allocate qdlimit poll-group context\n");
+		group->qdlimit_ctx = NULL;
+		return;
+	}
+	TAILQ_INIT(&ctx->ssds);
+	group->qdlimit_ctx = ctx;
+
+	pthread_mutex_lock(&g_qdlimit_config_lock);
+	TAILQ_INSERT_TAIL(&g_qdlimit_pg_list, ctx, global_link);
+	pthread_mutex_unlock(&g_qdlimit_config_lock);
+}
+
+void
+nvmf_qdlimit_pg_fini(struct spdk_nvmf_transport_poll_group *group)
+{
+	struct qdlimit_pg_ctx *ctx = group->qdlimit_ctx;
+	struct qdlimit_pg_ssd *s, *tmp;
+
+	if (ctx == NULL) {
+		return;
+	}
+
+	pthread_mutex_lock(&g_qdlimit_config_lock);
+	TAILQ_REMOVE(&g_qdlimit_pg_list, ctx, global_link);
+	pthread_mutex_unlock(&g_qdlimit_config_lock);
+
+	TAILQ_FOREACH_SAFE(s, &ctx->ssds, link, tmp) {
+		/* Parked requests must have been drained by the transport teardown path
+		 * (it walks pending_buf_queue + wait queues). Assert none leaked. */
+		assert(STAILQ_EMPTY(&s->wait_q));
+		TAILQ_REMOVE(&ctx->ssds, s, link);
+		free(s);
+	}
+	free(ctx);
+	group->qdlimit_ctx = NULL;
+}
+
+/* Find-or-create the per-core entry for bdev. Returns NULL only if the bdev has never been
+ * configured (no config entry exists); callers treat NULL as "unlimited, bypass". Note a
+ * configured-but-zero depth still returns a valid entry — the depth==0 bypass is applied at
+ * the admission gate (cfg->depth == 0), not here. */
+static struct qdlimit_pg_ssd *
+qdlimit_pg_get_ssd(struct qdlimit_pg_ctx *ctx, struct spdk_bdev *bdev, const char *bdev_name)
+{
+	struct qdlimit_pg_ssd *s;
+	struct qdlimit_config_entry *cfg;
+
+	/* Hot path: entry already exists. Lock-free read on the owning poll thread (the only
+	 * writer of this list; the insert below and get_stats reads are serialized by the lock). */
+	TAILQ_FOREACH(s, &ctx->ssds, link) {
+		if (s->bdev == bdev) {
+			return s;
+		}
+	}
+
+	/* First time this core sees this bdev: create the entry under the lock so a concurrent
+	 * nvmf_qdlimit_get_stats() (RPC thread) never observes a half-linked node. */
+	pthread_mutex_lock(&g_qdlimit_config_lock);
+	cfg = qdlimit_config_find(bdev_name);
+	if (cfg == NULL) {
+		pthread_mutex_unlock(&g_qdlimit_config_lock);
+		return NULL;	/* never configured: unlimited */
+	}
+	s = calloc(1, sizeof(*s));
+	if (s == NULL) {
+		pthread_mutex_unlock(&g_qdlimit_config_lock);
+		SPDK_ERRLOG("Failed to allocate qdlimit per-SSD entry for %s\n", bdev_name);
+		return NULL;
+	}
+	s->bdev = bdev;
+	s->cfg = cfg;
+	STAILQ_INIT(&s->wait_q);
+	TAILQ_INSERT_TAIL(&ctx->ssds, s, link);
+	pthread_mutex_unlock(&g_qdlimit_config_lock);
+	return s;
+}
+
+int
+nvmf_qdlimit_set_depth(const char *bdev_name, uint32_t depth)
+{
+	struct qdlimit_config_entry *e;
+
+	if (bdev_name == NULL || bdev_name[0] == '\0') {
+		return -EINVAL;
+	}
+	if (strlen(bdev_name) >= QDLIMIT_BDEV_NAME_MAX) {
+		return -ENAMETOOLONG;
+	}
+
+	pthread_mutex_lock(&g_qdlimit_config_lock);
+	e = qdlimit_config_get_or_create(bdev_name);
+	if (e == NULL) {
+		pthread_mutex_unlock(&g_qdlimit_config_lock);
+		return -ENOMEM;
+	}
+	e->depth = depth;
+	pthread_mutex_unlock(&g_qdlimit_config_lock);
+	return 0;
+}
+
+int
+nvmf_qdlimit_get_depth(const char *bdev_name, uint32_t *depth)
+{
+	struct qdlimit_config_entry *e;
+
+	if (bdev_name == NULL || depth == NULL) {
+		return -EINVAL;
+	}
+	pthread_mutex_lock(&g_qdlimit_config_lock);
+	e = qdlimit_config_find(bdev_name);
+	*depth = (e != NULL) ? e->depth : 0;
+	pthread_mutex_unlock(&g_qdlimit_config_lock);
+	return (e != NULL) ? 0 : -ENOENT;
+}
+
+void
+nvmf_qdlimit_config_cleanup(void)
+{
+	struct qdlimit_config_entry *e, *tmp;
+
+	pthread_mutex_lock(&g_qdlimit_config_lock);
+	TAILQ_FOREACH_SAFE(e, &g_qdlimit_config, link, tmp) {
+		TAILQ_REMOVE(&g_qdlimit_config, e, link);
+		free(e);
+	}
+	pthread_mutex_unlock(&g_qdlimit_config_lock);
+}
+
+int
+nvmf_qdlimit_get_stats(const char *bdev_name, uint32_t *depth, uint32_t *total_inflight,
+		       uint32_t *num_poll_groups)
+{
+	struct qdlimit_config_entry *cfg;
+	struct qdlimit_pg_ctx *ctx;
+	struct qdlimit_pg_ssd *s;
+	uint32_t total = 0, pgs = 0;
+
+	if (bdev_name == NULL || depth == NULL || total_inflight == NULL || num_poll_groups == NULL) {
+		return -EINVAL;
+	}
+
+	pthread_mutex_lock(&g_qdlimit_config_lock);
+	cfg = qdlimit_config_find(bdev_name);
+	if (cfg == NULL) {
+		pthread_mutex_unlock(&g_qdlimit_config_lock);
+		return -ENOENT;
+	}
+	*depth = cfg->depth;
+	/* Walk every live poll group and sum the per-core inflight count for this SSD (matched by
+	 * stable cfg pointer). num_poll_groups counts only the cores that have actually driven IO
+	 * to this SSD (i.e. have an entry for it), so depth * num_poll_groups is the exact global
+	 * in-flight ceiling. The list structure is stable here because pg register/unregister and
+	 * per-SSD entry creation all hold this same lock; the inflight value reads are benign races
+	 * against the owning poll threads' lock-free ++/-- (stats are approximate). */
+	TAILQ_FOREACH(ctx, &g_qdlimit_pg_list, global_link) {
+		TAILQ_FOREACH(s, &ctx->ssds, link) {
+			if (s->cfg == cfg) {
+				total += s->inflight;
+				pgs++;
+				break;
+			}
+		}
+	}
+	pthread_mutex_unlock(&g_qdlimit_config_lock);
+
+	*total_inflight = total;
+	*num_poll_groups = pgs;
+	return 0;
+}
+
+static enum nvmf_qdlimit_status
+qdlimit_admit_bdev(struct spdk_nvmf_transport_poll_group *group,
+		   struct spdk_nvmf_request *req, struct spdk_bdev *bdev, const char *bdev_name)
+{
+	struct qdlimit_pg_ctx *ctx = group->qdlimit_ctx;
+	struct qdlimit_pg_ssd *s;
+
+	if (ctx == NULL) {
+		return NVMF_QDLIMIT_ADMIT;	/* module not active on this group */
+	}
+	s = qdlimit_pg_get_ssd(ctx, bdev, bdev_name);
+	if (s == NULL || s->cfg->depth == 0) {
+		return NVMF_QDLIMIT_ADMIT;	/* unconfigured / unlimited */
+	}
+	if (s->inflight >= s->cfg->depth) {
+		/* Over limit: take it off the shared queue so other SSDs are not blocked,
+		 * and park it on this SSD's FIFO wait queue (reuses req->buf_link). */
+		STAILQ_REMOVE(&group->pending_buf_queue, req, spdk_nvmf_request, buf_link);
+		STAILQ_INSERT_TAIL(&s->wait_q, req, buf_link);
+		req->qdlimit_charged = false;
+		return NVMF_QDLIMIT_THROTTLED;
+	}
+	s->inflight++;
+	req->qdlimit_charged = true;
+	return NVMF_QDLIMIT_ADMIT;
+}
+
+/* Resolve nsid -> ns -> bdev using existing helpers, then gate. Bypass anything we cannot
+ * resolve or that carries no data. */
+enum nvmf_qdlimit_status
+nvmf_qdlimit_admit(struct spdk_nvmf_transport_poll_group *group, struct spdk_nvmf_request *req)
+{
+	struct spdk_nvmf_ctrlr *ctrlr;
+	struct spdk_nvmf_ns *ns;
+	struct spdk_bdev *bdev;
+
+	if (req->xfer == SPDK_NVME_DATA_NONE) {
+		return NVMF_QDLIMIT_ADMIT;
+	}
+	if (req->qpair == NULL) {
+		return NVMF_QDLIMIT_ADMIT;
+	}
+	ctrlr = req->qpair->ctrlr;
+	if (ctrlr == NULL || ctrlr->subsys == NULL || req->cmd == NULL) {
+		return NVMF_QDLIMIT_ADMIT;
+	}
+	ns = _nvmf_subsystem_get_ns(ctrlr->subsys, req->cmd->nvme_cmd.nsid);
+	if (ns == NULL || ns->bdev == NULL) {
+		return NVMF_QDLIMIT_ADMIT;
+	}
+	bdev = ns->bdev;
+	return qdlimit_admit_bdev(group, req, bdev, spdk_bdev_get_name(bdev));
+}
+
+static void
+qdlimit_release_bdev(struct spdk_nvmf_transport_poll_group *group,
+		     struct spdk_nvmf_request *req, struct spdk_bdev *bdev)
+{
+	struct qdlimit_pg_ctx *ctx = group->qdlimit_ctx;
+	struct qdlimit_pg_ssd *s;
+	struct spdk_nvmf_request *next;
+
+	if (ctx == NULL || !req->qdlimit_charged) {
+		return;
+	}
+	req->qdlimit_charged = false;
+
+	TAILQ_FOREACH(s, &ctx->ssds, link) {
+		if (s->bdev == bdev) {
+			break;
+		}
+	}
+	if (s == NULL) {
+		/* A charged request always has a live per-SSD entry (entries are freed only in
+		 * pg_fini, after all requests are drained). Reaching here means a teardown-ordering
+		 * bug upstream; log it so the leaked slot is diagnosable rather than silent. */
+		SPDK_ERRLOG("qdlimit release: no per-SSD entry for charged request (bdev %p)\n", bdev);
+		return;
+	}
+
+	assert(s->inflight > 0);
+	s->inflight--;
+
+	/* Re-arm the oldest waiter for this SSD at the HEAD of the shared queue. HEAD (not TAIL)
+	 * intentionally preserves per-SSD FIFO: the oldest parked request is reclaimed first and
+	 * cannot be jumped by a newer same-SSD arrival. This does not starve other SSDs: the
+	 * re-armed request is admitted on the next poll (inflight was just decremented) and
+	 * removed from the queue, and nvmf_rdma_qpair_process_pending continues past it
+	 * (STAILQ_FOREACH_SAFE) to service other SSDs in the same poll. (Validate cross-SSD
+	 * fairness under saturation during VM perf testing.) */
+	if (!STAILQ_EMPTY(&s->wait_q)) {
+		next = STAILQ_FIRST(&s->wait_q);
+		STAILQ_REMOVE_HEAD(&s->wait_q, buf_link);
+		STAILQ_INSERT_HEAD(&group->pending_buf_queue, next, buf_link);
+	}
+}
+
+void
+nvmf_qdlimit_release(struct spdk_nvmf_transport_poll_group *group, struct spdk_nvmf_request *req)
+{
+	struct spdk_nvmf_ctrlr *ctrlr;
+	struct spdk_nvmf_ns *ns;
+
+	if (!req->qdlimit_charged) {
+		return;
+	}
+	if (req->qpair == NULL || (ctrlr = req->qpair->ctrlr) == NULL || ctrlr->subsys == NULL) {
+		req->qdlimit_charged = false;	/* lost the mapping; just clear to avoid leaks */
+		return;
+	}
+	ns = _nvmf_subsystem_get_ns(ctrlr->subsys, req->cmd->nvme_cmd.nsid);
+	if (ns == NULL || ns->bdev == NULL) {
+		req->qdlimit_charged = false;
+		return;
+	}
+	qdlimit_release_bdev(group, req, ns->bdev);
+}
+
+/* Remove req from a per-SSD wait queue if it is currently parked there. Returns true if it
+ * was parked (and has now been removed), false if it was not on any wait queue. Used by the
+ * transport abort path: a throttled request in NEED_BUFFER state lives on a wait_q, NOT on
+ * pending_buf_queue, so the abort handler must consult this before doing its own
+ * STAILQ_REMOVE(pending_buf_queue). A throttled request is never charged, so no counter
+ * adjustment is needed here. */
+bool
+nvmf_qdlimit_abort_dequeue(struct spdk_nvmf_transport_poll_group *group,
+			   struct spdk_nvmf_request *req)
+{
+	struct qdlimit_pg_ctx *ctx = group->qdlimit_ctx;
+	struct qdlimit_pg_ssd *s;
+	struct spdk_nvmf_request *w, *tmp_w;
+
+	if (ctx == NULL) {
+		return false;
+	}
+	TAILQ_FOREACH(s, &ctx->ssds, link) {
+		STAILQ_FOREACH_SAFE(w, &s->wait_q, buf_link, tmp_w) {
+			if (w == req) {
+				STAILQ_REMOVE(&s->wait_q, req, spdk_nvmf_request, buf_link);
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+/* Drain any parked requests (used by teardown and tests) by completing them back onto
+ * pending_buf_queue head; the transport's own teardown then fails/flushes them. */
+void
+nvmf_qdlimit_pg_fini_drain(struct spdk_nvmf_transport_poll_group *group)
+{
+	struct qdlimit_pg_ctx *ctx = group->qdlimit_ctx;
+	struct qdlimit_pg_ssd *s;
+	struct spdk_nvmf_request *req;
+
+	if (ctx == NULL) {
+		return;
+	}
+	TAILQ_FOREACH(s, &ctx->ssds, link) {
+		while (!STAILQ_EMPTY(&s->wait_q)) {
+			req = STAILQ_FIRST(&s->wait_q);
+			STAILQ_REMOVE_HEAD(&s->wait_q, buf_link);
+			STAILQ_INSERT_HEAD(&group->pending_buf_queue, req, buf_link);
+		}
+	}
+	nvmf_qdlimit_pg_fini(group);
+}
