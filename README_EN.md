@@ -1,5 +1,7 @@
 # README<a id="EN-US_TOPIC_0000002521402728"></a>
 
+English | [简体中文](./README.md)
+
 ## Project Introduction<a id="EN-US_TOPIC_0000002551566043"></a>
 
 ### Introduction<a id="EN-US_TOPIC_0000002551566047"></a>
