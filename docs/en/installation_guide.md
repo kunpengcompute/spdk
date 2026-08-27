@@ -140,7 +140,7 @@ After KAE is installed, compile SPDK. You do not need to install SPDK. Just comp
     >     patch -p1 < spdk_v21.01.1_dpdk_compress_kae.patch
     >    ```
     >
-    > 4. The `--with-ksal` command is used to load the KSAL algorithm module. KSAL is a Huawei-developed high-performance CRC algorithm and is closed source externally. It is integrated as a dynamic library. Therefore, you need to [install the KSAL algorithm package](https://www.hikunpeng.com/document/detail/en/kunpengsdss/basicAccelFeatures/ksal/kunpengksal_16_0007.html) and load the KSAL dynamic library before configuration and compilation. To perform the compilation, you need to [download the RPM package](https://www.hikunpeng.com/boostkit/download?version=24.0.RC5).
+    > 4. The `--with-ksal` command is used to load the KSAL algorithm module. KSAL is a Huawei-developed high-performance CRC algorithm and is closed source externally. It is integrated as a dynamic library. Therefore, you need to [install the KSAL algorithm package](https://www.hikunpeng.com/document/detail/en/kunpengaccel/storage/ksal/kunpengksal_16_0007.html) and load the KSAL dynamic library before configuration and compilation. To perform the compilation, you need to [download the RPM package](https://www.hikunpeng.com/boostkit/download?version=24.0.RC5).
 
 7. <a id="000001"></a>Perform the compilation.
 
