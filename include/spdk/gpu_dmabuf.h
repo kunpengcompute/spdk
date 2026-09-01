@@ -38,12 +38,16 @@ struct spdk_gpu_dmabuf_memory_domain_opts {
 	 * CUDA device id whose primary context should be used for dma-buf export.
 	 * Set to -1 to infer the CUDA device from each GPU pointer at registration
 	 * or translation time.
+	 * When SPDK is built with MACA support, this field is interpreted as the
+	 * MACA device id while preserving the public ABI.
 	 */
 	int cuda_device_id;
 
 	/**
 	 * Optional CUDA context handle. This is a CUcontext stored as an opaque pointer
 	 * to avoid requiring CUDA headers in this public header.
+	 * When SPDK is built with MACA support, this field is accepted for ABI
+	 * compatibility but the MACA backend may ignore it.
 	 */
 	void *cuda_context;
 

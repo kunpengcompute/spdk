@@ -4,13 +4,188 @@
 
 #include "spdk/gpu_dmabuf.h"
 
+#include "spdk/config.h"
 #include "spdk/log.h"
 #include "spdk/likely.h"
 #include "spdk/tree.h"
 #include "spdk/util.h"
 
+#if defined(SPDK_CONFIG_MACA)
+#include <mcr/maca.h>
+#include <mcr/mc_runtime.h>
+#include <mcr/mc_runtime_api.h>
+#else
 #include <cuda.h>
+#endif
 #include <infiniband/verbs.h>
+
+#if defined(SPDK_CONFIG_MACA)
+typedef mcError_t gpu_result_t;
+typedef MCdevice gpu_device_t;
+typedef mcDeviceptr_t gpu_deviceptr_t;
+typedef void *gpu_context_t;
+
+#define GPU_SUCCESS mcSuccess
+#define GPU_POINTER_ATTRIBUTE_DEVICE_ORDINAL mcPointerAttributeDevice
+#define GPU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD mcMemHandleTypePosixFileDescriptor
+
+static gpu_result_t
+gpu_init(unsigned int flags)
+{
+	(void)flags;
+	return GPU_SUCCESS;
+}
+
+static gpu_result_t
+gpu_device_get(gpu_device_t *device, int device_id)
+{
+	if (device == NULL) {
+		return mcErrorInvalidValue;
+	}
+	*device = (gpu_device_t)device_id;
+	return GPU_SUCCESS;
+}
+
+static gpu_result_t
+gpu_device_primary_ctx_retain(gpu_context_t *ctx, gpu_device_t device)
+{
+	gpu_result_t rc = mcSetDevice((int)device);
+
+	if (rc == GPU_SUCCESS && ctx != NULL) {
+		*ctx = NULL;
+	}
+	return rc;
+}
+
+static gpu_result_t
+gpu_device_primary_ctx_release(int device_id)
+{
+	(void)device_id;
+	return GPU_SUCCESS;
+}
+
+static gpu_result_t
+gpu_ctx_get_current(gpu_context_t *ctx)
+{
+	if (ctx != NULL) {
+		*ctx = NULL;
+	}
+	return GPU_SUCCESS;
+}
+
+static gpu_result_t
+gpu_ctx_set_current(gpu_context_t ctx)
+{
+	(void)ctx;
+	return GPU_SUCCESS;
+}
+
+static gpu_result_t
+gpu_pointer_get_attribute(void *data, int attribute, gpu_deviceptr_t ptr)
+{
+	(void)data;
+	(void)attribute;
+	(void)ptr;
+	return mcErrorNotSupported;
+}
+
+static gpu_result_t
+gpu_mem_get_address_range(gpu_deviceptr_t *base, size_t *size, gpu_deviceptr_t ptr)
+{
+	return mcMemGetAddressRange(base, size, ptr);
+}
+
+static gpu_result_t
+gpu_mem_get_handle_for_address_range(int *fd, gpu_deviceptr_t base, size_t size,
+				     int handle_type, unsigned long long flags)
+{
+	return mcMemGetHandleForAddressRange(fd, base, size, handle_type, flags);
+}
+
+static const char *
+gpu_error_string(gpu_result_t rc)
+{
+	const char *errstr = mcGetErrorString(rc);
+
+	return errstr != NULL ? errstr : "unknown MACA error";
+}
+#else
+typedef CUresult gpu_result_t;
+typedef CUdevice gpu_device_t;
+typedef CUdeviceptr gpu_deviceptr_t;
+typedef CUcontext gpu_context_t;
+
+#define GPU_SUCCESS CUDA_SUCCESS
+#define GPU_POINTER_ATTRIBUTE_DEVICE_ORDINAL CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL
+#define GPU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD
+
+static gpu_result_t
+gpu_init(unsigned int flags)
+{
+	return cuInit(flags);
+}
+
+static gpu_result_t
+gpu_device_get(gpu_device_t *device, int device_id)
+{
+	return cuDeviceGet(device, device_id);
+}
+
+static gpu_result_t
+gpu_device_primary_ctx_retain(gpu_context_t *ctx, gpu_device_t device)
+{
+	return cuDevicePrimaryCtxRetain(ctx, device);
+}
+
+static gpu_result_t
+gpu_device_primary_ctx_release(int device_id)
+{
+	return cuDevicePrimaryCtxRelease(device_id);
+}
+
+static gpu_result_t
+gpu_ctx_get_current(gpu_context_t *ctx)
+{
+	return cuCtxGetCurrent(ctx);
+}
+
+static gpu_result_t
+gpu_ctx_set_current(gpu_context_t ctx)
+{
+	return cuCtxSetCurrent(ctx);
+}
+
+static gpu_result_t
+gpu_pointer_get_attribute(void *data, int attribute, gpu_deviceptr_t ptr)
+{
+	return cuPointerGetAttribute(data, attribute, ptr);
+}
+
+static gpu_result_t
+gpu_mem_get_address_range(gpu_deviceptr_t *base, size_t *size, gpu_deviceptr_t ptr)
+{
+	return cuMemGetAddressRange(base, size, ptr);
+}
+
+static gpu_result_t
+gpu_mem_get_handle_for_address_range(int *fd, gpu_deviceptr_t base, size_t size,
+				     int handle_type, unsigned long long flags)
+{
+	return cuMemGetHandleForAddressRange(fd, base, size, handle_type, flags);
+}
+
+static const char *
+gpu_error_string(gpu_result_t rc)
+{
+	const char *errstr = NULL;
+
+	if (cuGetErrorString(rc, &errstr) == CUDA_SUCCESS && errstr != NULL) {
+		return errstr;
+	}
+
+	return "unknown CUDA error";
+}
+#endif
 
 struct gpu_dmabuf_mr {
 	void *addr;
@@ -34,7 +209,7 @@ RB_HEAD(gpu_dmabuf_region_tree, gpu_dmabuf_region);
 
 struct gpu_dmabuf_cuda_ctx {
 	int device_id;
-	CUcontext cuda_ctx;
+	gpu_context_t cuda_ctx;
 	TAILQ_ENTRY(gpu_dmabuf_cuda_ctx) link;
 };
 
@@ -45,7 +220,7 @@ struct gpu_dmabuf_domain {
 	struct gpu_dmabuf_region_tree regions;
 	TAILQ_HEAD(, gpu_dmabuf_cuda_ctx) cuda_ctxs;
 	int cuda_device_id;
-	CUcontext cuda_ctx;
+	gpu_context_t cuda_ctx;
 	bool owns_cuda_ctx;
 	uint32_t rdma_access_flags;
 	TAILQ_ENTRY(gpu_dmabuf_domain) link;
@@ -217,7 +392,7 @@ gpu_dmabuf_get_rdma_pd(struct spdk_memory_domain *dst_domain, struct ibv_pd **pd
 static int
 gpu_dmabuf_get_ptr_device_id(struct gpu_dmabuf_domain *gd, void *addr, int *device_id)
 {
-	CUresult cu_rc;
+	gpu_result_t gpu_rc;
 	int detected_device_id;
 
 	if (gd->cuda_device_id >= 0) {
@@ -225,10 +400,16 @@ gpu_dmabuf_get_ptr_device_id(struct gpu_dmabuf_domain *gd, void *addr, int *devi
 		return 0;
 	}
 
-	cu_rc = cuPointerGetAttribute(&detected_device_id, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,
-				      (CUdeviceptr)addr);
-	if (cu_rc != CUDA_SUCCESS) {
-		SPDK_ERRLOG("cuPointerGetAttribute(DEVICE_ORDINAL) failed: %d\n", cu_rc);
+	gpu_rc = gpu_pointer_get_attribute(&detected_device_id,
+					   GPU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,
+					   (gpu_deviceptr_t)addr);
+	if (gpu_rc != GPU_SUCCESS) {
+#if defined(SPDK_CONFIG_MACA)
+		SPDK_ERRLOG("MACA GPU dma-buf requires cuda_device_id to be set explicitly\n");
+#else
+		SPDK_ERRLOG("gpu_pointer_get_attribute(DEVICE_ORDINAL) failed: %d (%s)\n",
+			    gpu_rc, gpu_error_string(gpu_rc));
+#endif
 		return -EFAULT;
 	}
 
@@ -237,11 +418,11 @@ gpu_dmabuf_get_ptr_device_id(struct gpu_dmabuf_domain *gd, void *addr, int *devi
 }
 
 static int
-gpu_dmabuf_get_cuda_ctx(struct gpu_dmabuf_domain *gd, int device_id, CUcontext *cuda_ctx)
+gpu_dmabuf_get_cuda_ctx(struct gpu_dmabuf_domain *gd, int device_id, gpu_context_t *cuda_ctx)
 {
 	struct gpu_dmabuf_cuda_ctx *ctx_entry;
-	CUdevice cuda_device;
-	CUresult cu_rc;
+	gpu_device_t cuda_device;
+	gpu_result_t gpu_rc;
 
 	if (gd->cuda_ctx != NULL) {
 		*cuda_ctx = gd->cuda_ctx;
@@ -264,16 +445,18 @@ gpu_dmabuf_get_cuda_ctx(struct gpu_dmabuf_domain *gd, int device_id, CUcontext *
 		return -ENOMEM;
 	}
 
-	cu_rc = cuDeviceGet(&cuda_device, device_id);
-	if (cu_rc != CUDA_SUCCESS) {
-		SPDK_ERRLOG("cuDeviceGet(%d) failed: %d\n", device_id, cu_rc);
+	gpu_rc = gpu_device_get(&cuda_device, device_id);
+	if (gpu_rc != GPU_SUCCESS) {
+		SPDK_ERRLOG("gpu_device_get(%d) failed: %d (%s)\n", device_id, gpu_rc,
+			    gpu_error_string(gpu_rc));
 		free(ctx_entry);
 		return -ENODEV;
 	}
 
-	cu_rc = cuDevicePrimaryCtxRetain(&ctx_entry->cuda_ctx, cuda_device);
-	if (cu_rc != CUDA_SUCCESS) {
-		SPDK_ERRLOG("cuDevicePrimaryCtxRetain(%d) failed: %d\n", device_id, cu_rc);
+	gpu_rc = gpu_device_primary_ctx_retain(&ctx_entry->cuda_ctx, cuda_device);
+	if (gpu_rc != GPU_SUCCESS) {
+		SPDK_ERRLOG("gpu_device_primary_ctx_retain(%d) failed: %d (%s)\n",
+			    device_id, gpu_rc, gpu_error_string(gpu_rc));
 		free(ctx_entry);
 		return -ENODEV;
 	}
@@ -284,22 +467,10 @@ gpu_dmabuf_get_cuda_ctx(struct gpu_dmabuf_domain *gd, int device_id, CUcontext *
 	return 0;
 }
 
-static const char *
-gpu_dmabuf_cuda_errstr(CUresult cu_rc)
-{
-	const char *errstr = NULL;
-
-	if (cuGetErrorString(cu_rc, &errstr) == CUDA_SUCCESS && errstr != NULL) {
-		return errstr;
-	}
-
-	return "unknown CUDA error";
-}
-
 static int
-gpu_dmabuf_set_cuda_ctx(CUcontext cuda_ctx, CUcontext *prev_ctx, bool *changed)
+gpu_dmabuf_set_cuda_ctx(gpu_context_t cuda_ctx, gpu_context_t *prev_ctx, bool *changed)
 {
-	CUresult cu_rc;
+	gpu_result_t gpu_rc;
 
 	*prev_ctx = NULL;
 	*changed = false;
@@ -307,10 +478,10 @@ gpu_dmabuf_set_cuda_ctx(CUcontext cuda_ctx, CUcontext *prev_ctx, bool *changed)
 		return 0;
 	}
 
-	cu_rc = cuCtxGetCurrent(prev_ctx);
-	if (cu_rc != CUDA_SUCCESS) {
-		SPDK_ERRLOG("cuCtxGetCurrent() failed: %d (%s)\n", cu_rc,
-			    gpu_dmabuf_cuda_errstr(cu_rc));
+	gpu_rc = gpu_ctx_get_current(prev_ctx);
+	if (gpu_rc != GPU_SUCCESS) {
+		SPDK_ERRLOG("gpu_ctx_get_current() failed: %d (%s)\n", gpu_rc,
+			    gpu_error_string(gpu_rc));
 		return -EFAULT;
 	}
 
@@ -318,10 +489,10 @@ gpu_dmabuf_set_cuda_ctx(CUcontext cuda_ctx, CUcontext *prev_ctx, bool *changed)
 		return 0;
 	}
 
-	cu_rc = cuCtxSetCurrent(cuda_ctx);
-	if (cu_rc != CUDA_SUCCESS) {
-		SPDK_ERRLOG("cuCtxSetCurrent() failed: %d (%s)\n", cu_rc,
-			    gpu_dmabuf_cuda_errstr(cu_rc));
+	gpu_rc = gpu_ctx_set_current(cuda_ctx);
+	if (gpu_rc != GPU_SUCCESS) {
+		SPDK_ERRLOG("gpu_ctx_set_current() failed: %d (%s)\n", gpu_rc,
+			    gpu_error_string(gpu_rc));
 		return -EFAULT;
 	}
 
@@ -330,18 +501,18 @@ gpu_dmabuf_set_cuda_ctx(CUcontext cuda_ctx, CUcontext *prev_ctx, bool *changed)
 }
 
 static void
-gpu_dmabuf_restore_cuda_ctx(CUcontext prev_ctx, bool changed)
+gpu_dmabuf_restore_cuda_ctx(gpu_context_t prev_ctx, bool changed)
 {
-	CUresult cu_rc;
+	gpu_result_t gpu_rc;
 
 	if (!changed) {
 		return;
 	}
 
-	cu_rc = cuCtxSetCurrent(prev_ctx);
-	if (cu_rc != CUDA_SUCCESS) {
-		SPDK_ERRLOG("cuCtxSetCurrent(previous) failed: %d (%s)\n", cu_rc,
-			    gpu_dmabuf_cuda_errstr(cu_rc));
+	gpu_rc = gpu_ctx_set_current(prev_ctx);
+	if (gpu_rc != GPU_SUCCESS) {
+		SPDK_ERRLOG("gpu_ctx_set_current(previous) failed: %d (%s)\n", gpu_rc,
+			    gpu_error_string(gpu_rc));
 	}
 }
 
@@ -485,10 +656,10 @@ gpu_dmabuf_register_mr(struct gpu_dmabuf_domain *gd, int device_id, struct ibv_p
 		       size_t len, struct gpu_dmabuf_mr **_entry)
 {
 	struct gpu_dmabuf_mr *entry;
-	CUcontext cuda_ctx;
-	CUcontext prev_ctx;
-	CUresult cu_rc;
-	CUdeviceptr alloc_base;
+	gpu_context_t cuda_ctx;
+	gpu_context_t prev_ctx;
+	gpu_result_t gpu_rc;
+	gpu_deviceptr_t alloc_base;
 	size_t alloc_size;
 	uintptr_t alloc_offset;
 	uint64_t dmabuf_offset;
@@ -517,11 +688,11 @@ gpu_dmabuf_register_mr(struct gpu_dmabuf_domain *gd, int device_id, struct ibv_p
 		return rc;
 	}
 
-	cu_rc = cuMemGetAddressRange(&alloc_base, &alloc_size, (CUdeviceptr)addr);
-	if (cu_rc != CUDA_SUCCESS) {
+	gpu_rc = gpu_mem_get_address_range(&alloc_base, &alloc_size, (gpu_deviceptr_t)addr);
+	if (gpu_rc != GPU_SUCCESS) {
 		gpu_dmabuf_restore_cuda_ctx(prev_ctx, ctx_changed);
-		SPDK_ERRLOG("cuMemGetAddressRange(addr=%p, len=%zu, device_id=%d) failed: %d (%s)\n",
-			    addr, len, device_id, cu_rc, gpu_dmabuf_cuda_errstr(cu_rc));
+		SPDK_ERRLOG("gpu_mem_get_address_range(addr=%p, len=%zu, device_id=%d) failed: %d (%s)\n",
+			    addr, len, device_id, gpu_rc, gpu_error_string(gpu_rc));
 		free(entry);
 		return -EFAULT;
 	}
@@ -535,21 +706,21 @@ gpu_dmabuf_register_mr(struct gpu_dmabuf_domain *gd, int device_id, struct ibv_p
 	alloc_offset = (uintptr_t)addr - (uintptr_t)alloc_base;
 	if (alloc_offset > alloc_size || len > alloc_size - alloc_offset) {
 		gpu_dmabuf_restore_cuda_ctx(prev_ctx, ctx_changed);
-		SPDK_ERRLOG("GPU buffer range is outside CUDA allocation: addr=%p len=%zu base=0x%" PRIx64
+		SPDK_ERRLOG("GPU buffer range is outside allocation: addr=%p len=%zu base=0x%" PRIx64
 			    " alloc_size=%zu offset=%" PRIuPTR "\n",
 			    addr, len, (uint64_t)alloc_base, alloc_size, alloc_offset);
 		free(entry);
 		return -EINVAL;
 	}
 
-	cu_rc = cuMemGetHandleForAddressRange(&dmabuf_fd, alloc_base, alloc_size,
-					      CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
+	gpu_rc = gpu_mem_get_handle_for_address_range(&dmabuf_fd, alloc_base, alloc_size,
+						      GPU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
 	gpu_dmabuf_restore_cuda_ctx(prev_ctx, ctx_changed);
-	if (cu_rc != CUDA_SUCCESS) {
-		SPDK_ERRLOG("cuMemGetHandleForAddressRange(addr=%p, len=%zu, device_id=%d, base=0x%" PRIx64
+	if (gpu_rc != GPU_SUCCESS) {
+		SPDK_ERRLOG("gpu_mem_get_handle_for_address_range(addr=%p, len=%zu, device_id=%d, base=0x%" PRIx64
 			    ", alloc_size=%zu, offset=%" PRIuPTR ") failed: %d (%s)\n",
-			    addr, len, device_id, (uint64_t)alloc_base, alloc_size, alloc_offset, cu_rc,
-			    gpu_dmabuf_cuda_errstr(cu_rc));
+			    addr, len, device_id, (uint64_t)alloc_base, alloc_size, alloc_offset, gpu_rc,
+			    gpu_error_string(gpu_rc));
 		free(entry);
 		return -EFAULT;
 	}
@@ -699,7 +870,7 @@ gpu_dmabuf_release_cuda_ctxs(struct gpu_dmabuf_domain *gd)
 
 	while ((ctx_entry = TAILQ_FIRST(&gd->cuda_ctxs)) != NULL) {
 		TAILQ_REMOVE(&gd->cuda_ctxs, ctx_entry, link);
-		cuDevicePrimaryCtxRelease(ctx_entry->device_id);
+		gpu_device_primary_ctx_release(ctx_entry->device_id);
 		free(ctx_entry);
 	}
 }
@@ -736,8 +907,8 @@ spdk_gpu_dmabuf_memory_domain_create(struct spdk_memory_domain **domain,
 {
 	struct spdk_gpu_dmabuf_memory_domain_opts local_opts;
 	struct gpu_dmabuf_domain *gd;
-	CUdevice cuda_device;
-	CUresult cu_rc;
+	gpu_device_t cuda_device;
+	gpu_result_t gpu_rc;
 	int rc;
 
 	if (domain == NULL) {
@@ -777,27 +948,29 @@ spdk_gpu_dmabuf_memory_domain_create(struct spdk_memory_domain **domain,
 	RB_INIT(&gd->regions);
 	TAILQ_INIT(&gd->cuda_ctxs);
 	gd->cuda_device_id = local_opts.cuda_device_id;
-	gd->cuda_ctx = (CUcontext)local_opts.cuda_context;
+	gd->cuda_ctx = (gpu_context_t)local_opts.cuda_context;
 	gd->rdma_access_flags = local_opts.rdma_access_flags;
 
-	cu_rc = cuInit(0);
-	if (cu_rc != CUDA_SUCCESS) {
-		SPDK_ERRLOG("cuInit() failed: %d\n", cu_rc);
+	gpu_rc = gpu_init(0);
+	if (gpu_rc != GPU_SUCCESS) {
+		SPDK_ERRLOG("gpu_init() failed: %d (%s)\n", gpu_rc, gpu_error_string(gpu_rc));
 		rc = -ENODEV;
 		goto err_free;
 	}
 
 	if (gd->cuda_ctx == NULL && gd->cuda_device_id >= 0) {
-		cu_rc = cuDeviceGet(&cuda_device, gd->cuda_device_id);
-		if (cu_rc != CUDA_SUCCESS) {
-			SPDK_ERRLOG("cuDeviceGet(%d) failed: %d\n", gd->cuda_device_id, cu_rc);
+		gpu_rc = gpu_device_get(&cuda_device, gd->cuda_device_id);
+		if (gpu_rc != GPU_SUCCESS) {
+			SPDK_ERRLOG("gpu_device_get(%d) failed: %d (%s)\n", gd->cuda_device_id,
+				    gpu_rc, gpu_error_string(gpu_rc));
 			rc = -ENODEV;
 			goto err_free;
 		}
 
-		cu_rc = cuDevicePrimaryCtxRetain(&gd->cuda_ctx, cuda_device);
-		if (cu_rc != CUDA_SUCCESS) {
-			SPDK_ERRLOG("cuDevicePrimaryCtxRetain(%d) failed: %d\n", gd->cuda_device_id, cu_rc);
+		gpu_rc = gpu_device_primary_ctx_retain(&gd->cuda_ctx, cuda_device);
+		if (gpu_rc != GPU_SUCCESS) {
+			SPDK_ERRLOG("gpu_device_primary_ctx_retain(%d) failed: %d (%s)\n",
+				    gd->cuda_device_id, gpu_rc, gpu_error_string(gpu_rc));
 			rc = -ENODEV;
 			goto err_free;
 		}
@@ -822,7 +995,7 @@ spdk_gpu_dmabuf_memory_domain_create(struct spdk_memory_domain **domain,
 
 err_release_cuda_ctx:
 	if (gd->owns_cuda_ctx) {
-		cuDevicePrimaryCtxRelease(gd->cuda_device_id);
+		gpu_device_primary_ctx_release(gd->cuda_device_id);
 	}
 err_free:
 	pthread_mutex_destroy(&gd->lock);
@@ -873,7 +1046,7 @@ spdk_gpu_dmabuf_memory_domain_destroy(struct spdk_memory_domain *domain)
 	spdk_memory_domain_destroy(gd->domain);
 
 	if (gd->owns_cuda_ctx) {
-		cuDevicePrimaryCtxRelease(gd->cuda_device_id);
+		gpu_device_primary_ctx_release(gd->cuda_device_id);
 	}
 	gpu_dmabuf_release_cuda_ctxs(gd);
 

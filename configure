@@ -87,6 +87,8 @@ function usage() {
 	echo " --with-rdma[=PROVIDER]    Build RDMA transport for NVMf target and initiator."
 	echo " --without-rdma            Accepts optional RDMA provider name. Can be \"verbs\" or \"mlx5_dv\"."
 	echo "                           If no provider specified, \"verbs\" provider is used by default."
+	echo " --with-maca[=DIR]         Build MACA GPU DMA-BUF RDMA helpers. DIR defaults to /opt/maca-3.5.3."
+	echo " --without-maca            Disable MACA GPU DMA-BUF RDMA helpers."
 	echo " --with-fc[=DIR]           Build FC transport for NVMf target."
 	echo " --without-fc              If an argument is provided, it is considered a directory containing"
 	echo "                           libufc.a and fc_lld.h. Otherwise the regular system paths will"
@@ -496,6 +498,21 @@ for i in "$@"; do
 		--without-cuda)
 			CONFIG[CUDA]=n
 			CONFIG[CUDA_PATH]=
+			;;
+		--with-maca=*)
+			check_dir "$i"
+			CONFIG[MACA]=y
+			CONFIG[MACA_PATH]=$(readlink -f ${i#*=})
+			;;
+		--with-maca)
+			CONFIG[MACA]=y
+			if [[ -d /opt/maca-3.5.3 ]]; then
+				CONFIG[MACA_PATH]=/opt/maca-3.5.3
+			fi
+			;;
+		--without-maca)
+			CONFIG[MACA]=n
+			CONFIG[MACA_PATH]=
 			;;
 		--with-fc=*)
 			CONFIG[FC]=y
@@ -970,6 +987,35 @@ if [[ "${CONFIG[CUDA]}" = "y" && "${CONFIG[RDMA]}" = "y" ]]; then
 		| "${BUILD_CMD[@]}" "${cuda_cflags[@]}" "${cuda_ldflags[@]}" -lcuda -libverbs - 2> /dev/null; then
 		echo "--with-cuda requires cuda.h, libcuda and ibv_reg_dmabuf_mr support."
 		echo "Use --with-cuda=/path/to/cuda when CUDA is not installed in /usr/local/cuda."
+		exit 1
+	fi
+fi
+
+if [[ "${CONFIG[CUDA]}" = "y" && "${CONFIG[MACA]}" = "y" ]]; then
+	echo "--with-cuda and --with-maca are mutually exclusive."
+	exit 1
+fi
+
+if [[ "${CONFIG[MACA]}" = "y" ]]; then
+	if [[ "${CONFIG[RDMA]}" != "y" ]]; then
+		echo "--with-maca requires --with-rdma."
+		exit 1
+	fi
+
+	maca_cflags=()
+	maca_ldflags=()
+	if [[ -n "${CONFIG[MACA_PATH]}" ]]; then
+		maca_cflags+=("-I${CONFIG[MACA_PATH]}/include")
+		maca_ldflags+=("-L${CONFIG[MACA_PATH]}/lib64")
+		maca_ldflags+=("-L${CONFIG[MACA_PATH]}/lib")
+	fi
+
+	if ! echo -e '#include <mcr/maca.h>\n#include <mcr/mc_runtime.h>\n#include <mcr/mc_runtime_api.h>\n#include <infiniband/verbs.h>\n' \
+		'int main(void) { (void)mcMemGetHandleForAddressRange; (void)ibv_reg_dmabuf_mr;\n' \
+		'(void)mcMemHandleTypePosixFileDescriptor; return 0; }\n' \
+		| "${BUILD_CMD[@]}" "${maca_cflags[@]}" "${maca_ldflags[@]}" -lmcruntime -libverbs - 2> /dev/null; then
+		echo "--with-maca requires MACA headers, libmcruntime and ibv_reg_dmabuf_mr support."
+		echo "Use --with-maca=/path/to/maca when MACA is not installed in /opt/maca-3.5.3."
 		exit 1
 	fi
 fi

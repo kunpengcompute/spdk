@@ -13,10 +13,13 @@ SO_SUFFIX := $(SO_VER).$(SO_MINOR)
 LIBNAME = dma
 C_SRCS = dma.c
 
-ifeq ($(CONFIG_CUDA),y)
 ifeq ($(CONFIG_RDMA),y)
+ifeq ($(CONFIG_CUDA),y)
 C_SRCS-y += gpu_dmabuf.c
 LOCAL_SYS_LIBS += -lcuda -libverbs
+else ifeq ($(CONFIG_MACA),y)
+C_SRCS-y += gpu_dmabuf.c
+LOCAL_SYS_LIBS += -lmcruntime -libverbs
 endif
 endif
 

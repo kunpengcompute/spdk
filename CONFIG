@@ -265,3 +265,7 @@ CONFIG_AIO_HAVE_RW_FLAGS=n
 # CUDA GPUDirect RDMA memory-domain helpers.
 CONFIG_CUDA=n
 CONFIG_CUDA_PATH=
+
+# Enable MACA GPU DMA-BUF RDMA helpers. Requires CONFIG_RDMA and MACA runtime.
+CONFIG_MACA=n
+CONFIG_MACA_PATH=
