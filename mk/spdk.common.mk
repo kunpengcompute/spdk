@@ -180,6 +180,15 @@ endif
 endif
 endif
 
+ifeq ($(CONFIG_MACA),y)
+SYS_LIBS += -lmcruntime
+ifneq ($(strip $(CONFIG_MACA_PATH)),)
+COMMON_CFLAGS += -I$(CONFIG_MACA_PATH)/include
+LDFLAGS += -L$(CONFIG_MACA_PATH)/lib64 -L$(CONFIG_MACA_PATH)/lib
+LDFLAGS += -Wl,-rpath,$(CONFIG_MACA_PATH)/lib64 -Wl,-rpath,$(CONFIG_MACA_PATH)/lib
+endif
+endif
+
 ifeq ($(CONFIG_URING),y)
 SYS_LIBS += -luring
 ifneq ($(strip $(CONFIG_URING_PATH)),)
