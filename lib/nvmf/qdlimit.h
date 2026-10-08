@@ -38,8 +38,9 @@ void nvmf_qdlimit_release(struct spdk_nvmf_transport_poll_group *group,
 bool nvmf_qdlimit_abort_dequeue(struct spdk_nvmf_transport_poll_group *group,
 			       struct spdk_nvmf_request *req);
 
-/* Config (global, per backing bdev). depth == 0 means unlimited. Returns 0 on success,
- * negative errno on failure. Safe to call from the RPC thread. */
+/* Config (global, per registered backing bdev). depth == 0 means unlimited. Returns 0 on
+ * success, -ENODEV if bdev_name is not registered, or another negative errno on failure.
+ * Safe to call from the RPC thread. */
 int nvmf_qdlimit_set_depth(const char *bdev_name, uint32_t depth);
 int nvmf_qdlimit_get_depth(const char *bdev_name, uint32_t *depth);
 

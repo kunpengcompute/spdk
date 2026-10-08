@@ -176,6 +176,9 @@ nvmf_qdlimit_set_depth(const char *bdev_name, uint32_t depth)
 	if (strlen(bdev_name) >= QDLIMIT_BDEV_NAME_MAX) {
 		return -ENAMETOOLONG;
 	}
+	if (spdk_bdev_get_by_name(bdev_name) == NULL) {
+		return -ENODEV;
+	}
 
 	pthread_mutex_lock(&g_qdlimit_config_lock);
 	e = qdlimit_config_get_or_create(bdev_name);
@@ -265,6 +268,11 @@ qdlimit_admit_bdev(struct spdk_nvmf_transport_poll_group *group,
 	struct qdlimit_pg_ctx *ctx = group->qdlimit_ctx;
 	struct qdlimit_pg_ssd *s;
 
+	/* A request may remain at the head of pending_buf_queue for multiple polls while
+	 * waiting for a shared data buffer. It already owns its slot after the first pass. */
+	if (req->qdlimit_charged) {
+		return NVMF_QDLIMIT_ADMIT;
+	}
 	if (ctx == NULL) {
 		return NVMF_QDLIMIT_ADMIT;	/* module not active on this group */
 	}
