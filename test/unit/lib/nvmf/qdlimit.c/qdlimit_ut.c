@@ -11,6 +11,9 @@
 static char g_fake_bdev_a;
 static char g_fake_bdev_b;
 
+DEFINE_STUB(spdk_bdev_get_by_name, struct spdk_bdev *, (const char *bdev_name),
+	    (struct spdk_bdev *)&g_fake_bdev_a);
+
 // DEFINE_STUB(spdk_bdev_get_name, const char *, (const struct spdk_bdev *bdev),
 // 	    ((void *)bdev == &g_fake_bdev_a) ? "bdevA" : "bdevB");
 
@@ -49,6 +52,12 @@ test_config_set_get(void)
 	memset(long_name, 'x', sizeof(long_name) - 1);
 	long_name[sizeof(long_name) - 1] = '\0';
 	CU_ASSERT(nvmf_qdlimit_set_depth(long_name, 1) == -ENAMETOOLONG);
+
+	/* A syntactically valid name must still resolve to a registered bdev. */
+	MOCK_SET(spdk_bdev_get_by_name, NULL);
+	CU_ASSERT(nvmf_qdlimit_set_depth("FAKE_BDEV", 8) == -ENODEV);
+	CU_ASSERT(nvmf_qdlimit_get_depth("FAKE_BDEV", &depth) == -ENOENT);
+	MOCK_SET(spdk_bdev_get_by_name, (struct spdk_bdev *)&g_fake_bdev_a);
 
 	nvmf_qdlimit_config_cleanup();
 }
@@ -125,6 +134,40 @@ test_admit_bypass(void)
 	CU_ASSERT(nvmf_qdlimit_set_depth("bdevA", 0) == 0);
 	CU_ASSERT(qdlimit_admit_bdev(&group, &rn, (void *)&g_fake_bdev_a, "bdevA") == NVMF_QDLIMIT_ADMIT);
 	CU_ASSERT(rn.qdlimit_charged == false);
+
+	nvmf_qdlimit_pg_fini(&group);
+	nvmf_qdlimit_config_cleanup();
+}
+
+static void
+test_repeated_admit_is_idempotent(void)
+{
+	struct spdk_nvmf_transport_poll_group group = {};
+	struct spdk_nvmf_request req = {};
+	struct qdlimit_pg_ctx *ctx;
+	struct qdlimit_pg_ssd *s;
+
+	STAILQ_INIT(&group.pending_buf_queue);
+	nvmf_qdlimit_pg_init(&group);
+	CU_ASSERT(nvmf_qdlimit_set_depth("bdevA", 999999) == 0);
+
+	/* The transport retries NEED_BUFFER on every poll when no shared buffer is available.
+	 * Re-admitting the same request must not consume another qdlimit slot. */
+	STAILQ_INSERT_TAIL(&group.pending_buf_queue, &req, buf_link);
+	CU_ASSERT(qdlimit_admit_bdev(&group, &req, (void *)&g_fake_bdev_a,
+				     "bdevA") == NVMF_QDLIMIT_ADMIT);
+	CU_ASSERT(qdlimit_admit_bdev(&group, &req, (void *)&g_fake_bdev_a,
+				     "bdevA") == NVMF_QDLIMIT_ADMIT);
+
+	ctx = group.qdlimit_ctx;
+	s = TAILQ_FIRST(&ctx->ssds);
+	SPDK_CU_ASSERT_FATAL(s != NULL);
+	CU_ASSERT(req.qdlimit_charged == true);
+	CU_ASSERT(s->inflight == 1);
+
+	qdlimit_release_bdev(&group, &req, (void *)&g_fake_bdev_a);
+	CU_ASSERT(req.qdlimit_charged == false);
+	CU_ASSERT(s->inflight == 0);
 
 	nvmf_qdlimit_pg_fini(&group);
 	nvmf_qdlimit_config_cleanup();
@@ -256,6 +299,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_pg_init_fini);
 	CU_ADD_TEST(suite, test_admit_under_and_over_limit);
 	CU_ADD_TEST(suite, test_admit_bypass);
+	CU_ADD_TEST(suite, test_repeated_admit_is_idempotent);
 	CU_ADD_TEST(suite, test_release_rearms_waiter);
 	CU_ADD_TEST(suite, test_release_uncharged_is_noop);
 	CU_ADD_TEST(suite, test_abort_dequeue_parked);

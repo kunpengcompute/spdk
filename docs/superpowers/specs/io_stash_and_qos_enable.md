@@ -16,12 +16,12 @@
 
 ## BIOS 设置
 
-使用前需要先进入 BIOS 配置 Cache Mode
+使用前需要先进入 BIOS 配置 Cache Mode，LPI，SMT2，TidCMP，UFS，One Numa Per Socket，Die Interleaving
 
 BIOS 路径：
 
 ```text
-Advanced -> Performance Config -> Cache Mode
+Advanced -> Performance Config
 ```
 
 将 Cache Mode 设置为：
@@ -30,7 +30,61 @@ Advanced -> Performance Config -> Cache Mode
 in:share out:share
 ```
 
+将 LPI，SMT2，TidCMP，UFS 设置为：
+
+```text
+Enabled
+```
+
+BIOS 路径：
+
+```text
+Advanced -> Memory Config
+```
+
+将 One Numa Per Socket，Die Interleaving 设置为：
+
+```text
+Enabled
+```
+
 保存 BIOS 配置后重启系统。
+
+## 网卡，内存及磁盘配置
+
+为了获取更好的读写性能，建议将网卡，内存条以及磁盘配置在同一个CPU上，例如都配置在 CPU0上
+
+### 确认网卡所在 CPU
+
+例如：用到的网卡名为 'enp65s0f0np0'，可以通过命令：
+
+```bash
+cat /sys/class/net/enp65s0f0np0/device/numa_node
+```
+
+若输出 0 则表示该卡位于 CPU0 上
+
+### 确认内存所在 CPU
+
+通过命令：
+
+```bash
+dmidecode -t 17 | grep -E 'Memory Device$|Size:|Locator:|Bank Locator:|Serial Number:'
+```
+
+观察 Memory Device 的 Bank Locator 的 SOCKET 参数，若为 0 表示该根内存条插在 CPU0 上。
+
+### 确认磁盘所在 CPU
+
+通过命令：
+
+```bash
+cat /sys/block/nvme0n1/device/device/numa_node
+```
+
+若输出 0 则表示该盘位于 CPU0 上
+
+环境配置时尽量让 网卡，磁盘， 内存位于同一CPU上，否则性能会有所下降。
 
 ## 获取并编译 QoS 版本 SPDK
 
