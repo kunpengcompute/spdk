@@ -7,6 +7,7 @@
 #include "spdk_cunit.h"
 #include "common/lib/test_env.c"
 #include "common/lib/test_rdma.c"
+#include "nvmf/qdlimit.c"
 #include "nvmf/rdma.c"
 #include "nvmf/transport.c"
 
@@ -38,6 +39,7 @@ DEFINE_STUB_V(spdk_mem_map_free, (struct spdk_mem_map **pmap));
 DEFINE_STUB_V(spdk_nvmf_ctrlr_data_init, (struct spdk_nvmf_transport_opts *opts,
 		struct spdk_nvmf_ctrlr_data *cdata));
 DEFINE_STUB_V(spdk_nvmf_request_exec, (struct spdk_nvmf_request *req));
+DEFINE_STUB(spdk_bdev_get_name, const char *, (const struct spdk_bdev *bdev), "test_bdev");
 DEFINE_STUB(spdk_nvmf_request_complete, int, (struct spdk_nvmf_request *req), 0);
 DEFINE_STUB(spdk_nvme_transport_id_compare, int, (const struct spdk_nvme_transport_id *trid1,
 		const struct spdk_nvme_transport_id *trid2), 0);
