@@ -342,8 +342,8 @@ int main()
 ## 前后台流量场景，使用L0进行精准流控的收益测试
 实际系统中通常同时存在前台读写流量和后台流量（GC流量、副本流量等），在2根内存条配置下，前后台流量争抢L3 Cache空间导致数据频繁下刷至DRAM，内存带宽瓶颈将导致前台业务性能降低。使用L0精确控制流量，前台流量进入L0 Cache中，后台流量进入L3 Cache中，可以减少前后台流量争抢L3 Cache，进而解决内存带宽瓶颈，最终提升前台业务性能。
 ### 1. 测试软硬件配置
--  测试环境：Kunpeng 920 7282C（L3 单P 140M，P0上插2根内存条，P1上不保留内存条） 
-- 测试组网：400Ge NIC + 8 V7 SSD，NIC在numa1上，SSD平均分布在numa0/1
+- 测试环境：Kunpeng 920新型号（P0上插2根内存条，P1上不保留内存条） 
+- 测试组网：2*200Ge Mellanox ConnectX-7 NIC + 8 V7 SSD，NIC在numa1上，SSD平均分布在numa0/1
 - 内核：kernel-5.10.0_hisi_l0+-140.aarch64.rpm
 - BIOS：L3 share模式，1P2Numa & 关闭die交织
 ### 2. 加载 L0 驱动并启用mpam
@@ -393,14 +393,8 @@ git clone https://github.com/redrose2100/lmbench.git
 chmod 777 -R lmbench/
 cd lmbench && make
 ```
-### 5. 服务端开启IOStash
-```bash
-git clone https://gitcode.com/openeuler/cache_tuner.git
-cd cache_tuner/cache_stash && make -j
-insmod cache_stash.ko
-echo 1 > /sys/kernel/cache_stash/llc_enable
-cat /sys/kernel/cache_stash/llc_enable
-```
+### 5. 服务端开启IOStash, 参考"1. 编译并加载 io stash"
+
 ### 6. 测试前后台流量场景的前台NOF性能（不使能L0）
 step1：启动后台流量
 ```bash
@@ -418,14 +412,14 @@ build/bin/spdk_tgt -m 0xff
 ```bash
 cd <spdk path>
 ./scripts/rpc.py nvmf_create_transport -t RDMA -q 1024 -m 127 -c 4096 -i 131072 -u 131072 -a 128 -n 320 -b 0
-./scripts/rpc.py bdev_nvme_attach_controller -b Nvme0 -t PCIe -a 0000:17:00.0
-./scripts/rpc.py bdev_nvme_attach_controller -b Nvme1 -t PCIe -a 0000:18:00.0
-./scripts/rpc.py bdev_nvme_attach_controller -b Nvme2 -t PCIe -a 0000:19:00.0
-./scripts/rpc.py bdev_nvme_attach_controller -b Nvme3 -t PCIe -a 0000:1a:00.0
-./scripts/rpc.py bdev_nvme_attach_controller -b Nvme4 -t PCIe -a 0000:57:00.0
-./scripts/rpc.py bdev_nvme_attach_controller -b Nvme5 -t PCIe -a 0000:58:00.0
-./scripts/rpc.py bdev_nvme_attach_controller -b Nvme6 -t PCIe -a 0000:59:00.0
-./scripts/rpc.py bdev_nvme_attach_controller -b Nvme7 -t PCIe -a 0000:5a:00.0
+./scripts/rpc.py bdev_nvme_attach_controller -b Nvme0 -t PCIe -a <BDF1>
+./scripts/rpc.py bdev_nvme_attach_controller -b Nvme1 -t PCIe -a <BDF2>
+./scripts/rpc.py bdev_nvme_attach_controller -b Nvme2 -t PCIe -a <BDF3>
+./scripts/rpc.py bdev_nvme_attach_controller -b Nvme3 -t PCIe -a <BDF4>
+./scripts/rpc.py bdev_nvme_attach_controller -b Nvme4 -t PCIe -a <BDF5>
+./scripts/rpc.py bdev_nvme_attach_controller -b Nvme5 -t PCIe -a <BDF6>
+./scripts/rpc.py bdev_nvme_attach_controller -b Nvme6 -t PCIe -a <BDF7>
+./scripts/rpc.py bdev_nvme_attach_controller -b Nvme7 -t PCIe -a <BDF8>
 ./scripts/rpc.py nvmf_create_subsystem nqn.2016-06.io.spdk:cnode1 -a -s SPDK00000000000001 -m 8
 ./scripts/rpc.py nvmf_subsystem_add_ns nqn.2016-06.io.spdk:cnode1 Nvme0n1
 ./scripts/rpc.py nvmf_subsystem_add_ns nqn.2016-06.io.spdk:cnode1 Nvme1n1
@@ -435,9 +429,11 @@ cd <spdk path>
 ./scripts/rpc.py nvmf_subsystem_add_ns nqn.2016-06.io.spdk:cnode1 Nvme5n1
 ./scripts/rpc.py nvmf_subsystem_add_ns nqn.2016-06.io.spdk:cnode1 Nvme6n1
 ./scripts/rpc.py nvmf_subsystem_add_ns nqn.2016-06.io.spdk:cnode1 Nvme7n1
-./scripts/rpc.py nvmf_subsystem_add_listener nqn.2016-06.io.spdk:cnode1 -t RDMA -a 192.168.65.87 -s 4420
-./scripts/rpc.py nvmf_subsystem_add_listener nqn.2016-06.io.spdk:cnode1 -t RDMA -a 192.168.75.87 -s 4420
+./scripts/rpc.py nvmf_subsystem_add_listener nqn.2016-06.io.spdk:cnode1 -t RDMA -a <ip1> -s <port1>
+./scripts/rpc.py nvmf_subsystem_add_listener nqn.2016-06.io.spdk:cnode1 -t RDMA -a <ip2> -s <port2>
 ```
+其中 `<ip1>/<port1>`、`<ip2>/<port2>` 替换为实际 RDMA 网卡 IP 和端口，可配置多个网口的监听; `<BDF1>`为SSD的PCIE地址。
+
 step3：客户端使用perf下发流量（128K包大小，16并发写），并观测前台业务带宽
 ```bash
 cd <spdk path>
@@ -460,14 +456,14 @@ build/bin/spdk_tgt -m 0xff
 ```bash
 cd <spdk path>
 ./scripts/rpc.py nvmf_create_transport -t RDMA -q 1024 -m 127 -c 4096 -i 131072 -u 131072 -a 128 -n 320 -b 0
-./scripts/rpc.py bdev_nvme_attach_controller -b Nvme0 -t PCIe -a 0000:17:00.0
-./scripts/rpc.py bdev_nvme_attach_controller -b Nvme1 -t PCIe -a 0000:18:00.0
-./scripts/rpc.py bdev_nvme_attach_controller -b Nvme2 -t PCIe -a 0000:19:00.0
-./scripts/rpc.py bdev_nvme_attach_controller -b Nvme3 -t PCIe -a 0000:1a:00.0
-./scripts/rpc.py bdev_nvme_attach_controller -b Nvme4 -t PCIe -a 0000:57:00.0
-./scripts/rpc.py bdev_nvme_attach_controller -b Nvme5 -t PCIe -a 0000:58:00.0
-./scripts/rpc.py bdev_nvme_attach_controller -b Nvme6 -t PCIe -a 0000:59:00.0
-./scripts/rpc.py bdev_nvme_attach_controller -b Nvme7 -t PCIe -a 0000:5a:00.0
+./scripts/rpc.py bdev_nvme_attach_controller -b Nvme0 -t PCIe -a <BDF1>
+./scripts/rpc.py bdev_nvme_attach_controller -b Nvme1 -t PCIe -a <BDF2>
+./scripts/rpc.py bdev_nvme_attach_controller -b Nvme2 -t PCIe -a <BDF3>
+./scripts/rpc.py bdev_nvme_attach_controller -b Nvme3 -t PCIe -a <BDF4>
+./scripts/rpc.py bdev_nvme_attach_controller -b Nvme4 -t PCIe -a <BDF5>
+./scripts/rpc.py bdev_nvme_attach_controller -b Nvme5 -t PCIe -a <BDF6>
+./scripts/rpc.py bdev_nvme_attach_controller -b Nvme6 -t PCIe -a <BDF7>
+./scripts/rpc.py bdev_nvme_attach_controller -b Nvme7 -t PCIe -a <BDF8>
 ./scripts/rpc.py nvmf_create_subsystem nqn.2016-06.io.spdk:cnode1 -a -s SPDK00000000000001 -m 8
 ./scripts/rpc.py nvmf_subsystem_add_ns nqn.2016-06.io.spdk:cnode1 Nvme0n1
 ./scripts/rpc.py nvmf_subsystem_add_ns nqn.2016-06.io.spdk:cnode1 Nvme1n1
@@ -477,9 +473,11 @@ cd <spdk path>
 ./scripts/rpc.py nvmf_subsystem_add_ns nqn.2016-06.io.spdk:cnode1 Nvme5n1
 ./scripts/rpc.py nvmf_subsystem_add_ns nqn.2016-06.io.spdk:cnode1 Nvme6n1
 ./scripts/rpc.py nvmf_subsystem_add_ns nqn.2016-06.io.spdk:cnode1 Nvme7n1
-./scripts/rpc.py nvmf_subsystem_add_listener nqn.2016-06.io.spdk:cnode1 -t RDMA -a 192.168.65.87 -s 4420
-./scripts/rpc.py nvmf_subsystem_add_listener nqn.2016-06.io.spdk:cnode1 -t RDMA -a 192.168.75.87 -s 4420
+./scripts/rpc.py nvmf_subsystem_add_listener nqn.2016-06.io.spdk:cnode1 -t RDMA -a <ip1> -s <port1>
+./scripts/rpc.py nvmf_subsystem_add_listener nqn.2016-06.io.spdk:cnode1 -t RDMA -a <ip2> -s <port2>
 ```
+其中 `<ip1>/<port1>`、`<ip2>/<port2>` 替换为实际 RDMA 网卡 IP 和端口，可配置多个网口的监听；`<BDF1>`为SSD的PCIE地址。
+
 step3：客户端使用perf下发流量（128K包大小，16并发写），并观测前台业务带宽
 ```bash
 cd <spdk path>
