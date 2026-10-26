@@ -341,7 +341,12 @@ int main()
 
 ## 前后台流量场景，使用L0进行精准流控的收益测试
 实际系统中通常同时存在前台读写流量和后台流量（GC流量、副本流量等），在2根内存条配置下，前后台流量争抢L3 Cache空间导致数据频繁下刷至DRAM，内存带宽瓶颈将导致前台业务性能降低。使用L0精确控制流量，前台流量进入L0 Cache中，后台流量进入L3 Cache中，可以减少前后台流量争抢L3 Cache，进而解决内存带宽瓶颈，最终提升前台业务性能。
-### 1. 加载 L0 驱动并启用mpam
+### 1. 测试软硬件配置
+-  测试环境：Kunpeng 920 7282C（L3 单P 140M，P0上插2根内存条，P1上不保留内存条） 
+- 测试组网：400Ge NIC + 8 V7 SSD，NIC在numa1上，SSD平均分布在numa0/1
+- 内核：kernel-5.10.0_hisi_l0+-140.aarch64.rpm
+- BIOS：L3 share模式，1P2Numa & 关闭die交织
+### 2. 加载 L0 驱动并启用mpam
 
 安装指定内核：
 ```bash
@@ -371,7 +376,7 @@ ll /dev/hisi_soc_cache_mgmt
 ```bash
 mount -t resctrl resctrl /sys/fs/resctrl/
 ```
-### 2. 服务端和客户端编译 SPDK
+### 3. 服务端和客户端编译 SPDK
 
 NVMf RDMA target 需要打开 RDMA：
 
@@ -382,13 +387,13 @@ git submodule update --init
 ./configure --with-rdma && make -j
 make install
 ```
-### 3. 服务端编译lmbench
+### 4. 服务端编译lmbench
 ```bash
 git clone https://github.com/redrose2100/lmbench.git
 chmod 777 -R lmbench/
 cd lmbench && make
 ```
-### 4. 服务端开启IOStash
+### 5. 服务端开启IOStash
 ```bash
 git clone https://gitcode.com/openeuler/cache_tuner.git
 cd cache_tuner/cache_stash && make -j
@@ -396,7 +401,7 @@ insmod cache_stash.ko
 echo 1 > /sys/kernel/cache_stash/llc_enable
 cat /sys/kernel/cache_stash/llc_enable
 ```
-### 5. 测试前后台流量场景的前台NOF性能（不使能L0）
+### 6. 测试前后台流量场景的前台NOF性能（不使能L0）
 step1：启动后台流量
 ```bash
 rmdir /sys/fs/resctrl/lmbench && mkdir /sys/fs/resctrl/lmbench
@@ -438,7 +443,7 @@ step3：客户端使用perf下发流量（128K包大小，16并发写），并�
 cd <spdk path>
 build/examples/perf -r 'trtype:RDMA adrfam:IPv4 traddr:192.168.65.87 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1 ns:1' -r 'trtype:RDMA adrfam:IPv4 traddr:192.168.65.87 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1 ns:2' -r 'trtype:RDMA adrfam:IPv4 traddr:192.168.65.87 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1 ns:3' -r 'trtype:RDMA adrfam:IPv4 traddr:192.168.65.87 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1 ns:4' -r 'trtype:RDMA adrfam:IPv4 traddr:192.168.75.87 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1 ns:5' -r 'trtype:RDMA adrfam:IPv4 traddr:192.168.75.87 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1 ns:6' -r 'trtype:RDMA adrfam:IPv4 traddr:192.168.75.87 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1 ns:7' -r 'trtype:RDMA adrfam:IPv4 traddr:192.168.75.87 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1 ns:8' -t 60 -w write -o 131072 -q 16 -c 0xff
 ```
-### 6. 测试前后台流量场景的前台NOF性能（使能L0）
+### 7. 测试前后台流量场景的前台NOF性能（使能L0）
 step1：启动后台流量
 ```bash
 rmdir /sys/fs/resctrl/lmbench && mkdir /sys/fs/resctrl/lmbench
@@ -480,4 +485,4 @@ step3：客户端使用perf下发流量（128K包大小，16并发写），并�
 cd <spdk path>
 build/examples/perf -r 'trtype:RDMA adrfam:IPv4 traddr:192.168.65.87 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1 ns:1' -r 'trtype:RDMA adrfam:IPv4 traddr:192.168.65.87 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1 ns:2' -r 'trtype:RDMA adrfam:IPv4 traddr:192.168.65.87 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1 ns:3' -r 'trtype:RDMA adrfam:IPv4 traddr:192.168.65.87 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1 ns:4' -r 'trtype:RDMA adrfam:IPv4 traddr:192.168.75.87 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1 ns:5' -r 'trtype:RDMA adrfam:IPv4 traddr:192.168.75.87 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1 ns:6' -r 'trtype:RDMA adrfam:IPv4 traddr:192.168.75.87 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1 ns:7' -r 'trtype:RDMA adrfam:IPv4 traddr:192.168.75.87 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1 ns:8' -t 60 -w write -o 131072 -q 16 -c 0xff
 ```
-### 7. 对比前后台流量场景下，使用L0 Cache前后，前台业务带宽的变化情况
+### 8. 对比前后台流量场景下，使用L0 Cache前后，前台业务带宽的变化情况
