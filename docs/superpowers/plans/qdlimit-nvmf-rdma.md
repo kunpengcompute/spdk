@@ -66,8 +66,8 @@ struct spdk_json_write_ctx;
 
 /* Result of the admission gate. */
 enum nvmf_qdlimit_status {
-	NVMF_QDLIMIT_ADMIT,	/* under limit (or unlimited): proceed to get_buffers */
-	NVMF_QDLIMIT_THROTTLED,	/* over limit: request parked on a per-SSD wait queue */
+        NVMF_QDLIMIT_ADMIT,     /* under limit (or unlimited): proceed to get_buffers */
+        NVMF_QDLIMIT_THROTTLED, /* over limit: request parked on a per-SSD wait queue */
 };
 
 /* Per-poll-group context lifecycle. Called from the RDMA poll-group create/destroy paths. */
@@ -78,12 +78,12 @@ void nvmf_qdlimit_pg_fini(struct spdk_nvmf_transport_poll_group *group);
  * On NVMF_QDLIMIT_THROTTLED the module has already removed req from group->pending_buf_queue
  * and parked it on the per-SSD wait queue; the caller must stop processing this request. */
 enum nvmf_qdlimit_status nvmf_qdlimit_admit(struct spdk_nvmf_transport_poll_group *group,
-		struct spdk_nvmf_request *req);
+                struct spdk_nvmf_request *req);
 
 /* Slot release. Call from _nvmf_rdma_request_free. No-op unless req->qdlimit_charged.
  * Decrements the per-core counter and re-arms one parked waiter for the same SSD. */
 void nvmf_qdlimit_release(struct spdk_nvmf_transport_poll_group *group,
-			 struct spdk_nvmf_request *req);
+                         struct spdk_nvmf_request *req);
 
 /* Config (global, per backing bdev). depth == 0 means unlimited. Returns 0 on success,
  * negative errno on failure. Safe to call from the RPC thread. */
@@ -114,98 +114,98 @@ void nvmf_qdlimit_config_cleanup(void);
  * (only at config_cleanup), so the per-pg hot path can cache a stable pointer and read
  * ->depth without locking. depth == 0 means unlimited. */
 struct qdlimit_config_entry {
-	char				bdev_name[256];
-	uint32_t			depth;
-	TAILQ_ENTRY(qdlimit_config_entry) link;
+        char                            bdev_name[256];
+        uint32_t                        depth;
+        TAILQ_ENTRY(qdlimit_config_entry) link;
 };
 
 static TAILQ_HEAD(, qdlimit_config_entry) g_qdlimit_config =
-	TAILQ_HEAD_INITIALIZER(g_qdlimit_config);
+        TAILQ_HEAD_INITIALIZER(g_qdlimit_config);
 static pthread_mutex_t g_qdlimit_config_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Caller must hold g_qdlimit_config_lock. */
 static struct qdlimit_config_entry *
 qdlimit_config_find(const char *bdev_name)
 {
-	struct qdlimit_config_entry *e;
+        struct qdlimit_config_entry *e;
 
-	TAILQ_FOREACH(e, &g_qdlimit_config, link) {
-		if (strcmp(e->bdev_name, bdev_name) == 0) {
-			return e;
-		}
-	}
-	return NULL;
+        TAILQ_FOREACH(e, &g_qdlimit_config, link) {
+                if (strcmp(e->bdev_name, bdev_name) == 0) {
+                        return e;
+                }
+        }
+        return NULL;
 }
 
 /* Caller must hold g_qdlimit_config_lock. Creates the entry if absent. */
 static struct qdlimit_config_entry *
 qdlimit_config_get_or_create(const char *bdev_name)
 {
-	struct qdlimit_config_entry *e = qdlimit_config_find(bdev_name);
+        struct qdlimit_config_entry *e = qdlimit_config_find(bdev_name);
 
-	if (e != NULL) {
-		return e;
-	}
-	e = calloc(1, sizeof(*e));
-	if (e == NULL) {
-		return NULL;
-	}
-	spdk_strcpy_pad(e->bdev_name, bdev_name, sizeof(e->bdev_name) - 1, '\0');
-	e->bdev_name[sizeof(e->bdev_name) - 1] = '\0';
-	e->depth = 0;
-	TAILQ_INSERT_TAIL(&g_qdlimit_config, e, link);
-	return e;
+        if (e != NULL) {
+                return e;
+        }
+        e = calloc(1, sizeof(*e));
+        if (e == NULL) {
+                return NULL;
+        }
+        spdk_strcpy_pad(e->bdev_name, bdev_name, sizeof(e->bdev_name) - 1, '\0');
+        e->bdev_name[sizeof(e->bdev_name) - 1] = '\0';
+        e->depth = 0;
+        TAILQ_INSERT_TAIL(&g_qdlimit_config, e, link);
+        return e;
 }
 
 int
 nvmf_qdlimit_set_depth(const char *bdev_name, uint32_t depth)
 {
-	struct qdlimit_config_entry *e;
+        struct qdlimit_config_entry *e;
 
-	if (bdev_name == NULL || bdev_name[0] == '\0') {
-		return -EINVAL;
-	}
-	if (strlen(bdev_name) >= sizeof(e->bdev_name)) {
-		return -ENAMETOOLONG;
-	}
+        if (bdev_name == NULL || bdev_name[0] == '\0') {
+                return -EINVAL;
+        }
+        if (strlen(bdev_name) >= sizeof(e->bdev_name)) {
+                return -ENAMETOOLONG;
+        }
 
-	pthread_mutex_lock(&g_qdlimit_config_lock);
-	e = qdlimit_config_get_or_create(bdev_name);
-	if (e == NULL) {
-		pthread_mutex_unlock(&g_qdlimit_config_lock);
-		return -ENOMEM;
-	}
-	e->depth = depth;
-	pthread_mutex_unlock(&g_qdlimit_config_lock);
-	return 0;
+        pthread_mutex_lock(&g_qdlimit_config_lock);
+        e = qdlimit_config_get_or_create(bdev_name);
+        if (e == NULL) {
+                pthread_mutex_unlock(&g_qdlimit_config_lock);
+                return -ENOMEM;
+        }
+        e->depth = depth;
+        pthread_mutex_unlock(&g_qdlimit_config_lock);
+        return 0;
 }
 
 int
 nvmf_qdlimit_get_depth(const char *bdev_name, uint32_t *depth)
 {
-	struct qdlimit_config_entry *e;
+        struct qdlimit_config_entry *e;
 
-	if (bdev_name == NULL || depth == NULL) {
-		return -EINVAL;
-	}
-	pthread_mutex_lock(&g_qdlimit_config_lock);
-	e = qdlimit_config_find(bdev_name);
-	*depth = (e != NULL) ? e->depth : 0;
-	pthread_mutex_unlock(&g_qdlimit_config_lock);
-	return (e != NULL) ? 0 : -ENOENT;
+        if (bdev_name == NULL || depth == NULL) {
+                return -EINVAL;
+        }
+        pthread_mutex_lock(&g_qdlimit_config_lock);
+        e = qdlimit_config_find(bdev_name);
+        *depth = (e != NULL) ? e->depth : 0;
+        pthread_mutex_unlock(&g_qdlimit_config_lock);
+        return (e != NULL) ? 0 : -ENOENT;
 }
 
 void
 nvmf_qdlimit_config_cleanup(void)
 {
-	struct qdlimit_config_entry *e, *tmp;
+        struct qdlimit_config_entry *e, *tmp;
 
-	pthread_mutex_lock(&g_qdlimit_config_lock);
-	TAILQ_FOREACH_SAFE(e, &g_qdlimit_config, link, tmp) {
-		TAILQ_REMOVE(&g_qdlimit_config, e, link);
-		free(e);
-	}
-	pthread_mutex_unlock(&g_qdlimit_config_lock);
+        pthread_mutex_lock(&g_qdlimit_config_lock);
+        TAILQ_FOREACH_SAFE(e, &g_qdlimit_config, link, tmp) {
+                TAILQ_REMOVE(&g_qdlimit_config, e, link);
+                free(e);
+        }
+        pthread_mutex_unlock(&g_qdlimit_config_lock);
 }
 ```
 
@@ -255,46 +255,46 @@ include $(SPDK_ROOT_DIR)/mk/spdk.unittest.mk
 static void
 test_config_set_get(void)
 {
-	uint32_t depth = 12345;
+        uint32_t depth = 12345;
 
-	/* Unconfigured bdev: ENOENT, depth defaults to 0. */
-	CU_ASSERT(nvmf_qdlimit_get_depth("bdevA", &depth) == -ENOENT);
-	CU_ASSERT(depth == 0);
+        /* Unconfigured bdev: ENOENT, depth defaults to 0. */
+        CU_ASSERT(nvmf_qdlimit_get_depth("bdevA", &depth) == -ENOENT);
+        CU_ASSERT(depth == 0);
 
-	/* Set then read back. */
-	CU_ASSERT(nvmf_qdlimit_set_depth("bdevA", 8) == 0);
-	CU_ASSERT(nvmf_qdlimit_get_depth("bdevA", &depth) == 0);
-	CU_ASSERT(depth == 8);
+        /* Set then read back. */
+        CU_ASSERT(nvmf_qdlimit_set_depth("bdevA", 8) == 0);
+        CU_ASSERT(nvmf_qdlimit_get_depth("bdevA", &depth) == 0);
+        CU_ASSERT(depth == 8);
 
-	/* Update in place. */
-	CU_ASSERT(nvmf_qdlimit_set_depth("bdevA", 0) == 0);
-	CU_ASSERT(nvmf_qdlimit_get_depth("bdevA", &depth) == 0);
-	CU_ASSERT(depth == 0);
+        /* Update in place. */
+        CU_ASSERT(nvmf_qdlimit_set_depth("bdevA", 0) == 0);
+        CU_ASSERT(nvmf_qdlimit_get_depth("bdevA", &depth) == 0);
+        CU_ASSERT(depth == 0);
 
-	/* Bad args. */
-	CU_ASSERT(nvmf_qdlimit_set_depth(NULL, 1) == -EINVAL);
-	CU_ASSERT(nvmf_qdlimit_set_depth("", 1) == -EINVAL);
+        /* Bad args. */
+        CU_ASSERT(nvmf_qdlimit_set_depth(NULL, 1) == -EINVAL);
+        CU_ASSERT(nvmf_qdlimit_set_depth("", 1) == -EINVAL);
 
-	nvmf_qdlimit_config_cleanup();
+        nvmf_qdlimit_config_cleanup();
 }
 
 int
 main(int argc, char **argv)
 {
-	CU_pSuite suite = NULL;
-	unsigned int num_failures;
+        CU_pSuite suite = NULL;
+        unsigned int num_failures;
 
-	CU_set_error_action(CUEA_ABORT);
-	CU_initialize_registry();
+        CU_set_error_action(CUEA_ABORT);
+        CU_initialize_registry();
 
-	suite = CU_add_suite("qdlimit", NULL, NULL);
-	CU_ADD_TEST(suite, test_config_set_get);
+        suite = CU_add_suite("qdlimit", NULL, NULL);
+        CU_ADD_TEST(suite, test_config_set_get);
 
-	CU_basic_set_mode(CU_BRM_VERBOSE);
-	CU_basic_run_tests();
-	num_failures = CU_get_number_of_failures();
-	CU_cleanup_registry();
-	return num_failures;
+        CU_basic_set_mode(CU_BRM_VERBOSE);
+        CU_basic_run_tests();
+        num_failures = CU_get_number_of_failures();
+        CU_cleanup_registry();
+        return num_failures;
 }
 ```
 
@@ -343,48 +343,48 @@ Add `#include "spdk/nvmf_transport.h"` to the includes, then add above `nvmf_qdl
 /* One entry per backing SSD (bdev) seen on this poll group's core. Touched only by the
  * owning poll thread, so inflight is updated lock-free. */
 struct qdlimit_pg_ssd {
-	struct spdk_bdev		*bdev;		/* identity key for this core */
-	struct qdlimit_config_entry	*cfg;		/* stable pointer; read ->depth on hot path */
-	uint32_t			inflight;	/* admitted, buffer-holding requests on this core */
-	STAILQ_HEAD(, spdk_nvmf_request) wait_q;	/* throttled requests, FIFO (uses req->buf_link) */
-	TAILQ_ENTRY(qdlimit_pg_ssd)	link;
+        struct spdk_bdev                *bdev;          /* identity key for this core */
+        struct qdlimit_config_entry     *cfg;           /* stable pointer; read ->depth on hot path */
+        uint32_t                        inflight;       /* admitted, buffer-holding requests on this core */
+        STAILQ_HEAD(, spdk_nvmf_request) wait_q;        /* throttled requests, FIFO (uses req->buf_link) */
+        TAILQ_ENTRY(qdlimit_pg_ssd)     link;
 };
 
 struct qdlimit_pg_ctx {
-	TAILQ_HEAD(, qdlimit_pg_ssd)	ssds;
+        TAILQ_HEAD(, qdlimit_pg_ssd)    ssds;
 };
 
 void
 nvmf_qdlimit_pg_init(struct spdk_nvmf_transport_poll_group *group)
 {
-	struct qdlimit_pg_ctx *ctx = calloc(1, sizeof(*ctx));
+        struct qdlimit_pg_ctx *ctx = calloc(1, sizeof(*ctx));
 
-	if (ctx == NULL) {
-		group->qdlimit_ctx = NULL;
-		return;
-	}
-	TAILQ_INIT(&ctx->ssds);
-	group->qdlimit_ctx = ctx;
+        if (ctx == NULL) {
+                group->qdlimit_ctx = NULL;
+                return;
+        }
+        TAILQ_INIT(&ctx->ssds);
+        group->qdlimit_ctx = ctx;
 }
 
 void
 nvmf_qdlimit_pg_fini(struct spdk_nvmf_transport_poll_group *group)
 {
-	struct qdlimit_pg_ctx *ctx = group->qdlimit_ctx;
-	struct qdlimit_pg_ssd *s, *tmp;
+        struct qdlimit_pg_ctx *ctx = group->qdlimit_ctx;
+        struct qdlimit_pg_ssd *s, *tmp;
 
-	if (ctx == NULL) {
-		return;
-	}
-	TAILQ_FOREACH_SAFE(s, &ctx->ssds, link, tmp) {
-		/* Parked requests must have been drained by the transport teardown path
-		 * (it walks pending_buf_queue + wait queues). Assert none leaked. */
-		assert(STAILQ_EMPTY(&s->wait_q));
-		TAILQ_REMOVE(&ctx->ssds, s, link);
-		free(s);
-	}
-	free(ctx);
-	group->qdlimit_ctx = NULL;
+        if (ctx == NULL) {
+                return;
+        }
+        TAILQ_FOREACH_SAFE(s, &ctx->ssds, link, tmp) {
+                /* Parked requests must have been drained by the transport teardown path
+                 * (it walks pending_buf_queue + wait queues). Assert none leaked. */
+                assert(STAILQ_EMPTY(&s->wait_q));
+                TAILQ_REMOVE(&ctx->ssds, s, link);
+                free(s);
+        }
+        free(ctx);
+        group->qdlimit_ctx = NULL;
 }
 
 /* Find-or-create the per-core entry for bdev. Returns NULL if the bdev has no configured
@@ -392,32 +392,32 @@ nvmf_qdlimit_pg_fini(struct spdk_nvmf_transport_poll_group *group)
 static struct qdlimit_pg_ssd *
 qdlimit_pg_get_ssd(struct qdlimit_pg_ctx *ctx, struct spdk_bdev *bdev, const char *bdev_name)
 {
-	struct qdlimit_pg_ssd *s;
-	struct qdlimit_config_entry *cfg;
+        struct qdlimit_pg_ssd *s;
+        struct qdlimit_config_entry *cfg;
 
-	TAILQ_FOREACH(s, &ctx->ssds, link) {
-		if (s->bdev == bdev) {
-			return s;
-		}
-	}
+        TAILQ_FOREACH(s, &ctx->ssds, link) {
+                if (s->bdev == bdev) {
+                        return s;
+                }
+        }
 
-	pthread_mutex_lock(&g_qdlimit_config_lock);
-	cfg = qdlimit_config_find(bdev_name);
-	pthread_mutex_unlock(&g_qdlimit_config_lock);
-	if (cfg == NULL) {
-		return NULL;	/* never configured: unlimited */
-	}
+        pthread_mutex_lock(&g_qdlimit_config_lock);
+        cfg = qdlimit_config_find(bdev_name);
+        pthread_mutex_unlock(&g_qdlimit_config_lock);
+        if (cfg == NULL) {
+                return NULL;    /* never configured: unlimited */
+        }
 
-	s = calloc(1, sizeof(*s));
-	if (s == NULL) {
-		return NULL;
-	}
-	s->bdev = bdev;
-	s->cfg = cfg;
-	s->inflight = 0;
-	STAILQ_INIT(&s->wait_q);
-	TAILQ_INSERT_TAIL(&ctx->ssds, s, link);
-	return s;
+        s = calloc(1, sizeof(*s));
+        if (s == NULL) {
+                return NULL;
+        }
+        s->bdev = bdev;
+        s->cfg = cfg;
+        s->inflight = 0;
+        STAILQ_INIT(&s->wait_q);
+        TAILQ_INSERT_TAIL(&ctx->ssds, s, link);
+        return s;
 }
 ```
 
@@ -426,7 +426,7 @@ qdlimit_pg_get_ssd(struct qdlimit_pg_ctx *ctx, struct spdk_bdev *bdev, const cha
 `struct spdk_nvmf_transport_poll_group` is defined in `include/spdk/nvmf_transport.h` (NOT `nvmf_internal.h`). Find it and add, immediately after its `STAILQ_HEAD(, spdk_nvmf_request) pending_buf_queue;` member:
 
 ```c
-	void				*qdlimit_ctx;	/* opaque per-group qdlimit state; NULL when unused */
+        void                            *qdlimit_ctx;   /* opaque per-group qdlimit state; NULL when unused */
 ```
 
 Run to find the exact line:
@@ -443,14 +443,14 @@ In `qdlimit_ut.c`, add this test and register it in `main`:
 static void
 test_pg_init_fini(void)
 {
-	struct spdk_nvmf_transport_poll_group group = {};
+        struct spdk_nvmf_transport_poll_group group = {};
 
-	nvmf_qdlimit_pg_init(&group);
-	CU_ASSERT(group.qdlimit_ctx != NULL);
-	CU_ASSERT(TAILQ_EMPTY(&((struct qdlimit_pg_ctx *)group.qdlimit_ctx)->ssds));
+        nvmf_qdlimit_pg_init(&group);
+        CU_ASSERT(group.qdlimit_ctx != NULL);
+        CU_ASSERT(TAILQ_EMPTY(&((struct qdlimit_pg_ctx *)group.qdlimit_ctx)->ssds));
 
-	nvmf_qdlimit_pg_fini(&group);
-	CU_ASSERT(group.qdlimit_ctx == NULL);
+        nvmf_qdlimit_pg_fini(&group);
+        CU_ASSERT(group.qdlimit_ctx == NULL);
 }
 ```
 Register: add `CU_ADD_TEST(suite, test_pg_init_fini);` after the existing `CU_ADD_TEST` line.
@@ -485,7 +485,7 @@ git commit -m "nvmf/qdlimit: add per-poll-group context and per-SSD entries"
 In `include/spdk/nvmf_transport.h`, in `struct spdk_nvmf_request`, add after the `bool dif_enabled;` line (line 80):
 
 ```c
-	bool				qdlimit_charged; /* holds a qdlimit slot, released exactly once */
+        bool                            qdlimit_charged; /* holds a qdlimit slot, released exactly once */
 ```
 
 - [ ] **Step 2: Write failing admission tests**
@@ -498,56 +498,56 @@ static char g_fake_bdev_a;
 static char g_fake_bdev_b;
 
 DEFINE_STUB(spdk_bdev_get_name, const char *, (const struct spdk_bdev *bdev),
-	    ((void *)bdev == &g_fake_bdev_a) ? "bdevA" : "bdevB");
+            ((void *)bdev == &g_fake_bdev_a) ? "bdevA" : "bdevB");
 
 static void
 test_admit_under_and_over_limit(void)
 {
-	struct spdk_nvmf_transport_poll_group group = {};
-	struct spdk_nvmf_request r1 = {}, r2 = {}, r3 = {};
+        struct spdk_nvmf_transport_poll_group group = {};
+        struct spdk_nvmf_request r1 = {}, r2 = {}, r3 = {};
 
-	STAILQ_INIT(&group.pending_buf_queue);
-	nvmf_qdlimit_pg_init(&group);
-	CU_ASSERT(nvmf_qdlimit_set_depth("bdevA", 2) == 0);
+        STAILQ_INIT(&group.pending_buf_queue);
+        nvmf_qdlimit_pg_init(&group);
+        CU_ASSERT(nvmf_qdlimit_set_depth("bdevA", 2) == 0);
 
-	/* Simulate the transport: each request is the queue head when gated. */
-	STAILQ_INSERT_TAIL(&group.pending_buf_queue, &r1, buf_link);
-	CU_ASSERT(qdlimit_admit_bdev(&group, &r1, (void *)&g_fake_bdev_a, "bdevA") == NVMF_QDLIMIT_ADMIT);
-	CU_ASSERT(r1.qdlimit_charged == true);
+        /* Simulate the transport: each request is the queue head when gated. */
+        STAILQ_INSERT_TAIL(&group.pending_buf_queue, &r1, buf_link);
+        CU_ASSERT(qdlimit_admit_bdev(&group, &r1, (void *)&g_fake_bdev_a, "bdevA") == NVMF_QDLIMIT_ADMIT);
+        CU_ASSERT(r1.qdlimit_charged == true);
 
-	STAILQ_INSERT_TAIL(&group.pending_buf_queue, &r2, buf_link);
-	CU_ASSERT(qdlimit_admit_bdev(&group, &r2, (void *)&g_fake_bdev_a, "bdevA") == NVMF_QDLIMIT_ADMIT);
+        STAILQ_INSERT_TAIL(&group.pending_buf_queue, &r2, buf_link);
+        CU_ASSERT(qdlimit_admit_bdev(&group, &r2, (void *)&g_fake_bdev_a, "bdevA") == NVMF_QDLIMIT_ADMIT);
 
-	/* Third request exceeds depth=2: throttled and removed from pending_buf_queue. */
-	STAILQ_INSERT_TAIL(&group.pending_buf_queue, &r3, buf_link);
-	CU_ASSERT(qdlimit_admit_bdev(&group, &r3, (void *)&g_fake_bdev_a, "bdevA") == NVMF_QDLIMIT_THROTTLED);
-	CU_ASSERT(r3.qdlimit_charged == false);
-	/* r3 left pending_buf_queue; r1 and r2 remain. */
-	CU_ASSERT(STAILQ_FIRST(&group.pending_buf_queue) == &r1);
+        /* Third request exceeds depth=2: throttled and removed from pending_buf_queue. */
+        STAILQ_INSERT_TAIL(&group.pending_buf_queue, &r3, buf_link);
+        CU_ASSERT(qdlimit_admit_bdev(&group, &r3, (void *)&g_fake_bdev_a, "bdevA") == NVMF_QDLIMIT_THROTTLED);
+        CU_ASSERT(r3.qdlimit_charged == false);
+        /* r3 left pending_buf_queue; r1 and r2 remain. */
+        CU_ASSERT(STAILQ_FIRST(&group.pending_buf_queue) == &r1);
 
-	nvmf_qdlimit_pg_fini_drain(&group); /* test helper, see step 3 */
+        nvmf_qdlimit_pg_fini_drain(&group); /* test helper, see step 3 */
 }
 
 static void
 test_admit_bypass(void)
 {
-	struct spdk_nvmf_transport_poll_group group = {};
-	struct spdk_nvmf_request rn = {}, ru = {};
+        struct spdk_nvmf_transport_poll_group group = {};
+        struct spdk_nvmf_request rn = {}, ru = {};
 
-	STAILQ_INIT(&group.pending_buf_queue);
-	nvmf_qdlimit_pg_init(&group);
+        STAILQ_INIT(&group.pending_buf_queue);
+        nvmf_qdlimit_pg_init(&group);
 
-	/* Unconfigured bdev (bdevB) => unlimited bypass, never charged. */
-	CU_ASSERT(qdlimit_admit_bdev(&group, &ru, (void *)&g_fake_bdev_b, "bdevB") == NVMF_QDLIMIT_ADMIT);
-	CU_ASSERT(ru.qdlimit_charged == false);
+        /* Unconfigured bdev (bdevB) => unlimited bypass, never charged. */
+        CU_ASSERT(qdlimit_admit_bdev(&group, &ru, (void *)&g_fake_bdev_b, "bdevB") == NVMF_QDLIMIT_ADMIT);
+        CU_ASSERT(ru.qdlimit_charged == false);
 
-	/* depth == 0 explicit => unlimited bypass. */
-	CU_ASSERT(nvmf_qdlimit_set_depth("bdevA", 0) == 0);
-	CU_ASSERT(qdlimit_admit_bdev(&group, &rn, (void *)&g_fake_bdev_a, "bdevA") == NVMF_QDLIMIT_ADMIT);
-	CU_ASSERT(rn.qdlimit_charged == false);
+        /* depth == 0 explicit => unlimited bypass. */
+        CU_ASSERT(nvmf_qdlimit_set_depth("bdevA", 0) == 0);
+        CU_ASSERT(qdlimit_admit_bdev(&group, &rn, (void *)&g_fake_bdev_a, "bdevA") == NVMF_QDLIMIT_ADMIT);
+        CU_ASSERT(rn.qdlimit_charged == false);
 
-	nvmf_qdlimit_pg_fini(&group);
-	nvmf_qdlimit_config_cleanup();
+        nvmf_qdlimit_pg_fini(&group);
+        nvmf_qdlimit_config_cleanup();
 }
 ```
 Register both in `main`. Also add at the end of `test_admit_under_and_over_limit`'s suite a `nvmf_qdlimit_config_cleanup();` — handled via the drain helper below.
@@ -563,29 +563,29 @@ Add to `qdlimit.c` (the `_bdev` form is `static` but reachable from the UT via `
 
 static enum nvmf_qdlimit_status
 qdlimit_admit_bdev(struct spdk_nvmf_transport_poll_group *group,
-		   struct spdk_nvmf_request *req, struct spdk_bdev *bdev, const char *bdev_name)
+                   struct spdk_nvmf_request *req, struct spdk_bdev *bdev, const char *bdev_name)
 {
-	struct qdlimit_pg_ctx *ctx = group->qdlimit_ctx;
-	struct qdlimit_pg_ssd *s;
+        struct qdlimit_pg_ctx *ctx = group->qdlimit_ctx;
+        struct qdlimit_pg_ssd *s;
 
-	if (ctx == NULL) {
-		return NVMF_QDLIMIT_ADMIT;	/* module not active on this group */
-	}
-	s = qdlimit_pg_get_ssd(ctx, bdev, bdev_name);
-	if (s == NULL || s->cfg->depth == 0) {
-		return NVMF_QDLIMIT_ADMIT;	/* unconfigured / unlimited */
-	}
-	if (s->inflight >= s->cfg->depth) {
-		/* Over limit: take it off the shared queue so other SSDs are not blocked,
-		 * and park it on this SSD's FIFO wait queue (reuses req->buf_link). */
-		STAILQ_REMOVE(&group->pending_buf_queue, req, spdk_nvmf_request, buf_link);
-		STAILQ_INSERT_TAIL(&s->wait_q, req, buf_link);
-		req->qdlimit_charged = false;
-		return NVMF_QDLIMIT_THROTTLED;
-	}
-	s->inflight++;
-	req->qdlimit_charged = true;
-	return NVMF_QDLIMIT_ADMIT;
+        if (ctx == NULL) {
+                return NVMF_QDLIMIT_ADMIT;      /* module not active on this group */
+        }
+        s = qdlimit_pg_get_ssd(ctx, bdev, bdev_name);
+        if (s == NULL || s->cfg->depth == 0) {
+                return NVMF_QDLIMIT_ADMIT;      /* unconfigured / unlimited */
+        }
+        if (s->inflight >= s->cfg->depth) {
+                /* Over limit: take it off the shared queue so other SSDs are not blocked,
+                 * and park it on this SSD's FIFO wait queue (reuses req->buf_link). */
+                STAILQ_REMOVE(&group->pending_buf_queue, req, spdk_nvmf_request, buf_link);
+                STAILQ_INSERT_TAIL(&s->wait_q, req, buf_link);
+                req->qdlimit_charged = false;
+                return NVMF_QDLIMIT_THROTTLED;
+        }
+        s->inflight++;
+        req->qdlimit_charged = true;
+        return NVMF_QDLIMIT_ADMIT;
 }
 
 /* Resolve nsid -> ns -> bdev using existing helpers, then gate. Bypass anything we cannot
@@ -593,26 +593,26 @@ qdlimit_admit_bdev(struct spdk_nvmf_transport_poll_group *group,
 enum nvmf_qdlimit_status
 nvmf_qdlimit_admit(struct spdk_nvmf_transport_poll_group *group, struct spdk_nvmf_request *req)
 {
-	struct spdk_nvmf_ctrlr *ctrlr;
-	struct spdk_nvmf_ns *ns;
-	struct spdk_bdev *bdev;
+        struct spdk_nvmf_ctrlr *ctrlr;
+        struct spdk_nvmf_ns *ns;
+        struct spdk_bdev *bdev;
 
-	if (req->xfer == SPDK_NVME_DATA_NONE) {
-		return NVMF_QDLIMIT_ADMIT;
-	}
-	if (req->qpair == NULL) {
-		return NVMF_QDLIMIT_ADMIT;
-	}
-	ctrlr = req->qpair->ctrlr;
-	if (ctrlr == NULL || ctrlr->subsys == NULL) {
-		return NVMF_QDLIMIT_ADMIT;
-	}
-	ns = _nvmf_subsystem_get_ns(ctrlr->subsys, req->cmd->nvme_cmd.nsid);
-	if (ns == NULL || ns->bdev == NULL) {
-		return NVMF_QDLIMIT_ADMIT;
-	}
-	bdev = ns->bdev;
-	return qdlimit_admit_bdev(group, req, bdev, spdk_bdev_get_name(bdev));
+        if (req->xfer == SPDK_NVME_DATA_NONE) {
+                return NVMF_QDLIMIT_ADMIT;
+        }
+        if (req->qpair == NULL) {
+                return NVMF_QDLIMIT_ADMIT;
+        }
+        ctrlr = req->qpair->ctrlr;
+        if (ctrlr == NULL || ctrlr->subsys == NULL) {
+                return NVMF_QDLIMIT_ADMIT;
+        }
+        ns = _nvmf_subsystem_get_ns(ctrlr->subsys, req->cmd->nvme_cmd.nsid);
+        if (ns == NULL || ns->bdev == NULL) {
+                return NVMF_QDLIMIT_ADMIT;
+        }
+        bdev = ns->bdev;
+        return qdlimit_admit_bdev(group, req, bdev, spdk_bdev_get_name(bdev));
 }
 ```
 
@@ -624,21 +624,21 @@ Add this test-only drain helper at the bottom of `qdlimit.c`, guarded so it is a
 void
 nvmf_qdlimit_pg_fini_drain(struct spdk_nvmf_transport_poll_group *group)
 {
-	struct qdlimit_pg_ctx *ctx = group->qdlimit_ctx;
-	struct qdlimit_pg_ssd *s;
-	struct spdk_nvmf_request *req;
+        struct qdlimit_pg_ctx *ctx = group->qdlimit_ctx;
+        struct qdlimit_pg_ssd *s;
+        struct spdk_nvmf_request *req;
 
-	if (ctx == NULL) {
-		return;
-	}
-	TAILQ_FOREACH(s, &ctx->ssds, link) {
-		while (!STAILQ_EMPTY(&s->wait_q)) {
-			req = STAILQ_FIRST(&s->wait_q);
-			STAILQ_REMOVE_HEAD(&s->wait_q, buf_link);
-			STAILQ_INSERT_HEAD(&group->pending_buf_queue, req, buf_link);
-		}
-	}
-	nvmf_qdlimit_pg_fini(group);
+        if (ctx == NULL) {
+                return;
+        }
+        TAILQ_FOREACH(s, &ctx->ssds, link) {
+                while (!STAILQ_EMPTY(&s->wait_q)) {
+                        req = STAILQ_FIRST(&s->wait_q);
+                        STAILQ_REMOVE_HEAD(&s->wait_q, buf_link);
+                        STAILQ_INSERT_HEAD(&group->pending_buf_queue, req, buf_link);
+                }
+        }
+        nvmf_qdlimit_pg_fini(group);
 }
 ```
 
@@ -654,7 +654,7 @@ Because the UT `#include`s `qdlimit.c`, it pulls in references to `_nvmf_subsyst
 
 ```c
 DEFINE_STUB(_nvmf_subsystem_get_ns, struct spdk_nvmf_ns *,
-	    (struct spdk_nvmf_subsystem *subsystem, uint32_t nsid), NULL);
+            (struct spdk_nvmf_subsystem *subsystem, uint32_t nsid), NULL);
 ```
 
 - [ ] **Step 5: Build and run**
@@ -690,48 +690,48 @@ In `qdlimit_ut.c`, add and register:
 static void
 test_release_rearms_waiter(void)
 {
-	struct spdk_nvmf_transport_poll_group group = {};
-	struct spdk_nvmf_request r1 = {}, r2 = {}, r3 = {};
+        struct spdk_nvmf_transport_poll_group group = {};
+        struct spdk_nvmf_request r1 = {}, r2 = {}, r3 = {};
 
-	STAILQ_INIT(&group.pending_buf_queue);
-	nvmf_qdlimit_pg_init(&group);
-	CU_ASSERT(nvmf_qdlimit_set_depth("bdevA", 2) == 0);
+        STAILQ_INIT(&group.pending_buf_queue);
+        nvmf_qdlimit_pg_init(&group);
+        CU_ASSERT(nvmf_qdlimit_set_depth("bdevA", 2) == 0);
 
-	STAILQ_INSERT_TAIL(&group.pending_buf_queue, &r1, buf_link);
-	qdlimit_admit_bdev(&group, &r1, (void *)&g_fake_bdev_a, "bdevA");	/* charged */
-	STAILQ_INSERT_TAIL(&group.pending_buf_queue, &r2, buf_link);
-	qdlimit_admit_bdev(&group, &r2, (void *)&g_fake_bdev_a, "bdevA");	/* charged */
-	STAILQ_INSERT_TAIL(&group.pending_buf_queue, &r3, buf_link);
-	qdlimit_admit_bdev(&group, &r3, (void *)&g_fake_bdev_a, "bdevA");	/* throttled, parked */
+        STAILQ_INSERT_TAIL(&group.pending_buf_queue, &r1, buf_link);
+        qdlimit_admit_bdev(&group, &r1, (void *)&g_fake_bdev_a, "bdevA");       /* charged */
+        STAILQ_INSERT_TAIL(&group.pending_buf_queue, &r2, buf_link);
+        qdlimit_admit_bdev(&group, &r2, (void *)&g_fake_bdev_a, "bdevA");       /* charged */
+        STAILQ_INSERT_TAIL(&group.pending_buf_queue, &r3, buf_link);
+        qdlimit_admit_bdev(&group, &r3, (void *)&g_fake_bdev_a, "bdevA");       /* throttled, parked */
 
-	/* Release r1: inflight 2->1, r3 re-armed onto pending_buf_queue head. */
-	qdlimit_release_bdev(&group, &r1, (void *)&g_fake_bdev_a);
-	CU_ASSERT(r1.qdlimit_charged == false);
-	CU_ASSERT(STAILQ_FIRST(&group.pending_buf_queue) == &r3);
+        /* Release r1: inflight 2->1, r3 re-armed onto pending_buf_queue head. */
+        qdlimit_release_bdev(&group, &r1, (void *)&g_fake_bdev_a);
+        CU_ASSERT(r1.qdlimit_charged == false);
+        CU_ASSERT(STAILQ_FIRST(&group.pending_buf_queue) == &r3);
 
-	/* r3 can now be admitted (inflight back under limit). */
-	CU_ASSERT(qdlimit_admit_bdev(&group, &r3, (void *)&g_fake_bdev_a, "bdevA") == NVMF_QDLIMIT_ADMIT);
-	CU_ASSERT(r3.qdlimit_charged == true);
+        /* r3 can now be admitted (inflight back under limit). */
+        CU_ASSERT(qdlimit_admit_bdev(&group, &r3, (void *)&g_fake_bdev_a, "bdevA") == NVMF_QDLIMIT_ADMIT);
+        CU_ASSERT(r3.qdlimit_charged == true);
 
-	nvmf_qdlimit_pg_fini_drain(&group);
-	nvmf_qdlimit_config_cleanup();
+        nvmf_qdlimit_pg_fini_drain(&group);
+        nvmf_qdlimit_config_cleanup();
 }
 
 static void
 test_release_uncharged_is_noop(void)
 {
-	struct spdk_nvmf_transport_poll_group group = {};
-	struct spdk_nvmf_request r = {};
+        struct spdk_nvmf_transport_poll_group group = {};
+        struct spdk_nvmf_request r = {};
 
-	STAILQ_INIT(&group.pending_buf_queue);
-	nvmf_qdlimit_pg_init(&group);
+        STAILQ_INIT(&group.pending_buf_queue);
+        nvmf_qdlimit_pg_init(&group);
 
-	/* Never charged: release must not underflow or touch queues. */
-	qdlimit_release_bdev(&group, &r, (void *)&g_fake_bdev_a);
-	CU_ASSERT(r.qdlimit_charged == false);
-	CU_ASSERT(STAILQ_EMPTY(&group.pending_buf_queue));
+        /* Never charged: release must not underflow or touch queues. */
+        qdlimit_release_bdev(&group, &r, (void *)&g_fake_bdev_a);
+        CU_ASSERT(r.qdlimit_charged == false);
+        CU_ASSERT(STAILQ_EMPTY(&group.pending_buf_queue));
 
-	nvmf_qdlimit_pg_fini(&group);
+        nvmf_qdlimit_pg_fini(&group);
 }
 ```
 
@@ -742,57 +742,57 @@ Add to `qdlimit.c`:
 ```c
 static void
 qdlimit_release_bdev(struct spdk_nvmf_transport_poll_group *group,
-		     struct spdk_nvmf_request *req, struct spdk_bdev *bdev)
+                     struct spdk_nvmf_request *req, struct spdk_bdev *bdev)
 {
-	struct qdlimit_pg_ctx *ctx = group->qdlimit_ctx;
-	struct qdlimit_pg_ssd *s;
-	struct spdk_nvmf_request *next;
+        struct qdlimit_pg_ctx *ctx = group->qdlimit_ctx;
+        struct qdlimit_pg_ssd *s;
+        struct spdk_nvmf_request *next;
 
-	if (ctx == NULL || !req->qdlimit_charged) {
-		return;
-	}
-	req->qdlimit_charged = false;
+        if (ctx == NULL || !req->qdlimit_charged) {
+                return;
+        }
+        req->qdlimit_charged = false;
 
-	TAILQ_FOREACH(s, &ctx->ssds, link) {
-		if (s->bdev == bdev) {
-			break;
-		}
-	}
-	if (s == NULL) {
-		return;		/* should not happen for a charged request */
-	}
+        TAILQ_FOREACH(s, &ctx->ssds, link) {
+                if (s->bdev == bdev) {
+                        break;
+                }
+        }
+        if (s == NULL) {
+                return;         /* should not happen for a charged request */
+        }
 
-	assert(s->inflight > 0);
-	s->inflight--;
+        assert(s->inflight > 0);
+        s->inflight--;
 
-	/* Re-arm the oldest waiter for this SSD by putting it back at the head of the shared
-	 * queue; the next poll re-runs the gate, which now passes (inflight < depth). */
-	if (!STAILQ_EMPTY(&s->wait_q)) {
-		next = STAILQ_FIRST(&s->wait_q);
-		STAILQ_REMOVE_HEAD(&s->wait_q, buf_link);
-		STAILQ_INSERT_HEAD(&group->pending_buf_queue, next, buf_link);
-	}
+        /* Re-arm the oldest waiter for this SSD by putting it back at the head of the shared
+         * queue; the next poll re-runs the gate, which now passes (inflight < depth). */
+        if (!STAILQ_EMPTY(&s->wait_q)) {
+                next = STAILQ_FIRST(&s->wait_q);
+                STAILQ_REMOVE_HEAD(&s->wait_q, buf_link);
+                STAILQ_INSERT_HEAD(&group->pending_buf_queue, next, buf_link);
+        }
 }
 
 void
 nvmf_qdlimit_release(struct spdk_nvmf_transport_poll_group *group, struct spdk_nvmf_request *req)
 {
-	struct spdk_nvmf_ctrlr *ctrlr;
-	struct spdk_nvmf_ns *ns;
+        struct spdk_nvmf_ctrlr *ctrlr;
+        struct spdk_nvmf_ns *ns;
 
-	if (!req->qdlimit_charged) {
-		return;
-	}
-	if (req->qpair == NULL || (ctrlr = req->qpair->ctrlr) == NULL || ctrlr->subsys == NULL) {
-		req->qdlimit_charged = false;	/* lost the mapping; just clear to avoid leaks */
-		return;
-	}
-	ns = _nvmf_subsystem_get_ns(ctrlr->subsys, req->cmd->nvme_cmd.nsid);
-	if (ns == NULL || ns->bdev == NULL) {
-		req->qdlimit_charged = false;
-		return;
-	}
-	qdlimit_release_bdev(group, req, ns->bdev);
+        if (!req->qdlimit_charged) {
+                return;
+        }
+        if (req->qpair == NULL || (ctrlr = req->qpair->ctrlr) == NULL || ctrlr->subsys == NULL) {
+                req->qdlimit_charged = false;   /* lost the mapping; just clear to avoid leaks */
+                return;
+        }
+        ns = _nvmf_subsystem_get_ns(ctrlr->subsys, req->cmd->nvme_cmd.nsid);
+        if (ns == NULL || ns->bdev == NULL) {
+                req->qdlimit_charged = false;
+                return;
+        }
+        qdlimit_release_bdev(group, req, ns->bdev);
 }
 
 /* Remove req from a per-SSD wait queue if it is currently parked there. Returns true if it
@@ -803,24 +803,24 @@ nvmf_qdlimit_release(struct spdk_nvmf_transport_poll_group *group, struct spdk_n
  * adjustment is needed here. */
 bool
 nvmf_qdlimit_abort_dequeue(struct spdk_nvmf_transport_poll_group *group,
-			   struct spdk_nvmf_request *req)
+                           struct spdk_nvmf_request *req)
 {
-	struct qdlimit_pg_ctx *ctx = group->qdlimit_ctx;
-	struct qdlimit_pg_ssd *s;
-	struct spdk_nvmf_request *w;
+        struct qdlimit_pg_ctx *ctx = group->qdlimit_ctx;
+        struct qdlimit_pg_ssd *s;
+        struct spdk_nvmf_request *w;
 
-	if (ctx == NULL) {
-		return false;
-	}
-	TAILQ_FOREACH(s, &ctx->ssds, link) {
-		STAILQ_FOREACH(w, &s->wait_q, buf_link) {
-			if (w == req) {
-				STAILQ_REMOVE(&s->wait_q, req, spdk_nvmf_request, buf_link);
-				return true;
-			}
-		}
-	}
-	return false;
+        if (ctx == NULL) {
+                return false;
+        }
+        TAILQ_FOREACH(s, &ctx->ssds, link) {
+                STAILQ_FOREACH(w, &s->wait_q, buf_link) {
+                        if (w == req) {
+                                STAILQ_REMOVE(&s->wait_q, req, spdk_nvmf_request, buf_link);
+                                return true;
+                        }
+                }
+        }
+        return false;
 }
 ```
 
@@ -830,7 +830,7 @@ Add the prototype to `qdlimit.h` immediately after `nvmf_qdlimit_release`'s decl
 /* Remove req from its per-SSD wait queue if parked there (transport abort path).
  * Returns true if it was parked and removed, false otherwise. */
 bool nvmf_qdlimit_abort_dequeue(struct spdk_nvmf_transport_poll_group *group,
-			       struct spdk_nvmf_request *req);
+                               struct spdk_nvmf_request *req);
 ```
 
 - [ ] **Step 2b: Add a unit test for abort_dequeue**
@@ -841,29 +841,29 @@ In `qdlimit_ut.c`, add and register:
 static void
 test_abort_dequeue_parked(void)
 {
-	struct spdk_nvmf_transport_poll_group group = {};
-	struct spdk_nvmf_request r1 = {}, r2 = {}, r3 = {};
+        struct spdk_nvmf_transport_poll_group group = {};
+        struct spdk_nvmf_request r1 = {}, r2 = {}, r3 = {};
 
-	STAILQ_INIT(&group.pending_buf_queue);
-	nvmf_qdlimit_pg_init(&group);
-	CU_ASSERT(nvmf_qdlimit_set_depth("bdevA", 2) == 0);
+        STAILQ_INIT(&group.pending_buf_queue);
+        nvmf_qdlimit_pg_init(&group);
+        CU_ASSERT(nvmf_qdlimit_set_depth("bdevA", 2) == 0);
 
-	STAILQ_INSERT_TAIL(&group.pending_buf_queue, &r1, buf_link);
-	qdlimit_admit_bdev(&group, &r1, (void *)&g_fake_bdev_a, "bdevA");	/* charged */
-	STAILQ_INSERT_TAIL(&group.pending_buf_queue, &r2, buf_link);
-	qdlimit_admit_bdev(&group, &r2, (void *)&g_fake_bdev_a, "bdevA");	/* charged */
-	STAILQ_INSERT_TAIL(&group.pending_buf_queue, &r3, buf_link);
-	qdlimit_admit_bdev(&group, &r3, (void *)&g_fake_bdev_a, "bdevA");	/* throttled, parked */
+        STAILQ_INSERT_TAIL(&group.pending_buf_queue, &r1, buf_link);
+        qdlimit_admit_bdev(&group, &r1, (void *)&g_fake_bdev_a, "bdevA");       /* charged */
+        STAILQ_INSERT_TAIL(&group.pending_buf_queue, &r2, buf_link);
+        qdlimit_admit_bdev(&group, &r2, (void *)&g_fake_bdev_a, "bdevA");       /* charged */
+        STAILQ_INSERT_TAIL(&group.pending_buf_queue, &r3, buf_link);
+        qdlimit_admit_bdev(&group, &r3, (void *)&g_fake_bdev_a, "bdevA");       /* throttled, parked */
 
-	/* r3 is parked -> dequeue returns true and removes it. */
-	CU_ASSERT(nvmf_qdlimit_abort_dequeue(&group, &r3) == true);
-	CU_ASSERT(nvmf_qdlimit_abort_dequeue(&group, &r3) == false);	/* no longer parked */
+        /* r3 is parked -> dequeue returns true and removes it. */
+        CU_ASSERT(nvmf_qdlimit_abort_dequeue(&group, &r3) == true);
+        CU_ASSERT(nvmf_qdlimit_abort_dequeue(&group, &r3) == false);    /* no longer parked */
 
-	/* r1 is charged/admitted, never parked -> dequeue returns false. */
-	CU_ASSERT(nvmf_qdlimit_abort_dequeue(&group, &r1) == false);
+        /* r1 is charged/admitted, never parked -> dequeue returns false. */
+        CU_ASSERT(nvmf_qdlimit_abort_dequeue(&group, &r1) == false);
 
-	nvmf_qdlimit_pg_fini_drain(&group);	/* wait_q now empty; safe */
-	nvmf_qdlimit_config_cleanup();
+        nvmf_qdlimit_pg_fini_drain(&group);     /* wait_q now empty; safe */
+        nvmf_qdlimit_config_cleanup();
 }
 ```
 Register: `CU_ADD_TEST(suite, test_abort_dequeue_parked);` in `main`.
@@ -908,33 +908,33 @@ grep -n '#include "nvmf_internal.h"' lib/nvmf/rdma.c
 In `lib/nvmf/rdma.c`, in `case RDMA_REQUEST_STATE_NEED_BUFFER:` (around line 2067), the existing code is:
 
 ```c
-			if (&rdma_req->req != STAILQ_FIRST(&rgroup->group.pending_buf_queue)) {
-				/* This request needs to wait in line to obtain a buffer */
-				break;
-			}
+                        if (&rdma_req->req != STAILQ_FIRST(&rgroup->group.pending_buf_queue)) {
+                                /* This request needs to wait in line to obtain a buffer */
+                                break;
+                        }
 
-			/* Try to get a data buffer */
-			rc = nvmf_rdma_request_parse_sgl(rtransport, device, rdma_req);
+                        /* Try to get a data buffer */
+                        rc = nvmf_rdma_request_parse_sgl(rtransport, device, rdma_req);
 ```
 
 Replace with (insert the gate between the FIFO check and parse_sgl):
 
 ```c
-			if (&rdma_req->req != STAILQ_FIRST(&rgroup->group.pending_buf_queue)) {
-				/* This request needs to wait in line to obtain a buffer */
-				break;
-			}
+                        if (&rdma_req->req != STAILQ_FIRST(&rgroup->group.pending_buf_queue)) {
+                                /* This request needs to wait in line to obtain a buffer */
+                                break;
+                        }
 
-			/* qdlimit admission: cap per-SSD buffer-holding requests before we
-			 * take a buffer. On THROTTLED the request has been moved off
-			 * pending_buf_queue onto a per-SSD wait queue and will be re-armed
-			 * on release. */
-			if (nvmf_qdlimit_admit(&rgroup->group, &rdma_req->req) == NVMF_QDLIMIT_THROTTLED) {
-				break;
-			}
+                        /* qdlimit admission: cap per-SSD buffer-holding requests before we
+                         * take a buffer. On THROTTLED the request has been moved off
+                         * pending_buf_queue onto a per-SSD wait queue and will be re-armed
+                         * on release. */
+                        if (nvmf_qdlimit_admit(&rgroup->group, &rdma_req->req) == NVMF_QDLIMIT_THROTTLED) {
+                                break;
+                        }
 
-			/* Try to get a data buffer */
-			rc = nvmf_rdma_request_parse_sgl(rtransport, device, rdma_req);
+                        /* Try to get a data buffer */
+                        rc = nvmf_rdma_request_parse_sgl(rtransport, device, rdma_req);
 ```
 
 - [ ] **Step 3: Insert the release hook in `_nvmf_rdma_request_free`**
@@ -942,27 +942,27 @@ Replace with (insert the gate between the FIFO check and parse_sgl):
 In `lib/nvmf/rdma.c`, in `_nvmf_rdma_request_free` (around line 1883-1888), the existing code is:
 
 ```c
-	rqpair = SPDK_CONTAINEROF(rdma_req->req.qpair, struct spdk_nvmf_rdma_qpair, qpair);
-	if (rdma_req->req.data_from_pool) {
-		rgroup = rqpair->poller->group;
+        rqpair = SPDK_CONTAINEROF(rdma_req->req.qpair, struct spdk_nvmf_rdma_qpair, qpair);
+        if (rdma_req->req.data_from_pool) {
+                rgroup = rqpair->poller->group;
 
-		spdk_nvmf_request_free_buffers(&rdma_req->req, &rgroup->group, &rtransport->transport);
-	}
+                spdk_nvmf_request_free_buffers(&rdma_req->req, &rgroup->group, &rtransport->transport);
+        }
 ```
 
 Replace with (release the qdlimit slot at the same point the buffer returns to the pool — post-ACK by construction):
 
 ```c
-	rqpair = SPDK_CONTAINEROF(rdma_req->req.qpair, struct spdk_nvmf_rdma_qpair, qpair);
-	rgroup = rqpair->poller->group;
+        rqpair = SPDK_CONTAINEROF(rdma_req->req.qpair, struct spdk_nvmf_rdma_qpair, qpair);
+        rgroup = rqpair->poller->group;
 
-	/* Release the qdlimit slot when the buffer is returned to the pool. For reads this
-	 * is reached only in COMPLETED state, i.e. after the data-transfer WR is ACKed. */
-	nvmf_qdlimit_release(&rgroup->group, &rdma_req->req);
+        /* Release the qdlimit slot when the buffer is returned to the pool. For reads this
+         * is reached only in COMPLETED state, i.e. after the data-transfer WR is ACKed. */
+        nvmf_qdlimit_release(&rgroup->group, &rdma_req->req);
 
-	if (rdma_req->req.data_from_pool) {
-		spdk_nvmf_request_free_buffers(&rdma_req->req, &rgroup->group, &rtransport->transport);
-	}
+        if (rdma_req->req.data_from_pool) {
+                spdk_nvmf_request_free_buffers(&rdma_req->req, &rgroup->group, &rtransport->transport);
+        }
 ```
 
 Note: `rgroup` was previously declared and only assigned inside the `if`; it is declared at the top of the function (line 1881), so hoisting the assignment is safe. Verify no "unused/used-uninitialized" warning after building.
@@ -981,28 +981,28 @@ grep -n "case RDMA_REQUEST_STATE_NEED_BUFFER:" lib/nvmf/rdma.c
 The one inside `_nvmf_rdma_qpair_abort_request` (around line 4351) currently reads:
 
 ```c
-	case RDMA_REQUEST_STATE_NEED_BUFFER:
-		STAILQ_REMOVE(&rqpair->poller->group->group.pending_buf_queue,
-			      &rdma_req_to_abort->req, spdk_nvmf_request, buf_link);
+        case RDMA_REQUEST_STATE_NEED_BUFFER:
+                STAILQ_REMOVE(&rqpair->poller->group->group.pending_buf_queue,
+                              &rdma_req_to_abort->req, spdk_nvmf_request, buf_link);
 
-		nvmf_rdma_request_set_abort_status(req, rdma_req_to_abort);
-		break;
+                nvmf_rdma_request_set_abort_status(req, rdma_req_to_abort);
+                break;
 ```
 
 Replace with:
 
 ```c
-	case RDMA_REQUEST_STATE_NEED_BUFFER:
-		/* A qdlimit-throttled request sits on a per-SSD wait queue, not on
-		 * pending_buf_queue. Remove it from whichever queue actually holds it. */
-		if (!nvmf_qdlimit_abort_dequeue(&rqpair->poller->group->group,
-						&rdma_req_to_abort->req)) {
-			STAILQ_REMOVE(&rqpair->poller->group->group.pending_buf_queue,
-				      &rdma_req_to_abort->req, spdk_nvmf_request, buf_link);
-		}
+        case RDMA_REQUEST_STATE_NEED_BUFFER:
+                /* A qdlimit-throttled request sits on a per-SSD wait queue, not on
+                 * pending_buf_queue. Remove it from whichever queue actually holds it. */
+                if (!nvmf_qdlimit_abort_dequeue(&rqpair->poller->group->group,
+                                                &rdma_req_to_abort->req)) {
+                        STAILQ_REMOVE(&rqpair->poller->group->group.pending_buf_queue,
+                                      &rdma_req_to_abort->req, spdk_nvmf_request, buf_link);
+                }
 
-		nvmf_rdma_request_set_abort_status(req, rdma_req_to_abort);
-		break;
+                nvmf_rdma_request_set_abort_status(req, rdma_req_to_abort);
+                break;
 ```
 
 (The throttled request is not charged, so no `inflight` adjustment is needed; an admitted-but-buffer-waiting request stays on `pending_buf_queue` and takes the `STAILQ_REMOVE` branch, then releases its slot normally via `_nvmf_rdma_request_free`.)
@@ -1019,19 +1019,19 @@ grep -n "if (rqpair->ibv_state == IBV_QPS_ERR" lib/nvmf/rdma.c
 ```
 The block reads:
 ```c
-		if (rdma_req->state == RDMA_REQUEST_STATE_NEED_BUFFER) {
-			STAILQ_REMOVE(&rgroup->group.pending_buf_queue, &rdma_req->req, spdk_nvmf_request, buf_link);
-		} else if (rdma_req->state == RDMA_REQUEST_STATE_DATA_TRANSFER_TO_CONTROLLER_PENDING) {
+                if (rdma_req->state == RDMA_REQUEST_STATE_NEED_BUFFER) {
+                        STAILQ_REMOVE(&rgroup->group.pending_buf_queue, &rdma_req->req, spdk_nvmf_request, buf_link);
+                } else if (rdma_req->state == RDMA_REQUEST_STATE_DATA_TRANSFER_TO_CONTROLLER_PENDING) {
 ```
 Replace the NEED_BUFFER branch with:
 ```c
-		if (rdma_req->state == RDMA_REQUEST_STATE_NEED_BUFFER) {
-			/* A qdlimit-throttled request sits on a per-SSD wait queue, not on
-			 * pending_buf_queue; remove it from whichever queue actually holds it. */
-			if (!nvmf_qdlimit_abort_dequeue(&rgroup->group, &rdma_req->req)) {
-				STAILQ_REMOVE(&rgroup->group.pending_buf_queue, &rdma_req->req, spdk_nvmf_request, buf_link);
-			}
-		} else if (rdma_req->state == RDMA_REQUEST_STATE_DATA_TRANSFER_TO_CONTROLLER_PENDING) {
+                if (rdma_req->state == RDMA_REQUEST_STATE_NEED_BUFFER) {
+                        /* A qdlimit-throttled request sits on a per-SSD wait queue, not on
+                         * pending_buf_queue; remove it from whichever queue actually holds it. */
+                        if (!nvmf_qdlimit_abort_dequeue(&rgroup->group, &rdma_req->req)) {
+                                STAILQ_REMOVE(&rgroup->group.pending_buf_queue, &rdma_req->req, spdk_nvmf_request, buf_link);
+                        }
+                } else if (rdma_req->state == RDMA_REQUEST_STATE_DATA_TRANSFER_TO_CONTROLLER_PENDING) {
 ```
 
 Note: at the `nvmf_qdlimit_pg_fini` call in `nvmf_rdma_poll_group_destroy`, add a comment that
@@ -1048,7 +1048,7 @@ grep -n "return &rgroup->group;" lib/nvmf/rdma.c
 Immediately before that `return`, add:
 
 ```c
-	nvmf_qdlimit_pg_init(&rgroup->group);
+        nvmf_qdlimit_pg_init(&rgroup->group);
 ```
 
 - [ ] **Step 5: Insert `pg_fini` in poll-group destroy**
@@ -1056,15 +1056,15 @@ Immediately before that `return`, add:
 In `nvmf_rdma_poll_group_destroy` (line 3655), after the `rgroup = SPDK_CONTAINEROF(...)` / NULL check (line 3661-3664) and before the poller-destroy loop, add:
 
 ```c
-	nvmf_qdlimit_pg_fini(&rgroup->group);
+        nvmf_qdlimit_pg_fini(&rgroup->group);
 ```
 
 Place it right after:
 ```c
-	rgroup = SPDK_CONTAINEROF(group, struct spdk_nvmf_rdma_poll_group, group);
-	if (!rgroup) {
-		return;
-	}
+        rgroup = SPDK_CONTAINEROF(group, struct spdk_nvmf_rdma_poll_group, group);
+        if (!rgroup) {
+                return;
+        }
 ```
 
 - [ ] **Step 6: Build SPDK**
@@ -1106,70 +1106,70 @@ In `lib/nvmf/nvmf_rpc.c`, add `#include "qdlimit.h"` near the top includes, then
 
 ```c
 struct rpc_qdlimit_set_depth {
-	char		*bdev_name;
-	uint32_t	depth;
+        char            *bdev_name;
+        uint32_t        depth;
 };
 
 static const struct spdk_json_object_decoder rpc_qdlimit_set_depth_decoders[] = {
-	{"bdev_name", offsetof(struct rpc_qdlimit_set_depth, bdev_name), spdk_json_decode_string},
-	{"depth", offsetof(struct rpc_qdlimit_set_depth, depth), spdk_json_decode_uint32},
+        {"bdev_name", offsetof(struct rpc_qdlimit_set_depth, bdev_name), spdk_json_decode_string},
+        {"depth", offsetof(struct rpc_qdlimit_set_depth, depth), spdk_json_decode_uint32},
 };
 
 static void
 rpc_nvmf_qdlimit_set_depth(struct spdk_jsonrpc_request *request,
-			   const struct spdk_json_val *params)
+                           const struct spdk_json_val *params)
 {
-	struct rpc_qdlimit_set_depth req = {};
-	int rc;
+        struct rpc_qdlimit_set_depth req = {};
+        int rc;
 
-	if (spdk_json_decode_object(params, rpc_qdlimit_set_depth_decoders,
-				    SPDK_COUNTOF(rpc_qdlimit_set_depth_decoders), &req)) {
-		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
-						 "Invalid parameters");
-		return;
-	}
-	rc = nvmf_qdlimit_set_depth(req.bdev_name, req.depth);
-	free(req.bdev_name);
-	if (rc != 0) {
-		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
-		return;
-	}
-	spdk_jsonrpc_send_bool_response(request, true);
+        if (spdk_json_decode_object(params, rpc_qdlimit_set_depth_decoders,
+                                    SPDK_COUNTOF(rpc_qdlimit_set_depth_decoders), &req)) {
+                spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+                                                 "Invalid parameters");
+                return;
+        }
+        rc = nvmf_qdlimit_set_depth(req.bdev_name, req.depth);
+        free(req.bdev_name);
+        if (rc != 0) {
+                spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
+                return;
+        }
+        spdk_jsonrpc_send_bool_response(request, true);
 }
 SPDK_RPC_REGISTER("nvmf_qdlimit_set_depth", rpc_nvmf_qdlimit_set_depth, SPDK_RPC_RUNTIME)
 
 struct rpc_qdlimit_get_depth {
-	char		*bdev_name;
+        char            *bdev_name;
 };
 
 static const struct spdk_json_object_decoder rpc_qdlimit_get_depth_decoders[] = {
-	{"bdev_name", offsetof(struct rpc_qdlimit_get_depth, bdev_name), spdk_json_decode_string},
+        {"bdev_name", offsetof(struct rpc_qdlimit_get_depth, bdev_name), spdk_json_decode_string},
 };
 
 static void
 rpc_nvmf_qdlimit_get_depth(struct spdk_jsonrpc_request *request,
-			   const struct spdk_json_val *params)
+                           const struct spdk_json_val *params)
 {
-	struct rpc_qdlimit_get_depth req = {};
-	struct spdk_json_write_ctx *w;
-	uint32_t depth = 0;
+        struct rpc_qdlimit_get_depth req = {};
+        struct spdk_json_write_ctx *w;
+        uint32_t depth = 0;
 
-	if (spdk_json_decode_object(params, rpc_qdlimit_get_depth_decoders,
-				    SPDK_COUNTOF(rpc_qdlimit_get_depth_decoders), &req)) {
-		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
-						 "Invalid parameters");
-		return;
-	}
-	(void)nvmf_qdlimit_get_depth(req.bdev_name, &depth);
+        if (spdk_json_decode_object(params, rpc_qdlimit_get_depth_decoders,
+                                    SPDK_COUNTOF(rpc_qdlimit_get_depth_decoders), &req)) {
+                spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+                                                 "Invalid parameters");
+                return;
+        }
+        (void)nvmf_qdlimit_get_depth(req.bdev_name, &depth);
 
-	w = spdk_jsonrpc_begin_result(request);
-	spdk_json_write_object_begin(w);
-	spdk_json_write_named_string(w, "bdev_name", req.bdev_name);
-	spdk_json_write_named_uint32(w, "depth", depth);
-	spdk_json_write_object_end(w);
-	spdk_jsonrpc_end_result(request, w);
+        w = spdk_jsonrpc_begin_result(request);
+        spdk_json_write_object_begin(w);
+        spdk_json_write_named_string(w, "bdev_name", req.bdev_name);
+        spdk_json_write_named_uint32(w, "depth", depth);
+        spdk_json_write_object_end(w);
+        spdk_jsonrpc_end_result(request, w);
 
-	free(req.bdev_name);
+        free(req.bdev_name);
 }
 SPDK_RPC_REGISTER("nvmf_qdlimit_get_depth", rpc_nvmf_qdlimit_get_depth, SPDK_RPC_RUNTIME)
 ```
@@ -1279,7 +1279,7 @@ $rpc_py nvmf_create_subsystem nqn.2016-06.io.spdk:cnode1 -a -s SPDK0000000000000
 $rpc_py nvmf_subsystem_add_ns nqn.2016-06.io.spdk:cnode1 SSD_A
 $rpc_py nvmf_subsystem_add_ns nqn.2016-06.io.spdk:cnode1 SSD_B
 $rpc_py nvmf_subsystem_add_listener nqn.2016-06.io.spdk:cnode1 \
-	-t $TEST_TRANSPORT -a $NVMF_FIRST_TARGET_IP -s $NVMF_PORT
+        -t $TEST_TRANSPORT -a $NVMF_FIRST_TARGET_IP -s $NVMF_PORT
 
 # Cap SSD_A at a low per-core depth; leave SSD_B unlimited.
 QD=4
@@ -1290,15 +1290,15 @@ $rpc_py nvmf_qdlimit_set_depth SSD_B 0
 # Helper: total RDMA data buffers currently checked out of the shared pool.
 # Derived from transport stats (num_shared_buffers minus current free cache).
 pool_inuse() {
-	$rpc_py nvmf_get_stats | jq '
-		[.poll_groups[].transports[]
-		 | select(.trtype=="RDMA")
-		 | (.pending_data_buffer // 0)] | add // 0'
+        $rpc_py nvmf_get_stats | jq '
+                [.poll_groups[].transports[]
+                 | select(.trtype=="RDMA")
+                 | (.pending_data_buffer // 0)] | add // 0'
 }
 
 # Connect initiator.
 nvme connect -t $TEST_TRANSPORT -n nqn.2016-06.io.spdk:cnode1 \
-	-a $NVMF_FIRST_TARGET_IP -s $NVMF_PORT
+        -a $NVMF_FIRST_TARGET_IP -s $NVMF_PORT
 waitforserial SPDK00000000000001
 
 # --- Buffer-occupancy ceiling sweep against SSD_A ---
@@ -1307,23 +1307,23 @@ iosize=4096
 prev=0
 plateaued=0
 for od in 1 2 4 8 16 32 64; do
-	fio --name=ssdA --filename=/dev/nvme-fabric-ssd_a --rw=randread --bs=${iosize} \
-	    --iodepth=${od} --numjobs=1 --runtime=5 --time_based --ioengine=libaio \
-	    --direct=1 --group_reporting &
-	fio_pid=$!
-	sleep 3
-	# Admitted in-flight for SSD_A cannot exceed QD * num_cores; with -m 0x3 => 2 cores.
-	inflight=$($rpc_py nvmf_qdlimit_get_depth SSD_A | jq .depth) # configured ceiling
-	occ_units=$(pool_inuse)
-	echo "offered=${od} pool_inflight_units=${occ_units} ceiling_per_core=${inflight}"
-	wait $fio_pid
-	# Past the ceiling, occupancy must stop growing (allow one in-flight quantum slack).
-	if [ "$od" -ge "$QD" ]; then
-		if [ "$occ_units" -le $((prev + 1)) ]; then
-			plateaued=1
-		fi
-	fi
-	prev=$occ_units
+        fio --name=ssdA --filename=/dev/nvme-fabric-ssd_a --rw=randread --bs=${iosize} \
+            --iodepth=${od} --numjobs=1 --runtime=5 --time_based --ioengine=libaio \
+            --direct=1 --group_reporting &
+        fio_pid=$!
+        sleep 3
+        # Admitted in-flight for SSD_A cannot exceed QD * num_cores; with -m 0x3 => 2 cores.
+        inflight=$($rpc_py nvmf_qdlimit_get_depth SSD_A | jq .depth) # configured ceiling
+        occ_units=$(pool_inuse)
+        echo "offered=${od} pool_inflight_units=${occ_units} ceiling_per_core=${inflight}"
+        wait $fio_pid
+        # Past the ceiling, occupancy must stop growing (allow one in-flight quantum slack).
+        if [ "$od" -ge "$QD" ]; then
+                if [ "$occ_units" -le $((prev + 1)) ]; then
+                        plateaued=1
+                fi
+        fi
+        prev=$occ_units
 done
 [ "$plateaued" -eq 1 ] || { echo "FAIL: buffer occupancy did not plateau at ceiling"; exit 1; }
 
