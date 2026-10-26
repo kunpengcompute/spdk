@@ -6,6 +6,7 @@
 #include "spdk_cunit.h"
 #include "common/lib/test_env.c"
 #include "nvmf/transport.c"
+#include "nvmf/qdlimit.c"
 #include "nvmf/rdma.c"
 #include "common/lib/test_rdma.c"
 
@@ -35,6 +36,7 @@ DEFINE_STUB(spdk_nvmf_qpair_disconnect, int, (struct spdk_nvmf_qpair *qpair,
 DEFINE_STUB_V(spdk_nvmf_request_exec, (struct spdk_nvmf_request *req));
 DEFINE_STUB_V(spdk_nvme_trid_populate_transport, (struct spdk_nvme_transport_id *trid,
 		enum spdk_nvme_transport_type trtype));
+DEFINE_STUB(spdk_bdev_get_name, const char *, (const struct spdk_bdev *bdev), "test_bdev");
 DEFINE_STUB(nvmf_ctrlr_abort_request, int, (struct spdk_nvmf_request *req), 0);
 DEFINE_STUB(spdk_nvmf_request_complete, int, (struct spdk_nvmf_request *req), 0);
 DEFINE_STUB(ut_transport_create, struct spdk_nvmf_transport *,
