@@ -338,3 +338,146 @@ int main()
 ### 使用注意事项
 
 1. mmap_alloc传入size不超过64M
+
+## 前后台流量场景，使用L0进行精准流控的收益测试
+实际系统中通常同时存在前台读写流量和后台流量（GC流量、副本流量等），在2根内存条配置下，前后台流量争抢L3 Cache空间导致数据频繁下刷至DRAM，内存带宽瓶颈将导致前台业务性能降低。使用L0精确控制流量，前台流量进入L0 Cache中，后台流量进入L3 Cache中，可以减少前后台流量争抢L3 Cache，进而解决内存带宽瓶颈，最终提升前台业务性能。
+### 1. 加载 L0 驱动并启用mpam
+
+安装指定内核：
+```bash
+rpm -ivh kernel-5.10.0_hisi_l0+-140.aarch64.rpm
+```
+内核开启mpam
+```bash
+grubby --args="mpam=acpi" --update-kernel=ALL
+```
+安装完成后建议重启，并确认已经进入该 L0 内核：
+```bash
+reboot
+uname -r
+```
+加载 L0 驱动：
+
+```bash
+rmmod hisi_l0
+modprobe hisi_l0 use_hugetlb=0
+export SPDK_NVMF_L0_DEVICE=/dev/hisi_soc_cache_mgmt
+```
+L0 设备路径是 `/dev/hisi_soc_cache_mgmt`。使用下面命令检查设备是否存在，存在则表示驱动已生效：
+```bash
+ll /dev/hisi_soc_cache_mgmt
+```
+挂载mpam
+```bash
+mount -t resctrl resctrl /sys/fs/resctrl/
+```
+### 2. 服务端和客户端编译 SPDK
+
+NVMf RDMA target 需要打开 RDMA：
+
+```bash
+git clone -b dev_L0 https://gitcode.com/boostkit/spdk.git
+cd spdk && ./scripts/pkgdep.sh
+git submodule update --init
+./configure --with-rdma && make -j
+make install
+```
+### 3. 服务端编译lmbench
+```bash
+git clone https://github.com/redrose2100/lmbench.git
+chmod 777 -R lmbench/
+cd lmbench && make
+```
+### 4. 服务端开启IOStash
+```bash
+git clone https://gitcode.com/openeuler/cache_tuner.git
+cd cache_tuner/cache_stash && make -j
+insmod cache_stash.ko
+echo 1 > /sys/kernel/cache_stash/llc_enable
+cat /sys/kernel/cache_stash/llc_enable
+```
+### 5. 测试前后台流量场景的前台NOF性能（不使能L0）
+step1：启动后台流量
+```bash
+rmdir /sys/fs/resctrl/lmbench && mkdir /sys/fs/resctrl/lmbench
+echo $$ > /sys/fs/resctrl/lmbench/tasks
+vim /sys/fs/resctrl/lmbench/schemata                                # 将后台流量的带宽使用上限限制为40%
+sh start_background_job.sh <bw_mem path>
+```
+step2：不使能L0 Cache，在服务端启动spdk
+```bash
+export SPDK_NVMF_L0_ENABLE=0
+cd <spdk path>
+build/bin/spdk_tgt -m 0xff
+```
+```bash
+cd <spdk path>
+./scripts/rpc.py nvmf_create_transport -t RDMA -q 1024 -m 127 -c 4096 -i 131072 -u 131072 -a 128 -n 320 -b 0
+./scripts/rpc.py bdev_nvme_attach_controller -b Nvme0 -t PCIe -a 0000:17:00.0
+./scripts/rpc.py bdev_nvme_attach_controller -b Nvme1 -t PCIe -a 0000:18:00.0
+./scripts/rpc.py bdev_nvme_attach_controller -b Nvme2 -t PCIe -a 0000:19:00.0
+./scripts/rpc.py bdev_nvme_attach_controller -b Nvme3 -t PCIe -a 0000:1a:00.0
+./scripts/rpc.py bdev_nvme_attach_controller -b Nvme4 -t PCIe -a 0000:57:00.0
+./scripts/rpc.py bdev_nvme_attach_controller -b Nvme5 -t PCIe -a 0000:58:00.0
+./scripts/rpc.py bdev_nvme_attach_controller -b Nvme6 -t PCIe -a 0000:59:00.0
+./scripts/rpc.py bdev_nvme_attach_controller -b Nvme7 -t PCIe -a 0000:5a:00.0
+./scripts/rpc.py nvmf_create_subsystem nqn.2016-06.io.spdk:cnode1 -a -s SPDK00000000000001 -m 8
+./scripts/rpc.py nvmf_subsystem_add_ns nqn.2016-06.io.spdk:cnode1 Nvme0n1
+./scripts/rpc.py nvmf_subsystem_add_ns nqn.2016-06.io.spdk:cnode1 Nvme1n1
+./scripts/rpc.py nvmf_subsystem_add_ns nqn.2016-06.io.spdk:cnode1 Nvme2n1
+./scripts/rpc.py nvmf_subsystem_add_ns nqn.2016-06.io.spdk:cnode1 Nvme3n1
+./scripts/rpc.py nvmf_subsystem_add_ns nqn.2016-06.io.spdk:cnode1 Nvme4n1
+./scripts/rpc.py nvmf_subsystem_add_ns nqn.2016-06.io.spdk:cnode1 Nvme5n1
+./scripts/rpc.py nvmf_subsystem_add_ns nqn.2016-06.io.spdk:cnode1 Nvme6n1
+./scripts/rpc.py nvmf_subsystem_add_ns nqn.2016-06.io.spdk:cnode1 Nvme7n1
+./scripts/rpc.py nvmf_subsystem_add_listener nqn.2016-06.io.spdk:cnode1 -t RDMA -a 192.168.65.87 -s 4420
+./scripts/rpc.py nvmf_subsystem_add_listener nqn.2016-06.io.spdk:cnode1 -t RDMA -a 192.168.75.87 -s 4420
+```
+step3：客户端使用perf下发流量（128K包大小，16并发写），并观测前台业务带宽
+```bash
+cd <spdk path>
+build/examples/perf -r 'trtype:RDMA adrfam:IPv4 traddr:192.168.65.87 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1 ns:1' -r 'trtype:RDMA adrfam:IPv4 traddr:192.168.65.87 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1 ns:2' -r 'trtype:RDMA adrfam:IPv4 traddr:192.168.65.87 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1 ns:3' -r 'trtype:RDMA adrfam:IPv4 traddr:192.168.65.87 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1 ns:4' -r 'trtype:RDMA adrfam:IPv4 traddr:192.168.75.87 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1 ns:5' -r 'trtype:RDMA adrfam:IPv4 traddr:192.168.75.87 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1 ns:6' -r 'trtype:RDMA adrfam:IPv4 traddr:192.168.75.87 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1 ns:7' -r 'trtype:RDMA adrfam:IPv4 traddr:192.168.75.87 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1 ns:8' -t 60 -w write -o 131072 -q 16 -c 0xff
+```
+### 6. 测试前后台流量场景的前台NOF性能（使能L0）
+step1：启动后台流量
+```bash
+rmdir /sys/fs/resctrl/lmbench && mkdir /sys/fs/resctrl/lmbench
+echo $$ > /sys/fs/resctrl/lmbench/tasks
+vim /sys/fs/resctrl/lmbench/schemata                                # 将后台流量的带宽使用上限限制为40%
+sh start_background_job.sh <bw_mem path>
+```
+step2：不使能L0 Cache，在服务端启动spdk
+```bash
+export SPDK_NVMF_L0_ENABLE=1
+cd <spdk path>
+build/bin/spdk_tgt -m 0xff
+```
+```bash
+cd <spdk path>
+./scripts/rpc.py nvmf_create_transport -t RDMA -q 1024 -m 127 -c 4096 -i 131072 -u 131072 -a 128 -n 320 -b 0
+./scripts/rpc.py bdev_nvme_attach_controller -b Nvme0 -t PCIe -a 0000:17:00.0
+./scripts/rpc.py bdev_nvme_attach_controller -b Nvme1 -t PCIe -a 0000:18:00.0
+./scripts/rpc.py bdev_nvme_attach_controller -b Nvme2 -t PCIe -a 0000:19:00.0
+./scripts/rpc.py bdev_nvme_attach_controller -b Nvme3 -t PCIe -a 0000:1a:00.0
+./scripts/rpc.py bdev_nvme_attach_controller -b Nvme4 -t PCIe -a 0000:57:00.0
+./scripts/rpc.py bdev_nvme_attach_controller -b Nvme5 -t PCIe -a 0000:58:00.0
+./scripts/rpc.py bdev_nvme_attach_controller -b Nvme6 -t PCIe -a 0000:59:00.0
+./scripts/rpc.py bdev_nvme_attach_controller -b Nvme7 -t PCIe -a 0000:5a:00.0
+./scripts/rpc.py nvmf_create_subsystem nqn.2016-06.io.spdk:cnode1 -a -s SPDK00000000000001 -m 8
+./scripts/rpc.py nvmf_subsystem_add_ns nqn.2016-06.io.spdk:cnode1 Nvme0n1
+./scripts/rpc.py nvmf_subsystem_add_ns nqn.2016-06.io.spdk:cnode1 Nvme1n1
+./scripts/rpc.py nvmf_subsystem_add_ns nqn.2016-06.io.spdk:cnode1 Nvme2n1
+./scripts/rpc.py nvmf_subsystem_add_ns nqn.2016-06.io.spdk:cnode1 Nvme3n1
+./scripts/rpc.py nvmf_subsystem_add_ns nqn.2016-06.io.spdk:cnode1 Nvme4n1
+./scripts/rpc.py nvmf_subsystem_add_ns nqn.2016-06.io.spdk:cnode1 Nvme5n1
+./scripts/rpc.py nvmf_subsystem_add_ns nqn.2016-06.io.spdk:cnode1 Nvme6n1
+./scripts/rpc.py nvmf_subsystem_add_ns nqn.2016-06.io.spdk:cnode1 Nvme7n1
+./scripts/rpc.py nvmf_subsystem_add_listener nqn.2016-06.io.spdk:cnode1 -t RDMA -a 192.168.65.87 -s 4420
+./scripts/rpc.py nvmf_subsystem_add_listener nqn.2016-06.io.spdk:cnode1 -t RDMA -a 192.168.75.87 -s 4420
+```
+step3：客户端使用perf下发流量（128K包大小，16并发写），并观测前台业务带宽
+```bash
+cd <spdk path>
+build/examples/perf -r 'trtype:RDMA adrfam:IPv4 traddr:192.168.65.87 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1 ns:1' -r 'trtype:RDMA adrfam:IPv4 traddr:192.168.65.87 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1 ns:2' -r 'trtype:RDMA adrfam:IPv4 traddr:192.168.65.87 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1 ns:3' -r 'trtype:RDMA adrfam:IPv4 traddr:192.168.65.87 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1 ns:4' -r 'trtype:RDMA adrfam:IPv4 traddr:192.168.75.87 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1 ns:5' -r 'trtype:RDMA adrfam:IPv4 traddr:192.168.75.87 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1 ns:6' -r 'trtype:RDMA adrfam:IPv4 traddr:192.168.75.87 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1 ns:7' -r 'trtype:RDMA adrfam:IPv4 traddr:192.168.75.87 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1 ns:8' -t 60 -w write -o 131072 -q 16 -c 0xff
+```
+### 7. 对比前后台流量场景下，使用L0 Cache前后，前台业务带宽的变化情况
