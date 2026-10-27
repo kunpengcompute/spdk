@@ -14,11 +14,7 @@ static char g_fake_bdev_b;
 DEFINE_STUB(spdk_bdev_get_by_name, struct spdk_bdev *, (const char *bdev_name),
 	    (struct spdk_bdev *)&g_fake_bdev_a);
 
-// DEFINE_STUB(spdk_bdev_get_name, const char *, (const struct spdk_bdev *bdev),
-// 	    ((void *)bdev == &g_fake_bdev_a) ? "bdevA" : "bdevB");
-
-// DEFINE_STUB(_nvmf_subsystem_get_ns, struct spdk_nvmf_ns *,
-// 	    (struct spdk_nvmf_subsystem *subsystem, uint32_t nsid), NULL);
+DEFINE_STUB(spdk_bdev_get_name, const char *, (const struct spdk_bdev *bdev), "bdevA");
 
 static void
 test_config_set_get(void)
@@ -285,6 +281,152 @@ test_get_stats_aggregates_across_cores(void)
 	nvmf_qdlimit_config_cleanup();
 }
 
+static void
+test_allocation_failures(void)
+{
+	struct spdk_nvmf_transport_poll_group group = {};
+	struct spdk_nvmf_request req = {};
+	struct qdlimit_pg_ctx *ctx;
+	int rc;
+
+	MOCK_SET(calloc, NULL);
+	rc = nvmf_qdlimit_set_depth("bdevA", 1);
+	MOCK_CLEAR(calloc);
+	CU_ASSERT(rc == -ENOMEM);
+	CU_ASSERT(TAILQ_EMPTY(&g_qdlimit_config));
+
+	MOCK_SET(calloc, NULL);
+	nvmf_qdlimit_pg_init(&group);
+	MOCK_CLEAR(calloc);
+	CU_ASSERT(group.qdlimit_ctx == NULL);
+	CU_ASSERT(TAILQ_EMPTY(&g_qdlimit_pg_list));
+	CU_ASSERT(qdlimit_admit_bdev(&group, &req, (void *)&g_fake_bdev_a,
+				     "bdevA") == NVMF_QDLIMIT_ADMIT);
+	CU_ASSERT(!nvmf_qdlimit_abort_dequeue(&group, &req));
+	nvmf_qdlimit_pg_fini_drain(&group);
+	qdlimit_release_bdev(&group, &req, (void *)&g_fake_bdev_a);
+
+	nvmf_qdlimit_pg_init(&group);
+	CU_ASSERT(nvmf_qdlimit_set_depth("bdevA", 1) == 0);
+	ctx = group.qdlimit_ctx;
+	MOCK_SET(calloc, NULL);
+	rc = qdlimit_admit_bdev(&group, &req, (void *)&g_fake_bdev_a, "bdevA");
+	MOCK_CLEAR(calloc);
+	CU_ASSERT(rc == NVMF_QDLIMIT_ADMIT);
+	CU_ASSERT(!req.qdlimit_charged);
+	CU_ASSERT(TAILQ_EMPTY(&ctx->ssds));
+
+	/* A charged request whose SSD entry is missing is cleared without underflow. */
+	req.qdlimit_charged = true;
+	qdlimit_release_bdev(&group, &req, (void *)&g_fake_bdev_a);
+	CU_ASSERT(!req.qdlimit_charged);
+	nvmf_qdlimit_pg_fini(&group);
+	nvmf_qdlimit_config_cleanup();
+}
+
+static void
+test_public_admit_and_release_mapping(void)
+{
+	struct spdk_nvmf_transport_poll_group group = {};
+	struct spdk_nvmf_request req = {};
+	struct spdk_nvmf_qpair qpair = {};
+	struct spdk_nvmf_ctrlr ctrlr = {};
+	struct spdk_nvmf_subsystem subsys = {};
+	struct spdk_nvmf_ns ns = {};
+	struct spdk_nvmf_ns *namespaces[] = {&ns};
+	union nvmf_h2c_msg cmd = {};
+	struct qdlimit_pg_ssd *ssd;
+
+	STAILQ_INIT(&group.pending_buf_queue);
+	nvmf_qdlimit_pg_init(&group);
+	CU_ASSERT(nvmf_qdlimit_set_depth("bdevA", 1) == 0);
+	CU_ASSERT(nvmf_qdlimit_admit(&group, &req) == NVMF_QDLIMIT_ADMIT);
+	req.xfer = SPDK_NVME_DATA_CONTROLLER_TO_HOST;
+	CU_ASSERT(nvmf_qdlimit_admit(&group, &req) == NVMF_QDLIMIT_ADMIT);
+	req.qpair = &qpair;
+	CU_ASSERT(nvmf_qdlimit_admit(&group, &req) == NVMF_QDLIMIT_ADMIT);
+	qpair.ctrlr = &ctrlr;
+	CU_ASSERT(nvmf_qdlimit_admit(&group, &req) == NVMF_QDLIMIT_ADMIT);
+	ctrlr.subsys = &subsys;
+	CU_ASSERT(nvmf_qdlimit_admit(&group, &req) == NVMF_QDLIMIT_ADMIT);
+	req.cmd = &cmd;
+	cmd.nvme_cmd.nsid = 1;
+	CU_ASSERT(nvmf_qdlimit_admit(&group, &req) == NVMF_QDLIMIT_ADMIT);
+	subsys.max_nsid = 1;
+	subsys.ns = namespaces;
+	CU_ASSERT(nvmf_qdlimit_admit(&group, &req) == NVMF_QDLIMIT_ADMIT);
+	ns.bdev = (void *)&g_fake_bdev_a;
+	CU_ASSERT(nvmf_qdlimit_admit(&group, &req) == NVMF_QDLIMIT_ADMIT);
+	CU_ASSERT(req.qdlimit_charged);
+	ssd = TAILQ_FIRST(&((struct qdlimit_pg_ctx *)group.qdlimit_ctx)->ssds);
+	SPDK_CU_ASSERT_FATAL(ssd != NULL);
+	CU_ASSERT(ssd->inflight == 1);
+	nvmf_qdlimit_release(&group, &req);
+	CU_ASSERT(!req.qdlimit_charged);
+	CU_ASSERT(ssd->inflight == 0);
+	nvmf_qdlimit_release(&group, &req);
+	CU_ASSERT(ssd->inflight == 0);
+
+	/* Lost mapping paths must not leave the request marked as charged. */
+	req.qdlimit_charged = true;
+	req.qpair = NULL;
+	nvmf_qdlimit_release(&group, &req);
+	CU_ASSERT(!req.qdlimit_charged);
+	req.qpair = &qpair;
+	req.qdlimit_charged = true;
+	qpair.ctrlr = NULL;
+	nvmf_qdlimit_release(&group, &req);
+	CU_ASSERT(!req.qdlimit_charged);
+	qpair.ctrlr = &ctrlr;
+	ctrlr.subsys = NULL;
+	req.qdlimit_charged = true;
+	nvmf_qdlimit_release(&group, &req);
+	CU_ASSERT(!req.qdlimit_charged);
+	ctrlr.subsys = &subsys;
+	cmd.nvme_cmd.nsid = 2;
+	req.qdlimit_charged = true;
+	nvmf_qdlimit_release(&group, &req);
+	CU_ASSERT(!req.qdlimit_charged);
+	cmd.nvme_cmd.nsid = 1;
+	ns.bdev = NULL;
+	req.qdlimit_charged = true;
+	nvmf_qdlimit_release(&group, &req);
+	CU_ASSERT(!req.qdlimit_charged);
+
+	nvmf_qdlimit_pg_fini(&group);
+	nvmf_qdlimit_config_cleanup();
+}
+
+static void
+test_stats_filters_ssds_and_validates_outputs(void)
+{
+	struct spdk_nvmf_transport_poll_group group = {}, unused_group = {};
+	struct spdk_nvmf_request a = {}, b = {};
+	uint32_t depth = 99, inflight = 99, groups = 99;
+
+	STAILQ_INIT(&group.pending_buf_queue);
+	nvmf_qdlimit_pg_init(&group);
+	nvmf_qdlimit_pg_init(&unused_group);
+	CU_ASSERT(nvmf_qdlimit_set_depth("bdevB", 2) == 0);
+	CU_ASSERT(nvmf_qdlimit_set_depth("bdevA", 1) == 0);
+	CU_ASSERT(qdlimit_admit_bdev(&group, &b, (void *)&g_fake_bdev_b,
+				     "bdevB") == NVMF_QDLIMIT_ADMIT);
+	CU_ASSERT(qdlimit_admit_bdev(&group, &a, (void *)&g_fake_bdev_a,
+				     "bdevA") == NVMF_QDLIMIT_ADMIT);
+	CU_ASSERT(nvmf_qdlimit_get_stats("bdevA", &depth, &inflight, &groups) == 0);
+	CU_ASSERT(depth == 1 && inflight == 1 && groups == 1);
+	CU_ASSERT(nvmf_qdlimit_get_stats("bdevA", NULL, &inflight, &groups) == -EINVAL);
+	CU_ASSERT(nvmf_qdlimit_get_stats("bdevA", &depth, NULL, &groups) == -EINVAL);
+	CU_ASSERT(nvmf_qdlimit_get_stats("bdevA", &depth, &inflight, NULL) == -EINVAL);
+	qdlimit_release_bdev(&group, &a, (void *)&g_fake_bdev_a);
+	qdlimit_release_bdev(&group, &b, (void *)&g_fake_bdev_b);
+	CU_ASSERT(nvmf_qdlimit_get_stats("bdevA", &depth, &inflight, &groups) == 0);
+	CU_ASSERT(inflight == 0 && groups == 1);
+	nvmf_qdlimit_pg_fini(&group);
+	nvmf_qdlimit_pg_fini(&unused_group);
+	nvmf_qdlimit_config_cleanup();
+}
+
 int
 main(int argc, char **argv)
 {
@@ -295,6 +437,9 @@ main(int argc, char **argv)
 	CU_initialize_registry();
 
 	suite = CU_add_suite("qdlimit", NULL, NULL);
+	CU_ADD_TEST(suite, test_allocation_failures);
+	CU_ADD_TEST(suite, test_public_admit_and_release_mapping);
+	CU_ADD_TEST(suite, test_stats_filters_ssds_and_validates_outputs);
 	CU_ADD_TEST(suite, test_config_set_get);
 	CU_ADD_TEST(suite, test_pg_init_fini);
 	CU_ADD_TEST(suite, test_admit_under_and_over_limit);

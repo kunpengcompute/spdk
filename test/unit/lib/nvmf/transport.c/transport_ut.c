@@ -110,6 +110,55 @@ ibv_reg_mr(struct ibv_pd *pd, void *addr, size_t length, int access)
 	}
 }
 
+DEFINE_STUB(spdk_l0_data_pool_enabled, bool, (void), false);
+DEFINE_STUB(spdk_l0_mempool_create, struct spdk_mempool *,
+	    (const char *name, size_t count, size_t ele_size,
+	     spdk_mempool_obj_cb_t *obj_init, void *obj_init_arg), NULL);
+
+static void
+test_spdk_nvmf_transport_l0_pool(void)
+{
+	struct nvmf_transport_ops_list_element *element;
+	struct spdk_nvmf_transport_ops saved;
+	struct spdk_nvmf_transport transport = {};
+	struct spdk_mempool *pool;
+	struct spdk_nvmf_transport *result;
+
+	TAILQ_FOREACH(element, &g_spdk_nvmf_transport_ops, link) {
+		if (strcmp(element->ops.name, "RDMA") == 0) {
+			break;
+		}
+	}
+	SPDK_CU_ASSERT_FATAL(element != NULL);
+	saved = element->ops;
+	element->ops.create = ut_transport_create;
+	element->ops.destroy = ut_transport_destroy;
+	MOCK_SET(ut_transport_create, &transport);
+	MOCK_SET(spdk_l0_data_pool_enabled, true);
+	pool = spdk_mempool_create("l0_ut", g_rdma_ut_transport_opts.num_shared_buffers,
+				   4096, 0, 0);
+	SPDK_CU_ASSERT_FATAL(pool != NULL);
+	MOCK_SET(spdk_l0_mempool_create, pool);
+	result = spdk_nvmf_transport_create("RDMA", &g_rdma_ut_transport_opts);
+	CU_ASSERT(result == &transport);
+	CU_ASSERT(transport.data_buf_pool == pool);
+	CU_ASSERT(spdk_nvmf_transport_destroy(result, NULL, NULL) == 0);
+
+	/* L0 allocation failure is returned to the caller, without silently falling back. */
+	MOCK_SET(spdk_l0_mempool_create, NULL);
+	result = spdk_nvmf_transport_create("RDMA", &g_rdma_ut_transport_opts);
+	CU_ASSERT(result == NULL);
+	pthread_mutex_destroy(&transport.mutex);
+
+	MOCK_SET(spdk_l0_data_pool_enabled, false);
+	result = spdk_nvmf_transport_create("RDMA", &g_rdma_ut_transport_opts);
+	SPDK_CU_ASSERT_FATAL(result != NULL);
+	CU_ASSERT(transport.data_buf_pool != NULL);
+	CU_ASSERT(spdk_nvmf_transport_destroy(result, NULL, NULL) == 0);
+	MOCK_CLEAR(ut_transport_create);
+	element->ops = saved;
+}
+
 static void
 test_spdk_nvmf_transport_create(void)
 {
@@ -360,6 +409,7 @@ main(int argc, char **argv)
 	suite = CU_add_suite("nvmf", NULL, NULL);
 
 	CU_ADD_TEST(suite, test_spdk_nvmf_transport_create);
+	CU_ADD_TEST(suite, test_spdk_nvmf_transport_l0_pool);
 	CU_ADD_TEST(suite, test_nvmf_transport_poll_group_create);
 	CU_ADD_TEST(suite, test_spdk_nvmf_transport_opts_init);
 	CU_ADD_TEST(suite, test_spdk_nvmf_transport_listen_ext);

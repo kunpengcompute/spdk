@@ -51,6 +51,10 @@ DEFINE_STUB_V(spdk_nvme_trid_populate_transport, (struct spdk_nvme_transport_id 
 DEFINE_STUB_V(spdk_nvmf_tgt_new_qpair, (struct spdk_nvmf_tgt *tgt, struct spdk_nvmf_qpair *qpair));
 DEFINE_STUB(nvmf_ctrlr_abort_request, int, (struct spdk_nvmf_request *req), 0);
 DEFINE_STUB(spdk_nvme_transport_id_adrfam_str, const char *, (enum spdk_nvmf_adrfam adrfam), NULL);
+DEFINE_STUB(ibv_get_device_name, const char *, (struct ibv_device *device), "rdma_ut");
+DEFINE_STUB(ibv_create_cq, struct ibv_cq *, (struct ibv_context *context, int cqe,
+		void *cq_context, struct ibv_comp_channel *channel, int comp_vector), NULL);
+DEFINE_STUB(ibv_destroy_cq, int, (struct ibv_cq *cq), 0);
 DEFINE_STUB(ibv_dereg_mr, int, (struct ibv_mr *mr), 0);
 DEFINE_STUB(ibv_resize_cq, int, (struct ibv_cq *cq, int cqe), 0);
 DEFINE_STUB(spdk_mempool_lookup, struct spdk_mempool *, (const char *name), NULL);
@@ -1499,6 +1503,331 @@ test_nvmf_rdma_resize_cq(void)
 	CU_ASSERT(rpoller.num_cqe > tnum_cqe);
 }
 
+static int
+ut_stat_write(void *ctx, const void *data, size_t size)
+{
+	char *output = ctx;
+	size_t len = strlen(output);
+
+	assert(len + size < 16384);
+	memcpy(output + len, data, size);
+	output[len + size] = '\0';
+	return 0;
+}
+
+static void
+test_nvmf_rdma_latency_stat_and_reset(void)
+{
+	struct spdk_nvmf_rdma_poll_group group = {};
+	struct spdk_nvmf_rdma_poller poller = {};
+	struct spdk_nvmf_rdma_device device = {};
+	struct ibv_context context = {};
+	struct ibv_device ibdev = {};
+	struct spdk_nvmf_rdma_qpair qpair = {};
+	struct spdk_nvmf_rdma_request req = {};
+	struct spdk_nvmf_rdma_poller_stat *stat = &poller.stat;
+	struct spdk_json_write_ctx *w;
+	char output[16384] = {};
+
+	TAILQ_INIT(&group.pollers);
+	TAILQ_INSERT_TAIL(&group.pollers, &poller, link);
+	device.context = &context;
+	context.device = &ibdev;
+	poller.device = &device;
+	poller.group = &group;
+	qpair.poller = &poller;
+	req.req.qpair = &qpair.qpair;
+	group.stat.pending_data_buffer = 10;
+	memset(stat, 0xff, sizeof(*stat));
+	nvmf_rdma_poll_group_reset_stat(&group.group);
+	CU_ASSERT(group.stat.pending_data_buffer == 0);
+	CU_ASSERT(stat->polls == 0 && stat->requests == 0 && stat->completions == 0);
+	CU_ASSERT(stat->min_read_latency_ticks == UINT64_MAX);
+	CU_ASSERT(stat->min_write_latency_ticks == UINT64_MAX);
+	CU_ASSERT(stat->min_read_data_rdma_latency_ticks == UINT64_MAX);
+	CU_ASSERT(stat->min_write_data_rdma_latency_ticks == UINT64_MAX);
+	CU_ASSERT(stat->min_read_bdev_latency_ticks == UINT64_MAX);
+	CU_ASSERT(stat->min_write_bdev_latency_ticks == UINT64_MAX);
+
+	/* The JSON format reports zero rather than the internal UINT64_MAX sentinel. */
+	w = spdk_json_write_begin(ut_stat_write, output, 0);
+	SPDK_CU_ASSERT_FATAL(w != NULL);
+	spdk_json_write_object_begin(w);
+	nvmf_rdma_poll_group_dump_stat(&group.group, w);
+	spdk_json_write_object_end(w);
+	spdk_json_write_end(w);
+	CU_ASSERT(strstr(output, "\"min_read_latency_ticks\":0") != NULL);
+	CU_ASSERT(strstr(output, "\"min_write_bdev_latency_ticks\":0") != NULL);
+
+	nvmf_rdma_update_io_latency_stat(stat, SPDK_NVME_OPC_READ, 20);
+	nvmf_rdma_update_io_latency_stat(stat, SPDK_NVME_OPC_READ, 10);
+	nvmf_rdma_update_io_latency_stat(stat, SPDK_NVME_OPC_WRITE, 30);
+	nvmf_rdma_update_io_latency_stat(stat, SPDK_NVME_OPC_FLUSH, 999);
+	CU_ASSERT(stat->read_io_count == 2 && stat->read_latency_ticks == 30);
+	CU_ASSERT(stat->min_read_latency_ticks == 10 && stat->max_read_latency_ticks == 20);
+	CU_ASSERT(stat->write_io_count == 1 && stat->write_latency_ticks == 30);
+	nvmf_rdma_update_data_rdma_latency_stat(stat, SPDK_NVME_OPC_READ, 4);
+	nvmf_rdma_update_data_rdma_latency_stat(stat, SPDK_NVME_OPC_WRITE, 5);
+	nvmf_rdma_update_data_rdma_latency_stat(stat, SPDK_NVME_OPC_FLUSH, 999);
+	CU_ASSERT(stat->read_data_rdma_io_count == 1 && stat->read_data_rdma_latency_ticks == 4);
+	CU_ASSERT(stat->write_data_rdma_io_count == 1 && stat->write_data_rdma_latency_ticks == 5);
+	nvmf_rdma_update_bdev_latency_stat(stat, SPDK_NVME_OPC_READ, 6);
+	nvmf_rdma_update_bdev_latency_stat(stat, SPDK_NVME_OPC_WRITE, 7);
+	nvmf_rdma_update_bdev_latency_stat(stat, SPDK_NVME_OPC_FLUSH, 999);
+	CU_ASSERT(stat->read_bdev_io_count == 1 && stat->read_bdev_latency_ticks == 6);
+	CU_ASSERT(stat->write_bdev_io_count == 1 && stat->write_bdev_latency_ticks == 7);
+
+	MOCK_SET(spdk_get_ticks, 100);
+	nvmf_rdma_request_start_bdev_latency(&req.req);
+	CU_ASSERT(req.req.bdev_io_tsc_valid && req.req.bdev_io_tsc == 100);
+	nvmf_rdma_request_complete_bdev_latency(&req.req);
+	CU_ASSERT(stat->read_bdev_io_count == 1); /* opcode not captured yet */
+	req.opc_valid = true;
+	req.opc = SPDK_NVME_OPC_READ;
+	req.req.bdev_io_tsc_valid = false;
+	nvmf_rdma_request_complete_bdev_latency(&req.req);
+	CU_ASSERT(stat->read_bdev_io_count == 1);
+	req.req.bdev_io_tsc_valid = true;
+	MOCK_SET(spdk_get_ticks, 112);
+	nvmf_rdma_request_complete_bdev_latency(&req.req);
+	CU_ASSERT(stat->read_bdev_io_count == 2 && stat->read_bdev_latency_ticks == 18);
+	CU_ASSERT(stat->min_read_bdev_latency_ticks == 6 && stat->max_read_bdev_latency_ticks == 12);
+	MOCK_CLEAR(spdk_get_ticks);
+
+	memset(output, 0, sizeof(output));
+	w = spdk_json_write_begin(ut_stat_write, output, 0);
+	SPDK_CU_ASSERT_FATAL(w != NULL);
+	spdk_json_write_object_begin(w);
+	nvmf_rdma_poll_group_dump_stat(&group.group, w);
+	spdk_json_write_object_end(w);
+	spdk_json_write_end(w);
+	CU_ASSERT(strstr(output, "\"read_io_count\":2") != NULL);
+	CU_ASSERT(strstr(output, "\"min_read_latency_ticks\":10") != NULL);
+	CU_ASSERT(strstr(output, "\"min_write_latency_ticks\":30") != NULL);
+	CU_ASSERT(strstr(output, "\"min_read_data_rdma_latency_ticks\":4") != NULL);
+	CU_ASSERT(strstr(output, "\"min_write_data_rdma_latency_ticks\":5") != NULL);
+	CU_ASSERT(strstr(output, "\"min_read_bdev_latency_ticks\":6") != NULL);
+	CU_ASSERT(strstr(output, "\"min_write_bdev_latency_ticks\":7") != NULL);
+	TAILQ_REMOVE(&group.pollers, &poller, link);
+	nvmf_rdma_poll_group_reset_stat(&group.group);
+}
+
+static void
+test_nvmf_rdma_signal_last_data_wr(void)
+{
+	struct spdk_nvmf_rdma_request req = {};
+	struct ibv_send_wr second = {};
+
+	nvmf_rdma_signal_last_data_wr(&req);
+	CU_ASSERT(req.data.wr.send_flags == IBV_SEND_SIGNALED);
+	req.data.wr.send_flags = 0;
+	req.data.wr.next = &second;
+	second.next = &req.rsp.wr;
+	nvmf_rdma_signal_last_data_wr(&req);
+	CU_ASSERT(req.data.wr.send_flags == 0);
+	CU_ASSERT(second.send_flags == IBV_SEND_SIGNALED);
+	CU_ASSERT(req.rsp.wr.send_flags == 0);
+}
+
+static struct ibv_wc g_test_wc;
+static int
+ut_poll_cq(struct ibv_cq *cq, int entries, struct ibv_wc *wc)
+{
+	*wc = g_test_wc;
+	return 1;
+}
+
+static void
+test_nvmf_rdma_data_completion_latency(void)
+{
+	struct spdk_nvmf_rdma_transport transport = {};
+	struct spdk_nvmf_rdma_poll_group group = {};
+	struct spdk_nvmf_rdma_poller poller = {};
+	struct spdk_nvmf_rdma_qpair qpair = {};
+	struct spdk_nvmf_rdma_resources resources = {};
+	struct spdk_nvmf_rdma_device device = {};
+	struct spdk_nvmf_rdma_request req = {};
+	struct ibv_context context = {};
+	struct ibv_cq cq = {.context = &context};
+	struct ibv_qp ibqp = {};
+	struct spdk_rdma_qp rdma_qp = {.qp = &ibqp};
+	union nvmf_c2h_msg rsp = {};
+	union nvmf_h2c_msg cmd = {};
+
+	STAILQ_INIT(&group.group.pending_buf_queue);
+	STAILQ_INIT(&resources.free_queue);
+	STAILQ_INIT(&resources.incoming_queue);
+	poller_reset(&poller, &group);
+	qpair_reset(&qpair, &poller, &device, &resources, &transport.transport);
+	qpair.rdma_qp = &rdma_qp;
+	context.ops.poll_cq = ut_poll_cq;
+	poller.cq = &cq;
+	req.req.qpair = &qpair.qpair;
+	req.req.rsp = &rsp;
+	req.req.cmd = &cmd;
+	req.data.rdma_wr.type = RDMA_WR_TYPE_DATA;
+	req.opc_valid = true;
+	req.opc = SPDK_NVME_OPC_WRITE;
+	req.state = RDMA_REQUEST_STATE_TRANSFERRING_HOST_TO_CONTROLLER;
+	req.num_outstanding_data_wr = 2;
+	req.data.wr.opcode = IBV_WR_RDMA_READ;
+	req.data_transfer_tsc = 10;
+	req.data_transfer_tsc_valid = true;
+	qpair.current_send_depth = qpair.current_read_depth = 2;
+	g_test_wc = (struct ibv_wc) {
+		.wr_id = (uintptr_t)&req.data.rdma_wr, .opcode = IBV_WC_RDMA_READ
+	};
+	MOCK_SET(spdk_get_ticks, 30);
+	CU_ASSERT(nvmf_rdma_poller_poll(&transport, &poller) == 0);
+	CU_ASSERT(req.num_outstanding_data_wr == 1 && req.data_transfer_tsc_valid);
+	CU_ASSERT(poller.stat.write_data_rdma_io_count == 0);
+	CU_ASSERT(nvmf_rdma_poller_poll(&transport, &poller) == 0);
+	CU_ASSERT(req.state == RDMA_REQUEST_STATE_EXECUTING);
+	CU_ASSERT(!req.data_transfer_tsc_valid);
+	CU_ASSERT(poller.stat.write_data_rdma_io_count == 1);
+	CU_ASSERT(poller.stat.write_data_rdma_latency_ticks == 20);
+	CU_ASSERT(qpair.current_read_depth == 0 && qpair.current_send_depth == 0);
+
+	/* A signaled RDMA_WRITE records data latency, while SEND owns depth retirement. */
+	req.opc = SPDK_NVME_OPC_READ;
+	req.num_outstanding_data_wr = 1;
+	req.data.wr.opcode = IBV_WR_RDMA_WRITE;
+	req.state = RDMA_REQUEST_STATE_COMPLETING;
+	req.data_transfer_tsc_valid = true;
+	g_test_wc.opcode = IBV_WC_RDMA_WRITE;
+	qpair.current_send_depth = 2;
+	CU_ASSERT(nvmf_rdma_poller_poll(&transport, &poller) == 0);
+	CU_ASSERT(poller.stat.read_data_rdma_io_count == 1);
+	CU_ASSERT(poller.stat.read_data_rdma_latency_ticks == 20);
+	CU_ASSERT(!req.data_transfer_tsc_valid);
+	CU_ASSERT(req.num_outstanding_data_wr == 1 && qpair.current_send_depth == 2);
+
+	/* Error completions invalidate the timer. Failed READ WRs retire read depth. */
+	g_test_wc.status = IBV_WC_WR_FLUSH_ERR;
+	CU_ASSERT(nvmf_rdma_poller_poll(&transport, &poller) == -1);
+	CU_ASSERT(req.num_outstanding_data_wr == 1 && qpair.current_send_depth == 2);
+	req.data.wr.opcode = IBV_WR_RDMA_READ;
+	req.num_outstanding_data_wr = 1;
+	req.data_transfer_tsc_valid = true;
+	qpair.current_read_depth = 1;
+	CU_ASSERT(nvmf_rdma_poller_poll(&transport, &poller) == -1);
+	CU_ASSERT(req.state == RDMA_REQUEST_STATE_COMPLETED);
+	CU_ASSERT(req.num_outstanding_data_wr == 0 && qpair.current_read_depth == 0);
+	CU_ASSERT(!req.data_transfer_tsc_valid);
+	MOCK_CLEAR(spdk_get_ticks);
+}
+
+static void
+test_nvmf_rdma_poller_initial_latency_minima(void)
+{
+	struct spdk_nvmf_rdma_transport transport = {};
+	struct spdk_nvmf_rdma_poll_group group = {};
+	struct spdk_nvmf_rdma_device device = {};
+	struct spdk_nvmf_rdma_poller *poller = NULL;
+	struct ibv_cq cq = {};
+
+	TAILQ_INIT(&group.pollers);
+	transport.rdma_opts.no_srq = true;
+	MOCK_SET(ibv_create_cq, &cq);
+	CU_ASSERT(nvmf_rdma_poller_create(&transport, &group, &device, &poller) == 0);
+	SPDK_CU_ASSERT_FATAL(poller != NULL);
+	CU_ASSERT(poller->stat.min_read_latency_ticks == UINT64_MAX);
+	CU_ASSERT(poller->stat.min_write_latency_ticks == UINT64_MAX);
+	CU_ASSERT(poller->stat.min_read_data_rdma_latency_ticks == UINT64_MAX);
+	CU_ASSERT(poller->stat.min_write_data_rdma_latency_ticks == UINT64_MAX);
+	CU_ASSERT(poller->stat.min_read_bdev_latency_ticks == UINT64_MAX);
+	CU_ASSERT(poller->stat.min_write_bdev_latency_ticks == UINT64_MAX);
+	TAILQ_REMOVE(&group.pollers, poller, link);
+	nvmf_rdma_poller_destroy(poller);
+	MOCK_SET(ibv_create_cq, NULL);
+}
+
+static void
+test_nvmf_rdma_qdlimit_gate_and_abort(void)
+{
+	struct spdk_nvmf_rdma_transport transport = {};
+	struct spdk_nvmf_rdma_poll_group group = {};
+	struct spdk_nvmf_rdma_poller poller = {};
+	struct spdk_nvmf_rdma_qpair qpair = {};
+	struct spdk_nvmf_rdma_resources resources = {};
+	struct spdk_nvmf_rdma_device device = {};
+	struct spdk_nvmf_rdma_request req = {};
+	struct spdk_nvmf_request admitted = {}, abort_req = {};
+	struct spdk_nvmf_ctrlr ctrlr = {};
+	struct spdk_nvmf_subsystem subsys = {};
+	struct spdk_nvmf_ns ns = {};
+	struct spdk_nvmf_ns *namespaces[] = {&ns};
+	struct qdlimit_config_entry *cfg;
+	union nvmf_h2c_msg cmd = {};
+	union nvmf_c2h_msg rsp = {}, abort_rsp = {};
+	char fake_bdev;
+
+	STAILQ_INIT(&group.group.pending_buf_queue);
+	STAILQ_INIT(&resources.free_queue);
+	STAILQ_INIT(&resources.incoming_queue);
+	poller_reset(&poller, &group);
+	qpair_reset(&qpair, &poller, &device, &resources, &transport.transport);
+	qpair.qpair.ctrlr = &ctrlr;
+	ctrlr.subsys = &subsys;
+	subsys.max_nsid = 1;
+	subsys.ns = namespaces;
+	ns.bdev = (void *)&fake_bdev;
+	cmd.nvme_cmd.nsid = 1;
+	req.req.cmd = &cmd;
+	req.req.rsp = &rsp;
+	req.req.qpair = &qpair.qpair;
+	req.req.xfer = SPDK_NVME_DATA_CONTROLLER_TO_HOST;
+	nvmf_qdlimit_pg_init(&group.group);
+	cfg = qdlimit_config_get_or_create("test_bdev");
+	SPDK_CU_ASSERT_FATAL(cfg != NULL);
+	cfg->depth = 1;
+	CU_ASSERT(qdlimit_admit_bdev(&group.group, &admitted, ns.bdev,
+				     "test_bdev") == NVMF_QDLIMIT_ADMIT);
+
+	req.state = RDMA_REQUEST_STATE_NEED_BUFFER;
+	STAILQ_INSERT_TAIL(&group.group.pending_buf_queue, &req.req, buf_link);
+	CU_ASSERT(!nvmf_rdma_request_process(&transport, &req));
+	CU_ASSERT(req.state == RDMA_REQUEST_STATE_NEED_BUFFER);
+	CU_ASSERT(STAILQ_EMPTY(&group.group.pending_buf_queue));
+	CU_ASSERT(!req.req.qdlimit_charged);
+
+	/* Disconnect while parked must unlink the SSD waiter before freeing the request. */
+	qpair.ibv_state = IBV_QPS_ERR;
+	qpair.qd = 1;
+	CU_ASSERT(nvmf_rdma_request_process(&transport, &req));
+	CU_ASSERT(req.state == RDMA_REQUEST_STATE_FREE);
+	CU_ASSERT(qpair.qd == 0);
+	STAILQ_INIT(&resources.free_queue);
+	/* A NEED_BUFFER request can instead still belong to the common buffer queue. */
+	req.state = RDMA_REQUEST_STATE_NEED_BUFFER;
+	qpair.qd = 1;
+	STAILQ_INSERT_TAIL(&group.group.pending_buf_queue, &req.req, buf_link);
+	CU_ASSERT(nvmf_rdma_request_process(&transport, &req));
+	CU_ASSERT(STAILQ_EMPTY(&group.group.pending_buf_queue));
+	STAILQ_INIT(&resources.free_queue);
+
+	/* NVMe Abort handles both the SSD wait queue and the common buffer queue. */
+	qpair.ibv_state = IBV_QPS_RTS;
+	req.state = RDMA_REQUEST_STATE_NEED_BUFFER;
+	STAILQ_INSERT_TAIL(&group.group.pending_buf_queue, &req.req, buf_link);
+	CU_ASSERT(!nvmf_rdma_request_process(&transport, &req));
+	abort_req.req_to_abort = &req.req;
+	abort_req.rsp = &abort_rsp;
+	abort_rsp.nvme_cpl.cdw0 = 1;
+	_nvmf_rdma_qpair_abort_request(&abort_req);
+	CU_ASSERT(req.state == RDMA_REQUEST_STATE_READY_TO_COMPLETE);
+	CU_ASSERT(rsp.nvme_cpl.status.sc == SPDK_NVME_SC_ABORTED_BY_REQUEST);
+	CU_ASSERT(abort_rsp.nvme_cpl.cdw0 == 0);
+	req.state = RDMA_REQUEST_STATE_NEED_BUFFER;
+	STAILQ_INSERT_TAIL(&group.group.pending_buf_queue, &req.req, buf_link);
+	_nvmf_rdma_qpair_abort_request(&abort_req);
+	CU_ASSERT(STAILQ_EMPTY(&group.group.pending_buf_queue));
+	CU_ASSERT(req.state == RDMA_REQUEST_STATE_READY_TO_COMPLETE);
+	qdlimit_release_bdev(&group.group, &admitted, ns.bdev);
+	nvmf_qdlimit_pg_fini(&group.group);
+	nvmf_qdlimit_config_cleanup();
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1520,6 +1849,11 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_nvmf_rdma_resources_create);
 	CU_ADD_TEST(suite, test_nvmf_rdma_qpair_compare);
 	CU_ADD_TEST(suite, test_nvmf_rdma_resize_cq);
+	CU_ADD_TEST(suite, test_nvmf_rdma_latency_stat_and_reset);
+	CU_ADD_TEST(suite, test_nvmf_rdma_signal_last_data_wr);
+	CU_ADD_TEST(suite, test_nvmf_rdma_data_completion_latency);
+	CU_ADD_TEST(suite, test_nvmf_rdma_poller_initial_latency_minima);
+	CU_ADD_TEST(suite, test_nvmf_rdma_qdlimit_gate_and_abort);
 
 	CU_basic_set_mode(CU_BRM_VERBOSE);
 	CU_basic_run_tests();

@@ -207,6 +207,46 @@ test_nvmf_tgt_create_poll_group(void)
 	MOCK_CLEAR(spdk_bdev_get_io_channel);
 }
 
+static unsigned int g_reset_stat_calls;
+
+static void
+ut_reset_transport_stat(struct spdk_nvmf_transport_poll_group *group)
+{
+	CU_ASSERT(group != NULL);
+	g_reset_stat_calls++;
+}
+
+static void
+test_nvmf_poll_group_reset_stat(void)
+{
+	struct spdk_nvmf_poll_group group = {};
+	struct spdk_nvmf_transport_ops with_reset = {.poll_group_reset_stat = ut_reset_transport_stat};
+	struct spdk_nvmf_transport_ops without_reset = {};
+	struct spdk_nvmf_transport transports[2] = {{.ops = &without_reset}, {.ops = &with_reset}};
+	struct spdk_nvmf_transport_poll_group tgroups[2] = {
+		{.transport = &transports[0]}, {.transport = &transports[1]}
+	};
+
+	TAILQ_INIT(&group.tgroups);
+	group.stat.admin_qpairs = 1;
+	group.stat.io_qpairs = 2;
+	group.stat.pending_bdev_io = 3;
+	group.stat.completed_nvme_io = 4;
+	TAILQ_INSERT_TAIL(&group.tgroups, &tgroups[0], link);
+	TAILQ_INSERT_TAIL(&group.tgroups, &tgroups[1], link);
+	g_reset_stat_calls = 0;
+	spdk_nvmf_poll_group_reset_stat(&group);
+	CU_ASSERT(group.stat.admin_qpairs == 0);
+	CU_ASSERT(group.stat.io_qpairs == 0);
+	CU_ASSERT(group.stat.pending_bdev_io == 0);
+	CU_ASSERT(group.stat.completed_nvme_io == 0);
+	CU_ASSERT(g_reset_stat_calls == 1);
+	TAILQ_REMOVE(&group.tgroups, &tgroups[0], link);
+	TAILQ_REMOVE(&group.tgroups, &tgroups[1], link);
+	spdk_nvmf_poll_group_reset_stat(&group);
+	CU_ASSERT(g_reset_stat_calls == 1);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -219,6 +259,7 @@ main(int argc, char **argv)
 	suite = CU_add_suite("nvmf", NULL, NULL);
 
 	CU_ADD_TEST(suite, test_nvmf_tgt_create_poll_group);
+	CU_ADD_TEST(suite, test_nvmf_poll_group_reset_stat);
 
 	CU_basic_set_mode(CU_BRM_VERBOSE);
 	CU_basic_run_tests();
