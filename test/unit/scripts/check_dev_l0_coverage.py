@@ -19,6 +19,15 @@ import sys
 
 
 ROOT = Path(__file__).resolve().parents[3]
+L0_COMMIT = '2ea99cf2d41b46680246134fd47a11ee05b37d33'
+L0_SOURCES = frozenset((
+    'lib/env_dpdk/env.c',
+    'lib/env_dpdk/l0.c',
+    'lib/env_dpdk/l0_mmap_platform.c',
+    'lib/env_dpdk/memory.c',
+    'lib/nvmf/transport.c',
+    'lib/rdma/common.c',
+))
 
 
 def git(*args):
@@ -77,14 +86,25 @@ def load_lcov(paths, source_root):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--base', default='v23.01.1')
-    parser.add_argument('--head', default='67de5d5f7ae6fc970faa3a9add67db5e51594e82')
+    parser.add_argument('--scope', choices=('all', 'l0'), default='all',
+                        help='l0: all six L0 C sources from commit ' + L0_COMMIT)
+    parser.add_argument('--base')
+    parser.add_argument('--head')
     parser.add_argument('--source-root', type=Path, default=ROOT,
                         help='source checkout prefix recorded in LCOV')
     parser.add_argument('--json', type=Path)
     parser.add_argument('lcov', nargs='+', type=Path)
     args = parser.parse_args()
+    args.base = args.base or (L0_COMMIT + '^' if args.scope == 'l0' else 'v23.01.1')
+    args.head = args.head or (L0_COMMIT if args.scope == 'l0'
+                             else '67de5d5f7ae6fc970faa3a9add67db5e51594e82')
     additions = added_lines(args.base, args.head)
+    if args.scope == 'l0':
+        missing = L0_SOURCES.difference(additions)
+        if missing:
+            parser.error('L0 scope must include all six sources; no additions for: '
+                         + ', '.join(sorted(missing)))
+        additions = {path: lines for path, lines in additions.items() if path in L0_SOURCES}
     if not additions:
         parser.error('no added product source lines; refusing vacuous 100%%')
     dirty = git('diff', args.head, '--', *sorted(additions))
@@ -108,7 +128,8 @@ def main():
     failed = any(row['missing_coverage'] or row['uncovered_lines'] for row in rows)
     total = sum(row['executable_lines'] for row in rows)
     covered = sum(row['covered_lines'] for row in rows)
-    report = {'base': git('rev-parse', args.base + '^{commit}').strip(),
+    report = {'scope': args.scope,
+              'base': git('rev-parse', args.base + '^{commit}').strip(),
               'head': git('rev-parse', args.head + '^{commit}').strip(),
               'status': 'FAIL' if failed else 'PASS', 'files': rows,
               'covered_lines': covered, 'executable_lines': total,
