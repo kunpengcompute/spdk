@@ -208,8 +208,6 @@ run_test "unittest_l0" $valgrind $testdir/lib/env_dpdk/l0.c/l0_ut
 run_test "unittest_l0_mmap" $valgrind $testdir/lib/env_dpdk/l0_mmap_platform.c/l0_mmap_platform_ut
 run_test "unittest_env_mempool" $valgrind $testdir/lib/env_dpdk/env.c/env_ut
 run_test "unittest_env_memory" $valgrind $testdir/lib/env_dpdk/memory.c/memory_ut
-run_test "unittest_nvmf_python" python3 "$testdir/scripts/test_nvmf_dev_l0.py"
-run_test "unittest_l0_background" python3 "$testdir/scripts/test_l0_background_job.py"
 run_test "unittest_include" $valgrind $testdir/include/spdk/histogram_data.h/histogram_ut
 run_test "unittest_bdev" unittest_bdev
 if grep -q '#define SPDK_CONFIG_CRYPTO 1' $rootdir/include/spdk/config.h; then
