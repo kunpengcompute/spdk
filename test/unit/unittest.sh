@@ -107,6 +107,7 @@ function unittest_nvmf() {
 	$valgrind $testdir/lib/nvmf/subsystem.c/subsystem_ut
 	$valgrind $testdir/lib/nvmf/tcp.c/tcp_ut
 	$valgrind $testdir/lib/nvmf/nvmf.c/nvmf_ut
+	$valgrind $testdir/lib/nvmf/nvmf_rpc.c/nvmf_rpc_ut
 }
 
 function unittest_scsi() {
@@ -203,6 +204,10 @@ if [ $(uname -m) = "aarch64" ]; then
 fi
 
 run_test "unittest_pci_event" $valgrind $testdir/lib/env_dpdk/pci_event.c/pci_event_ut
+run_test "unittest_l0" $valgrind $testdir/lib/env_dpdk/l0.c/l0_ut
+run_test "unittest_l0_mmap" $valgrind $testdir/lib/env_dpdk/l0_mmap_platform.c/l0_mmap_platform_ut
+run_test "unittest_env_mempool" $valgrind $testdir/lib/env_dpdk/env.c/env_ut
+run_test "unittest_env_memory" $valgrind $testdir/lib/env_dpdk/memory.c/memory_ut
 run_test "unittest_include" $valgrind $testdir/include/spdk/histogram_data.h/histogram_ut
 run_test "unittest_bdev" unittest_bdev
 if grep -q '#define SPDK_CONFIG_CRYPTO 1' $rootdir/include/spdk/config.h; then
@@ -248,6 +253,12 @@ run_test "unittest_lvol" $valgrind $testdir/lib/lvol/lvol.c/lvol_ut
 if grep -q '#define SPDK_CONFIG_RDMA 1' $rootdir/include/spdk/config.h; then
 	run_test "unittest_nvme_rdma" $valgrind $testdir/lib/nvme/nvme_rdma.c/nvme_rdma_ut
 	run_test "unittest_nvmf_transport" $valgrind $testdir/lib/nvmf/transport.c/transport_ut
+	if [[ $(uname -s) == Linux ]]; then
+		run_test "unittest_nvmf_transport_weak" $valgrind $testdir/lib/nvmf/transport_weak.c/transport_weak_ut
+		run_test "unittest_nvmf_transport_weak_preload" env SPDK_UT_WEAK_L0_AVAILABLE=1 \
+			LD_PRELOAD="$testdir/lib/nvmf/transport_weak.c/weak_l0_fixture.so${LD_PRELOAD:+:$LD_PRELOAD}" \
+			$valgrind $testdir/lib/nvmf/transport_weak.c/transport_weak_ut
+	fi
 	run_test "unittest_rdma" $valgrind $testdir/lib/rdma/common.c/common_ut
 fi
 
@@ -263,6 +274,7 @@ fi
 
 if grep -q '#define SPDK_CONFIG_RDMA 1' $rootdir/include/spdk/config.h; then
 	run_test "unittest_nvmf_rdma" $valgrind $testdir/lib/nvmf/rdma.c/rdma_ut
+	run_test "unittest_nvmf_qdlimit" $valgrind $testdir/lib/nvmf/qdlimit.c/qdlimit_ut
 fi
 
 run_test "unittest_scsi" unittest_scsi

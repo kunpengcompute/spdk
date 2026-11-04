@@ -40,8 +40,16 @@ DEFINE_STUB(spdk_bdev_abort, int,
 	    (struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 	     void *bio_cb_arg, spdk_bdev_io_completion_cb cb, void *cb_arg), 0);
 
-DEFINE_STUB_V(spdk_bdev_io_get_iovec,
-	      (struct spdk_bdev_io *bdev_io, struct iovec **iovp, int *iovcntp));
+static struct iovec *g_zcopy_iov;
+void
+spdk_bdev_io_get_iovec(struct spdk_bdev_io *bdev_io, struct iovec **iovp, int *iovcntp)
+{
+	*iovp = g_zcopy_iov;
+	*iovcntp = 1;
+}
+
+static const struct spdk_nvmf_transport_ops g_ut_transport_ops = {};
+static struct spdk_nvmf_transport g_ut_transport = {.ops = &g_ut_transport_ops};
 DEFINE_STUB(spdk_bdev_get_write_unit_size, uint32_t, (const struct spdk_bdev *bdev), 1);
 
 uint32_t
@@ -343,7 +351,7 @@ test_spdk_nvmf_bdev_ctrlr_compare_and_write_cmd(void)
 	struct spdk_nvmf_request write_req = {};
 	union nvmf_c2h_msg write_rsp = {};
 
-	struct spdk_nvmf_qpair qpair = {};
+	struct spdk_nvmf_qpair qpair = {.transport = &g_ut_transport};
 
 	struct spdk_nvme_cmd cmp_cmd = {};
 	struct spdk_nvme_cmd write_cmd = {};
@@ -544,7 +552,7 @@ test_nvmf_bdev_ctrlr_zcopy_start(void)
 	struct spdk_nvmf_request write_req = {};
 	union nvmf_c2h_msg write_rsp = {};
 
-	struct spdk_nvmf_qpair qpair = {};
+	struct spdk_nvmf_qpair qpair = {.transport = &g_ut_transport};
 
 	struct spdk_nvme_cmd write_cmd = {};
 
@@ -626,7 +634,7 @@ test_nvmf_bdev_ctrlr_cmd(void)
 	struct spdk_bdev bdev = {};
 	struct spdk_io_channel ch = {};
 	struct spdk_nvmf_request req = {};
-	struct spdk_nvmf_qpair qpair = {};
+	struct spdk_nvmf_qpair qpair = {.transport = &g_ut_transport};
 	union nvmf_h2c_msg cmd = {};
 	union nvmf_c2h_msg rsp = {};
 	struct spdk_nvme_scc_source_range range = {};
@@ -788,11 +796,13 @@ static void
 test_nvmf_bdev_ctrlr_read_write_cmd(void)
 {
 	struct spdk_bdev bdev = {};
+	struct spdk_nvmf_qpair qpair = {.transport = &g_ut_transport};
 	struct spdk_nvmf_request req = {};
 	union nvmf_c2h_msg rsp = {};
 	union nvmf_h2c_msg cmd = {};
 	int rc;
 
+	req.qpair = &qpair;
 	req.cmd = &cmd;
 	req.rsp = &rsp;
 
@@ -824,7 +834,7 @@ test_nvmf_bdev_ctrlr_nvme_passthru(void)
 	struct spdk_bdev bdev = {};
 	struct spdk_bdev_desc *desc = NULL;
 	struct spdk_io_channel ch = {};
-	struct spdk_nvmf_qpair qpair = {};
+	struct spdk_nvmf_qpair qpair = {.transport = &g_ut_transport};
 	struct spdk_nvmf_poll_group group = {};
 
 	struct spdk_nvmf_request req = {};
@@ -920,6 +930,101 @@ test_nvmf_bdev_ctrlr_nvme_passthru(void)
 	MOCK_SET(spdk_bdev_nvme_admin_passthru, 0);
 }
 
+static unsigned int g_latency_started, g_latency_completed;
+
+static void
+ut_start_bdev_latency(struct spdk_nvmf_request *req)
+{
+	g_latency_started++;
+	req->bdev_io_tsc = 123;
+	req->bdev_io_tsc_valid = true;
+}
+
+static void
+ut_complete_bdev_latency(struct spdk_nvmf_request *req)
+{
+	CU_ASSERT(req->bdev_io_tsc_valid);
+	CU_ASSERT(req->bdev_io_tsc == 123);
+	g_latency_completed++;
+}
+
+static void
+test_nvmf_bdev_latency_hooks(void)
+{
+	struct spdk_nvmf_transport_ops ops = {
+		.req_start_bdev_latency = ut_start_bdev_latency,
+		.req_complete_bdev_latency = ut_complete_bdev_latency,
+	};
+	struct spdk_nvmf_transport transport = {.ops = &ops};
+	struct spdk_nvmf_poll_group group = {};
+	struct spdk_nvmf_qpair qpair = {.transport = &transport, .group = &group};
+	struct spdk_nvmf_request req = {.qpair = &qpair, .length = 512};
+	union nvmf_h2c_msg cmd = {};
+	union nvmf_c2h_msg rsp = {};
+	struct spdk_bdev bdev = {.blocklen = 512, .blockcnt = 100};
+	int rc;
+
+	req.cmd = &cmd;
+	req.rsp = &rsp;
+	g_latency_started = g_latency_completed = 0;
+	cmd.nvme_cmd.opc = SPDK_NVME_OPC_READ;
+	rc = nvmf_bdev_ctrlr_read_cmd(&bdev, NULL, NULL, &req);
+	CU_ASSERT(rc == SPDK_NVMF_REQUEST_EXEC_STATUS_ASYNCHRONOUS);
+	CU_ASSERT(g_latency_started == 1 && req.bdev_io_tsc_valid);
+	nvmf_bdev_ctrlr_complete_cmd(NULL, true, &req);
+	CU_ASSERT(g_latency_completed == 1);
+	CU_ASSERT(!req.bdev_io_tsc_valid && req.bdev_io_tsc == 0);
+
+	MOCK_SET(spdk_bdev_readv_blocks, -EIO);
+	rc = nvmf_bdev_ctrlr_read_cmd(&bdev, NULL, NULL, &req);
+	CU_ASSERT(rc == SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE);
+	CU_ASSERT(!req.bdev_io_tsc_valid && req.bdev_io_tsc == 0);
+	MOCK_SET(spdk_bdev_readv_blocks, 0);
+	cmd.nvme_cmd.opc = SPDK_NVME_OPC_WRITE;
+	MOCK_SET(spdk_bdev_writev_blocks, -ENOMEM);
+	rc = nvmf_bdev_ctrlr_write_cmd(&bdev, NULL, NULL, &req);
+	CU_ASSERT(rc == SPDK_NVMF_REQUEST_EXEC_STATUS_ASYNCHRONOUS);
+	CU_ASSERT(!req.bdev_io_tsc_valid && req.bdev_io_tsc == 0);
+	CU_ASSERT(group.stat.pending_bdev_io == 1);
+	MOCK_SET(spdk_bdev_writev_blocks, 0);
+
+	/* Zero-copy reads time population, and clear the timer on failed submission. */
+	cmd.nvme_cmd.opc = SPDK_NVME_OPC_READ;
+	MOCK_SET(spdk_bdev_zcopy_start, -EIO);
+	rc = nvmf_bdev_ctrlr_zcopy_start(&bdev, NULL, NULL, &req);
+	CU_ASSERT(rc == SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE);
+	CU_ASSERT(!req.bdev_io_tsc_valid && req.bdev_io_tsc == 0);
+	MOCK_SET(spdk_bdev_zcopy_start, 0);
+	rc = nvmf_bdev_ctrlr_zcopy_start(&bdev, NULL, NULL, &req);
+	CU_ASSERT(rc == SPDK_NVMF_REQUEST_EXEC_STATUS_ASYNCHRONOUS);
+	g_zcopy_iov = req.iov;
+	req.iov[0].iov_base = &bdev;
+	nvmf_bdev_ctrlr_zcopy_start_complete(NULL, true, &req);
+	CU_ASSERT(g_latency_completed == 2);
+	CU_ASSERT(!req.bdev_io_tsc_valid && req.bdev_io_tsc == 0);
+	CU_ASSERT(req.data == &bdev);
+	g_zcopy_iov = NULL;
+
+	/* Only a committed zero-copy write starts the backend write timer. */
+	cmd.nvme_cmd.opc = SPDK_NVME_OPC_WRITE;
+	nvmf_bdev_ctrlr_zcopy_end(&req, false);
+	CU_ASSERT(!req.bdev_io_tsc_valid);
+	nvmf_bdev_ctrlr_zcopy_end(&req, true);
+	CU_ASSERT(req.bdev_io_tsc_valid);
+	nvmf_bdev_ctrlr_zcopy_end_complete(NULL, true, &req);
+	CU_ASSERT(g_latency_completed == 3);
+	CU_ASSERT(!req.bdev_io_tsc_valid && req.bdev_io_tsc == 0);
+
+	/* Transports without timing hooks still clear stale request state. */
+	ops.req_start_bdev_latency = NULL;
+	ops.req_complete_bdev_latency = NULL;
+	nvmf_bdev_ctrlr_start_bdev_latency(&req);
+	req.bdev_io_tsc = 999;
+	req.bdev_io_tsc_valid = true;
+	nvmf_bdev_ctrlr_update_bdev_latency(&req);
+	CU_ASSERT(!req.bdev_io_tsc_valid && req.bdev_io_tsc == 0);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -931,6 +1036,7 @@ main(int argc, char **argv)
 
 	suite = CU_add_suite("nvmf", NULL, NULL);
 
+	CU_ADD_TEST(suite, test_nvmf_bdev_latency_hooks);
 	CU_ADD_TEST(suite, test_get_rw_params);
 	CU_ADD_TEST(suite, test_lba_in_range);
 	CU_ADD_TEST(suite, test_get_dif_ctx);
