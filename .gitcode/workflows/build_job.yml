@@ -1,0 +1,56 @@
+name: Build Job
+
+on:
+  workflow_call:
+    inputs:
+      runs_on_flavor:
+        required: true
+        type: string
+      docker_img:
+        required: true
+        type: string
+      pr_id:
+        required: true
+        type: string
+      branch:            # PR 目标分支（主文件 Detect_file_changes 的 base 用）
+        required: true
+        type: string
+      default_branch:    # 默认分支（脚本缺失回退 checkout 用）
+        required: true
+        type: string
+
+jobs:
+  JOB_Compile:
+    name: Compile
+    select: selected_by_default
+    runs-on: [ self-hosted, os=euler, arch=arm64, type=pr, "${{ inputs.runs_on_flavor }}" ]
+    container:
+      image: ${{ inputs.docker_img }}
+    steps:
+      - name: fast_checkout
+        identifier: fast_checkout
+        uses: checkout
+        with:
+          allow-unsafe-pr-checkout: true
+          ref: refs/merge-requests/${{ inputs.pr_id }}/merge
+      - name: checkout_default_scripts
+        uses: checkout
+        with:
+          ref: ${{ inputs.default_branch }}
+          path: base-scripts
+      - name: init_script
+        run: |-
+          for dir in .gitcode/scripts .gitcode/dockerfiles; do
+            mkdir -p "${dir}"
+            cp -f "base-scripts/${dir}"/* "${dir}/" 2>/dev/null || true
+          done
+          test -f .gitcode/scripts/build_ci.sh || {
+            echo "ERROR: 基分支未提供 .gitcode/scripts/build_ci.sh"; exit 1;
+          }
+          test -f .gitcode/scripts/prepare_spdk.sh || {
+            echo "ERROR: 基分支未提供 .gitcode/scripts/prepare_spdk.sh"; exit 1;
+          }
+      - name: build
+        env:
+          TARGET_BRANCH: ${{ inputs.branch }}   # 供脚本按分支区分构建逻辑
+        run: sh .gitcode/scripts/build_ci.sh
