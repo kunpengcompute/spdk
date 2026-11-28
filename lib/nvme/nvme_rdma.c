@@ -1958,7 +1958,8 @@ nvme_rdma_memory_domain_transfer_data(struct spdk_memory_domain *dst_domain, voi
 	NVME_RQPAIR_DEBUGLOG(rqpair, "req %p, addr %p, len %zu, key %u\n", rdma_req, ctx.addr, ctx.length,
 			     ctx.rkey);
 	icd_supported = spdk_nvme_opc_get_data_transfer(req->cmd.opc) == SPDK_NVME_DATA_HOST_TO_CONTROLLER
-			&& req->payload_size <= ctrlr->ioccsz_bytes && ctrlr->icdoff == 0;
+			&& req->payload_size <= ctrlr->ioccsz_bytes && ctrlr->icdoff == 0
+			&& !nvme_ns_cmd_get_ext_io_opt(req->payload.opts, rdma_disable_in_capsule_data, false);
 
 	/* We expect that result of accel sequence is a Memory Key which describes a virtually contig address space.
 	 * That means we prepare a contig request even if original payload was scattered */
@@ -1992,7 +1993,8 @@ nvme_rdma_req_init(struct nvme_rdma_qpair *rqpair, struct spdk_nvme_rdma_req *rd
 	 * will currently just not use inline data for now.
 	 */
 	icd_supported = spdk_nvme_opc_get_data_transfer(req->cmd.opc) == SPDK_NVME_DATA_HOST_TO_CONTROLLER
-			&& req->payload_size <= ctrlr->ioccsz_bytes && ctrlr->icdoff == 0;
+			&& req->payload_size <= ctrlr->ioccsz_bytes && ctrlr->icdoff == 0
+			&& !nvme_ns_cmd_get_ext_io_opt(req->payload.opts, rdma_disable_in_capsule_data, false);
 
 	if (spdk_unlikely(req->payload_size == 0)) {
 		rc = nvme_rdma_build_null_request(rdma_req);
