@@ -659,8 +659,11 @@ struct spdk_nvme_ns_cmd_ext_io_opts {
 	 *  qpair is part of a poll group).
 	 */
 	void *accel_sequence;
+	/** Use keyed SGLs for NVMe/RDMA data instead of sending data in the command capsule. */
+	bool rdma_disable_in_capsule_data;
+	uint8_t reserved57[7];
 };
-SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_ns_cmd_ext_io_opts) == 56, "Incorrect size");
+SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_ns_cmd_ext_io_opts) == 64, "Incorrect size");
 
 /**
  * Parse the string representation of a transport ID.
